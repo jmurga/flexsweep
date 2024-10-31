@@ -13,12 +13,12 @@ threadpoolctl.threadpool_limits(1)
 
 import subprocess
 
-# from . import pd, np, Parallel, delayed
-# from .data import Data
+from . import pd, np, Parallel, delayed
+from .data import Data
 
-import pandas as pd
-import numpy as np
-from joblib import Parallel, delayed
+# import pandas as pd
+# import numpy as np
+# from joblib import Parallel, delayed
 
 from math import comb
 from functools import partial, reduce
@@ -377,6 +377,7 @@ def calculate_stats(
             df_centers_stats.insert(0, "center", c)
             df_centers_stats.insert(0, "iter", _iter)
             df_centers_stats = df_centers_stats.astype(object)
+
             # df_nsl.insert(0, "window", w)
             # df_nsl.insert(0, "center", c)
             # df_nsl.insert(0, "iter", i)
@@ -450,7 +451,7 @@ def calculate_stats(
 
 
 def summary_statistics(
-    simulations,
+    data,
     nthreads=1,
     center=[500000, 700000],
     windows=[1000000],
@@ -500,18 +501,18 @@ def summary_statistics(
 
     """
 
-    if isinstance(simulations, str):
-        fs_data = Data(simulations, nthreads=nthreads)
+    if isinstance(data, str):
+        fs_data = Data(data, nthreads=nthreads)
         sims, params = fs_data.read_simulations()
         # Opening neutral expectations
-        neutral_save = simulations + "/neutral_bins.pickle"
-        fvs_file = simulations + "/fvs.parquet"
-        if os.path.exists(neutral_save) is True:
+        neutral_save = data + "/neutral_bins.pickle"
+        fvs_file = data + "/fvs.parquet"
+        if os.path.exists(neutral_save):
             with open(neutral_save, "rb") as handle:
                 neutral_norm = pickle.load(handle)
         else:
             neutral_norm = None
-    elif isinstance(simulations, list) or isinstance(simulations, tuple):
+    elif isinstance(data, list) or isinstance(data, tuple):
         sims = {"sweeps": sims, "neutral": []}
 
         with open(neutral_save, "rb") as handle:
@@ -519,9 +520,12 @@ def summary_statistics(
         fvs_file = os.getcwd() + "/fvs.parquet"
 
         print("Output files will be written at {}".format(os.getcwd()))
-    elif isinstance(simulations, dict):
+    elif isinstance(data, dict):
         neutral_save = os.getcwd() + "/neutral_bins.pickle"
         fvs_file = os.getcwd() + "/fvs.parquet"
+
+        regions_list = data.pop("regions", None)
+        sims = data
 
     assert len(sims["sweeps"]) > 0 and (
         len(sims["neutral"]) > 0 or neutral_save is not None
@@ -530,17 +534,17 @@ def summary_statistics(
     for k, s in sims.items():
         pars = [(i[0], i[1]) for i in s]
         # Use joblib to parallelize the execution
-        summ_stats = Parallel(n_jobs=nthreads, verbose=5)(
+        summ_stats = Parallel(n_jobs=nthreads, backend="multiprocessing", verbose=5)(
             delayed(calculate_stats)(
                 ts,
                 rec_map,
-                index,
+                _iter,
                 center=center,
                 step=step,
                 neutral=True if k == "neutral" else False,
                 mispolarize_ratio=mispolarize_ratio,
             )
-            for index, (ts, rec_map) in enumerate(pars, 1)
+            for _iter, (ts, rec_map) in enumerate(pars, 1)
         )
 
         # Ensure params order

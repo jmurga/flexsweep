@@ -1,10 +1,10 @@
-# from . import pd, np, Parallel, delayed
+from . import pd, np, Parallel, delayed
 
 from allel import read_vcf, GenotypeArray, index_windows
 
-import numpy as np
-import pandas as pd
-from joblib import Parallel, delayed
+# import numpy as np
+# import pandas as pd
+# from joblib import Parallel, delayed
 from scipy.interpolate import interp1d
 from itertools import chain
 from tqdm import tqdm
@@ -38,19 +38,20 @@ class Data:
         self.step = step
         self.nthreads = nthreads
 
-    def genome_reader(self, region, samples):
-        warnings.filterwarnings(
+    def genome_reader(self, region, samples, _iter=0):
+        filterwarnings(
             "ignore", message="invalid INFO header", module="allel.io.vcf_read"
         )
 
         raw_data = allel.read_vcf(self.data, region=region, samples=samples)
 
-        gt = allel.GenotypeArray(raw_data["calldata/GT"])
+        try:
+            gt = allel.GenotypeArray(raw_data["calldata/GT"])
+        except:
+            gt = np.array([])
 
         if gt.shape[0] == 0:
-            print("here")
-            # return (None, None)
-            return None
+            return {region: None}
 
         pos = raw_data["variants/POS"]
         np_chrom = np.char.replace(raw_data["variants/CHROM"].astype(str), "chr", "")
@@ -84,7 +85,7 @@ class Data:
             # rec_map = np.column_stack([rec_map, f(rec_map[:, 2]).astype(int)])
 
         # return hap
-        return (hap.values, rec_map[:, [0, 1, -1, 2]])
+        return {region: (hap.values, rec_map[:, [0, 1, -1, 2]])}
 
     def read_vcf(self, chrom, contig_length):
         assert (
@@ -110,24 +111,25 @@ class Data:
             )
         )
 
-        region_data = Parallel(
-            n_jobs=self.nthreads, backend="multiprocessing", verbose=5
-        )(
+        region_data = Parallel(n_jobs=self.nthreads, verbose=5)(
             delayed(self.genome_reader)(
                 chrom + ":" + str(w[0]) + "-" + str(w[1]), self.samples
             )
             for w in window_iter
         )
 
-        region_data = [
-            item for item in region_data if not all(elem is None for elem in item)
-        ]
+        out_dict = dict(chain.from_iterable(d.items() for d in region_data))
 
-        return region_data
+        sims = {"sweeps": [], "region": []}
+        for k, v in out_dict.items():
+            if v is not None:
+                sims["sweeps"].append(v)
+                sims["regions"].append(k)
+
+        return sims
 
     def read_simulations(self, seq_len=1.2e6):
         assert isinstance(self.data, str)
-
         # df_sweeps = pd.read_csv(self.data + "/sweep_params.txt")
         df_params = pd.read_csv(self.data + "/params.txt.gz")
         df_sweeps = df_params.loc[df_params.model == "sweep", :]
@@ -138,7 +140,7 @@ class Data:
         ).values.astype(str)
         neutral_l = glob.glob(self.data + "/neutral/*.ms.gz")
         neutral = [
-            self.data + "/sweeps/sweep_" + str(i) + ".ms.gz"
+            self.data + "/neutral/neutral_" + str(i) + ".ms.gz"
             for i in range(1, len(neutral_l) + 1)
         ]
 
@@ -180,11 +182,11 @@ class Data:
         if not isinstance(self.data, list):
             self.data = [self.data]
 
-            ms_data = Parallel(n_jobs=self.nthreads, verbose=5)(
-                delayed(self.ms_parser)(m, seq_len) for m in self.data
-            )
+        ms_data = Parallel(n_jobs=self.nthreads, verbose=5)(
+            delayed(self.ms_parser)(m, seq_len) for m in self.data
+        )
 
-            return tuple(chain(*ms_data))
+        return tuple(chain(*ms_data))
 
     def ms_parser(self, ms_file, param=None, seq_len=1.2e6):
         """Read a ms file and output the positions and the genotypes.

@@ -1,37 +1,39 @@
 # Flexsweep v2.0
 
-(In development, not recommended for end users. Need to solve RAM issues when performing large number of simulations ~200K. All the statistic are uneficienly saved on Dataframe where most values are nan, was easy to work with).
+(In development, not recommended for end users. Need to solve RAM issues when performing large number of simulations ~200K. All the statistic are uneficiently saved on a Dataframe where most values are nan, was easy to work with).
 
-The second version of [Flexsweep software](https://doi.org/10.1093/molbev/msad139), a versatile tool for detecting selective sweeps with various ages, strengths, starting allele frequencies, and completeness. The software trains a convolutional neural network (CNN) to classify genomic loci as sweep or neutral regions. The workflow begins with simulating data under an appropriate demographic model and regions as neutral or sweeps, including several selection events regarding sweep strength, age, starting allele frequency (softness), and ending allele frequency (completeness).
+The second version of [Flexsweep software](https://doi.org/10.1093/molbev/msad139), a versatile tool for detecting selective sweeps. The software trains a convolutional neural network (CNN) to classify genomic loci as sweep or neutral regions. The workflow begins with simulating data under an appropriate demographic model and classify regions as neutral or sweeps, including several selection events regarding sweep strength, age, starting allele frequency (softness), and ending allele frequency (completeness).
 
-The new version simplifies and streamlines the project structure, files, simulations, and summary statistics estimation and allows for the easy addition of custom CNN architectures. The software takes advantage of [demes](https://doi.org/10.1093/genetics/iyac131) to simulate custom demography histories and main scikit-alleles formats data structures to avoid external software and temporal files. We included Numba optimized versions of [iSAFE](https://doi.org/10.1038/nmeth.4606), DIND, hapdaf, S ratio and freqs statistics. The software now is also able to run the following statistics:
+The new version simplifies and streamlines the project structure, files, simulations, summary statistics estimation and allows for the easy addition of custom CNN architectures. The software takes advantage of [demes](https://doi.org/10.1093/genetics/iyac131) to simulate custom demography histories and main [scikit-allel](https://scikit-allel.readthedocs.io/) formats data structures to avoid external software and temporal files. We included optimized versions of [iSAFE](https://doi.org/10.1038/nmeth.4606), [DIND](https://doi.org/10.1371/journal.pgen.1000562), hapdaf, S ratio, freqs as well as the custom HAF and H12 as described in [Flexsweep](https://doi.org/10.1093/molbev/msad139). The software now is also able to run the following statistics:
 
-- $\Delta$ IHH
-- $\pi$
-- $\theta_{W}$
-- Kelly's Zns
-- $\omega_{max}$
-- Fay & Wu's H
-- Zeng's E
-- Fu & Li's D and F
-- LASSI
+- [$\Delta$ IHH](https://doi.org/10.1126/science.1183863)
+- [$\pi$](https://scikit-allel.readthedocs.io/en/stable/stats/diversity.html#allel.mean_pairwise_difference)
+- [$\theta_{W}]([https://scikit-allel.readthedocs.io/en/stable/stats/diversity.html#allel.watterson_theta)
+- [Kelly's Zns](https://doi.org/10.1093/genetics/146.3.1197)
+- [$\omega_{max}]([https://doi.org/10.1534/genetics.103.025387)
+- [Fay & Wu's H](https://doi.org/10.1534/genetics.106.061432)
+- [Zeng's E](https://doi.org/10.1534/genetics.106.061432)
+- [Fu & Li's D and F](https://doi.org/10.1093/genetics/133.3.693)
+- [LASSI $T$ and $m$](https://doi.org/10.1093/molbev/msaa115)
 
 Similarly to the first version, Flexsweep works in three main steps: simulation, summary statistics estimation (feature vectors), and training/classification. Once installed, you can access the Command Line Interface to run any module as needed.
 
-`data` folder includes a static-compiled version of [discoal]([https://github.com/kr-colab/discoal](https://doi.org/10.1093/bioinformatics/btw556)), which reduces the virtual memory needed (tested on CentOS, Ubuntu and PopOS!) which is automatically accesed if no other `discoal` binary is provided. It also includes multiple `demes` demography models, including the YRI population history estimated by [Speidel et al. 2019](https://doi.org/10.1038/s41588-019-0484-x).
+`data` folder includes a static-compiled version of [discoal](https://doi.org/10.1093/bioinformatics/btw556), which reduces the virtual memory needed (tested on CentOS, Ubuntu and PopOS!). Such binary is automatically accesed if no other `discoal` binary is provided. It also includes multiple `demes` demography models, including the YRI population history estimated by [Speidel et al. 2019](https://doi.org/10.1038/s41588-019-0484-x).
+
 ## Installation
 ```bash
 pip install flexsweep
 ```
+~conda install -c bioconda flexsweep~
 
 ## Tutorial
 ### Simulation
 Running from CLI. By default it only uses 1 thread and simulate $10^4$ neutral and sweep simulation each case. Comma-separated values will draw mutation or recombination rate values from a Uniform distribution while single values will draw mutation or recombination rate values from a Exponential distribution.
 
-
 ```bash
 flexsweep --help
 ```
+
 ```
 Usage: flexsweep simulator [OPTIONS]
 
@@ -59,15 +61,83 @@ Options:
                              [required]
   --output_folder TEXT       Folder where outputs will be saved
                              [required]
+  --time TEXT                Start/end adaptive mutation range timing
   --discoal_path TEXT        Path to the discoal executable
   --num_simulations INTEGER  Number of neutral and sweep simulations
   --nthreads INTEGER         Number of threads for parallelization
   --help                     Show this message and exit.
 ```
 
-Simulating $10^5$ neutral and sweep scenarios using human mutation rate estimation from [Smith et al. 2019)[https://doi.org/10.1371/journal.pgen.1007254]
-```
- flexsweep simulator --sample_size 100 --mutation_rate 5e-9,2e-8 --recombination_rate 1e-8 --locus_length 1200000 --demes data/constant.yaml --output_folder training_eq --num_simulations 100000 --nthreads 100                            
+Simulating $10^5$ neutral and sweep scenarios using human mutation rate estimation from [Smith et al. 2019](https://doi.org/10.1371/journal.pgen.1007254)
+
+```bash
+flexsweep simulator --sample_size 100 --mutation_rate 5e-9,2e-8 --recombination_rate 1e-8 --locus_length 1200000 --demes data/constant.yaml --output_folder training_eq --num_simulations 100000 --nthreads 100
 ```
 
+### Feature vectors from simulations
+The command will output a parquet file containing the feature vectors input to train Flexsweep CNN as well as the neutral expected values to normalize prediction from empirical data.
 
+```bash
+flexsweep fvs-discoal --help
+```
+
+```
+Usage: flexsweep fvs-discoal [OPTIONS]
+
+  Run the summary statistic estimation from discoal simulation to create CNN
+  input feature vectors. Will create two file: a parquet dataframe and a
+  pickle dictionary containing neutral expectation and stdev
+
+Options:
+  --simulations_path TEXT  Path containing neutral and sweeps discoal
+                           simulations.  [required]
+  --nthreads INTEGER       Number of threads  [required]
+  --help                   Show this message and exit.
+```
+
+```bash
+flexsweep fvs-discoal --simulation_path training_eq --nthreads 100
+```
+
+### Feature vectors from VCF
+The command parse a VCF file by sliding window creating each corresponding HaplotypeArray. To parallel reading the software create *a priori* genomic positions ranges so the VCF `contig_name` and `contig_length` must be inputted to avoid reading the entire VCF.
+
+Note that `fvs-discoal` must be run before `fvs-vcf` to properly create the `neutral_bin` data. It outputs a parquet file containing the feature vectors input to train Flexsweep CNN normalized by neutral expectation.
+
+```bash
+flexsweep fvs-vcf --help
+```
+
+```
+Usage: flexsweep fvs-vcf [OPTIONS]
+
+  Run the summary statistic estimation from a VCF file to create CNN input
+  feature vectors
+
+Options:
+  --vcf TEXT             VCF file to parse. Must be indexed [required]
+  --neutral_bin TEXT     Neutral bin data from discoal simulations  [required]
+  --contig_name TEXT           Chromosome name  [required]
+  --contig_len TEXT      Chromosome length for sliding  [required]
+  --window_size INTEGER  Window size  [required]
+  --step INTEGER         Sliding step  [required]
+  --help                 Show this message and exit.
+```
+
+### Training/prediction
+Train Flexsweep CNN with the normalized feature vectors to classify neutral and sweep regions.
+
+`--mode train` will output a CNN model for later classification in the selected `output_folder`. Note that `--mode train` must be executed before `--mode predict` because it will search the CNN model prior to predict execution.
+
+```
+Usage: flexsweep cnn [OPTIONS]
+
+  Run the Flexsweep CNN
+
+Options:
+  --train_data TEXT       Path to the training data  [required]
+  --output_folder TEXT    Output folder for the CNN model and logs  [required]
+  --mode [train|predict]  Mode: 'train' or 'predict'  [required]
+  --help                  Show this message and exit.
+
+```

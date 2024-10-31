@@ -2,6 +2,8 @@ import time, os, sys
 
 # from . import pd, np
 
+import pandas as pd
+import numpy as np
 import importlib
 from sklearn.model_selection import train_test_split
 from itertools import product
@@ -27,7 +29,7 @@ class CNN:
         gpu (bool): Indicates whether to use GPU for training. Default is True.
     """
 
-    def __init__(self, train_data, output_folder):
+    def __init__(self, train_data, output_folder, output_prediction="predictions.txt"):
         """
         Initializes the CNN class with training data and output folder.
 
@@ -39,6 +41,7 @@ class CNN:
         self.train_data = train_data
         self.test_data = None
         self.output_folder = output_folder
+        self.output_prediction = output_prediction
         self.num_stats = 11
         self.center = np.arange(5e5, 7e5 + 1e4, 1e4).astype(int)
         self.windows = np.array([50000, 100000, 200000, 500000, 1000000])
@@ -384,6 +387,9 @@ class CNN:
         """
         tf = self.check_tf()
 
+        if self.model is None and os.path.exists(output_folder + "/model.keras"):
+            self.model = output_folder + "/model.keras"
+
         assert self.model is not None, "Please input the CNN trained model"
 
         # import data to predict
@@ -408,19 +414,6 @@ class CNN:
                 "ihs",
                 "h12",
             ]:
-                # for i in [
-                #     "DIND_",
-                #     "HAF_",
-                #     "hDo_",
-                #     "iSAFE_",
-                #     "hf_",
-                #     "hDs_",
-                #     # "nsl_",
-                #     "S_",
-                #     "lf_",
-                #     # "ihs_",
-                #     "H12_",
-                # ]:
                 test_X.append(df_m.iloc[:, df_m.columns.str.contains(i)])
 
             test_X = pd.concat(test_X, axis=1).values
@@ -486,4 +479,5 @@ class CNN:
             )
             d_prediction[m] = df_prediction
 
+        # d_prediction.to_csv(self.output_folder + "/predictions.txt")
         return d_prediction

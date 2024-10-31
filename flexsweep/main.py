@@ -6,7 +6,7 @@ def parse_float_list(ctx, param, value):
     """Parse a comma-separated list of floats."""
     if value:
         try:
-            return [float(x) for x in value.split(",")]
+            return [int(x) if x.isdigit() else float(x) for x in value.split(",")]
         except ValueError:
             raise click.BadParameter("Must be a comma-separated list of floats")
     return []
@@ -45,10 +45,10 @@ def cli():
     help="Folder where outputs will be saved",
 )
 @click.option(
-    "--discoal_path",
+    "--time",
     type=str,
-    default=None,
-    help="Path to the discoal executable",
+    default="0,5000",
+    help="Start/end adaptive mutation range timing",
 )
 @click.option(
     "--num_simulations",
@@ -59,6 +59,12 @@ def cli():
 @click.option(
     "--nthreads", type=int, default=1, help="Number of threads for parallelization"
 )
+@click.option(
+    "--discoal_path",
+    type=str,
+    default=None,
+    help="Path to the discoal executable",
+)
 def simulator(
     sample_size,
     mutation_rate,
@@ -68,6 +74,7 @@ def simulator(
     output_folder,
     discoal_path,
     num_simulations,
+    time,
     nthreads,
 ):
     """Run the discoal Simulator"""
@@ -79,6 +86,7 @@ def simulator(
 
     mutation_rate_list = parse_float_list(None, None, mutation_rate)
     recombination_rate_list = parse_float_list(None, None, recombination_rate)
+    time_list = parse_float_list(None, None, time)
 
     if len(mutation_rate_list) == 2:
         mu_rate = {
@@ -138,29 +146,31 @@ def fvs_discoal(simulations_path, nthreads):
 
 
 @cli.command()
-@click.option("--vcf", type=str, required=True, help="VCF file to parse")
+@click.option(
+    "--vcf", type=str, required=True, help="VCF file to parse. Must be indexed"
+)
 @click.option(
     "--neutral_bin",
     type=str,
     required=True,
     help="Neutral bin data from discoal simulations",
 )
-@click.option("--chrom", type=str, required=True, help="Chromosome name")
+@click.option("--contig_name", type=str, required=True, help="Chromosome name")
 @click.option(
     "--contig_len", type=str, required=True, help="Chromosome length for sliding"
 )
 @click.option("--window_size", type=int, required=True, help="Window size")
 @click.option("--step", type=int, required=True, help="Sliding step")
-def fvs_vcf(vcf, chrom, contig_length, window_size, step, nthreads):
-    """Run the summary statistic estimation from a VCF file to create CNN input feature vectors"""
+def fvs_vcf(vcf, contig_name, contig_length, window_size, step, nthreads):
+    """Run the summary statistic estimation from a VCF file to create CNN input feature vectors."""
     import flexsweep as fs
 
     data = fs.Data(vcf, window_size=window_size, step=step, nthreads=nthreads)
-    data_gt = fs.read_vcf(chrom, contig_length)
+    data_gt = fs.read_vcf(contig_name, contig_length)
 
 
 @cli.command()
-@click.option("--train_data", type=str, required=True, help="Path to the training data")
+@click.option("--data", type=str, required=True, help="Path to the training data")
 @click.option(
     "--output_folder",
     type=str,
@@ -168,21 +178,35 @@ def fvs_vcf(vcf, chrom, contig_length, window_size, step, nthreads):
     help="Output folder for the CNN model and logs",
 )
 @click.option(
+    "--output_prediction",
+    type=str,
+    default="predictions.txt",
+    help="Prediction file name. Saved on output_folder",
+)
+@click.option(
     "--mode",
     type=click.Choice(["train", "predict"]),
     required=True,
     help="Mode: 'train' or 'predict'",
 )
-def cnn(train_data, output_folder, mode):
+@click.option(
+    "--model",
+    type=str,
+    default=None,
+    help="Input a pretrained model",
+)
+def cnn(data, output_folder, mode):
     """Run the Flexsweep CNN"""
     import flexsweep as fs
 
-    fs_cnn = fs.CNN(train_data, output_folder)
+    fs_cnn = fs.CNN(data, output_folder, output_prediction)
     if mode == "train":
         fs_cnn.train()
         d_prediction = fs_cnn.predict()
 
     if mode == "predict":
+        if model is not None:
+            fs_cnn.model = model
         fs_cnn.predict()
 
 

@@ -1,10 +1,10 @@
 import os
 
-from . import pd, np, Parallel, delayed
+# from . import pd, np, Parallel, delayed
 
-# import numpy as np
-# import pandas as pd
-# from joblib import Parallel, delayed
+import numpy as np
+import pandas as pd
+from joblib import Parallel, delayed
 
 import demes
 import subprocess
@@ -43,6 +43,7 @@ class Simulator:
         Args:
                 parameters (dataclass): A configuration dataclass containing simulation parameters and mean diffusion times.
         """
+        self.ne_0 = ne
         self.ne = ne
         self.sample_size = sample_size
         self.mutation_rate = mutation_rate
@@ -59,6 +60,7 @@ class Simulator:
         self.s = [0.001, 0.01]
         self.fixed_ratio = 0.1
         self.reset_simulations = False
+        self.demes_data = None
 
     def check_inputs(self):
         assert isinstance(
@@ -92,26 +94,29 @@ class Simulator:
         os.makedirs(self.output_folder + "/sweeps/", exist_ok=True)
         os.makedirs(self.output_folder + "/neutral/", exist_ok=True)
 
-        # discoal_demes = "constant"
+        discoal_demes = self.read_demes()
 
+        return discoal_demes
+
+    def read_demes(self):
         assert ".yaml" in self.demes, "Please input a demes model"
 
         pop_history = demes.load(self.demes).asdict_simplified()["demes"][0]["epochs"]
         df_epochs = pd.DataFrame.from_dict(pop_history).iloc[::-1]
 
+        self.demes_data = df_epochs
         if df_epochs.shape[1] > 2:
             df_epochs.iloc[0, 1] = df_epochs.iloc[0, 2]
-            self.ne = df_epochs.start_size.iloc[0]
+            self.ne_0 = df_epochs.start_size.iloc[0]
         else:
-            self.ne = df_epochs.start_size.values[0]
+            self.ne_0 = df_epochs.start_size.values[0]
 
-        epochs = df_epochs.end_time[1:].values / (4 * self.ne)
-        sizes = df_epochs.start_size.values[1:] / self.ne
+        epochs = df_epochs.end_time[1:].values / (4 * self.ne_0)
+        sizes = df_epochs.start_size.values[1:] / self.ne_0
 
         discoal_demes = " "
         for i, j in zip(epochs, sizes):
             discoal_demes += "-en {0:.20f} 0 {1:.20f} ".format(i, j)
-
         return discoal_demes
 
     def random_distribution(self, num):
@@ -188,16 +193,44 @@ class Simulator:
             }
         )
 
+        ms_neutral = list(
+            chain(
+                *Parallel(n_jobs=self.nthreads, verbose=0)(
+                    delayed(self.ms_parser)(m, seq_len=1.2e6) for m in sims_n
+                )
+            )
+        )
+
         # Sweep simulations
         mu, rho = self.random_distribution(self.num_simulations)
         theta_sweeps = 4 * self.ne * self.locus_length * mu
         rho_sweeps = 4 * self.ne * self.locus_length * rho
 
-        sel_time = np.round(
+        # sel_time = np.round(
+        #     np.random.uniform(self.time[0], self.time[1], self.num_simulations)
+        #     / (4 * self.ne),
+        #     3,
+        # )
+
+        sel_time = np.ceil(
             np.random.uniform(self.time[0], self.time[1], self.num_simulations)
-            / (4 * self.ne),
-            3,
         )
+
+        if len(self.demes_data.end_time.values) < 2:
+            # No intervals possible if arr1 has fewer than 2 elements
+            indices = np.full(sel_time.shape, -1).min()
+        else:
+            # Create a mask to find where each element in arr2 falls within intervals of arr1
+            mask = (sel_time[:, None] >= self.demes_data.end_time.values[:-1]) & (
+                sel_time[:, None] < self.demes_data.end_time.values[1:]
+            )
+
+            # Get the index of the interval where each sel_time element falls, or -1 if no match
+            indices = np.where(mask.any(axis=1), mask.argmax(axis=1), -1).min()
+
+        sel_time /= 4 * self.ne_0
+
+        self.ne = self.demes_data.start_size.values[indices]
         sel_coef = np.random.uniform(
             2 * self.ne * self.s[0], 2 * self.ne * self.s[1], self.num_simulations
         )
@@ -251,14 +284,6 @@ class Simulator:
             )
         )
 
-        ms_neutral = list(
-            chain(
-                *Parallel(n_jobs=self.nthreads, verbose=0)(
-                    delayed(self.ms_parser)(m, seq_len=1.2e6) for m in sims_n
-                )
-            )
-        )
-
         df_sweeps = pd.DataFrame(
             {
                 "iter": np.arange(1, self.num_simulations + 1),
@@ -272,6 +297,8 @@ class Simulator:
             }
         )
 
+        params = df_sweeps.loc[:, ["s", "t", "saf", "eaf"]].values
+
         ms_sweeps = list(
             chain(
                 *Parallel(n_jobs=self.nthreads, verbose=0)(
@@ -280,8 +307,6 @@ class Simulator:
                 )
             )
         )
-
-        params = df_sweeps.loc[:, ["s", "t", "saf", "eaf"]].values
 
         df = pd.concat([df_neutral, df_sweeps])
         df.to_csv(self.output_folder + "/params.txt.gz", index=False)
