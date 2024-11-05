@@ -1,10 +1,10 @@
-from . import pd, np, Parallel, delayed
+# from . import pd, np, Parallel, delayed
 
 from allel import read_vcf, GenotypeArray, index_windows
 
-# import numpy as np
-# import pandas as pd
-# from joblib import Parallel, delayed
+import numpy as np
+import pandas as pd
+from joblib import Parallel, delayed
 from scipy.interpolate import interp1d
 from itertools import chain
 from tqdm import tqdm
@@ -43,10 +43,10 @@ class Data:
             "ignore", message="invalid INFO header", module="allel.io.vcf_read"
         )
 
-        raw_data = allel.read_vcf(self.data, region=region, samples=samples)
+        raw_data = read_vcf(self.data, region=region, samples=samples)
 
         try:
-            gt = allel.GenotypeArray(raw_data["calldata/GT"])
+            gt = GenotypeArray(raw_data["calldata/GT"])
         except:
             gt = np.array([])
 
@@ -73,11 +73,14 @@ class Data:
                 {"chrom": np_chrom, "idx": np.arange(pos.size), "pos": pos, "cm": pos}
             ).values
         else:
-            df_recombination_map = pd.read_csv(self.recombination_map, sep="\t")
+            df_recombination_map = pd.read_csv(self.recombination_map, sep=",")
             genetic_distance = self.get_cm(df_recombination_map, pos)
             rec_map = pd.DataFrame(
-                [chrom, np.arange(pos.size), pos, genetic_distance]
+                [np_chrom, np.arange(pos.size), pos, genetic_distance]
             ).T.values
+
+            if np.all(rec_map[:, -1] == 0):
+                rec_map[:, -1] = pos
 
             # # physical position to relative physical position (1,1.2e6)
             # # this way we do not perform any change on summary_statistics center/windows combinations
@@ -87,7 +90,7 @@ class Data:
         # return hap
         return {region: (hap.values, rec_map[:, [0, 1, -1, 2]])}
 
-    def read_vcf(self, chrom, contig_length):
+    def read_vcf(self, contig_name, contig_length):
         assert (
             "zarr" in self.data
             or "vcf" in self.data
@@ -102,7 +105,7 @@ class Data:
             step = int(self.step)
 
         window_iter = list(
-            allel.index_windows(
+            index_windows(
                 np.arange(1, int(contig_length) + 1),
                 int(self.window_size),
                 1,
@@ -113,7 +116,7 @@ class Data:
 
         region_data = Parallel(n_jobs=self.nthreads, verbose=5)(
             delayed(self.genome_reader)(
-                chrom + ":" + str(w[0]) + "-" + str(w[1]), self.samples
+                contig_name + ":" + str(w[0]) + "-" + str(w[1]), self.samples
             )
             for w in window_iter
         )
@@ -123,8 +126,10 @@ class Data:
         sims = {"sweeps": [], "region": []}
         for k, v in out_dict.items():
             if v is not None:
-                sims["sweeps"].append(v)
-                sims["regions"].append(k)
+                tmp = list(v)
+                tmp.append(np.zeros(4))
+                sims["sweeps"].append(tmp)
+                sims["region"].append(k)
 
         return sims
 
@@ -337,7 +342,7 @@ class Data:
         # Create the interpolating function
         interp_func = interp1d(
             df_rec_map.iloc[:, 1].values,
-            df_rec_map.iloc[:, 3].values,
+            df_rec_map.iloc[:, -1].values,
             kind="linear",
             fill_value="extrapolate",
         )

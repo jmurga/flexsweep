@@ -64,31 +64,11 @@ class Simulator:
 
     def check_inputs(self):
         assert isinstance(
-            self.mutation_rate, dict
+            self.mutation_rate, list
         ), "Please input distribution and mutation rates values"
         assert isinstance(
-            self.recombination_rate, dict
+            self.recombination_rate, list
         ), "Please input distribution and recombination_rate values"
-
-        assert (
-            "dist" in self.mutation_rate.keys()
-        ), "Please input a dict with the choosen distribution to pick mu values"
-        assert self.mutation_rate["dist"] in [
-            "fixed",
-            "uniform",
-            "truncnorm",
-            "exponential",
-        ], "Please input the proper distribution and values: mutation_rate = {'dist':'uniform,'mean':mu/rho} | {'dist':'uniform','lower':mu/rho,'upper':mu/rho},{'dist':'truncnorm','mean':mu/rho,'std':mu/rho,'min':mu/rho,'max':mu/rho},{'dist':'exponential,'mean':mu/rho}"
-
-        assert (
-            "dist" in self.recombination_rate.keys()
-        ), "Please input a dict with the choosen distribution to pick mu values"
-        assert self.recombination_rate["dist"] in [
-            "fixed",
-            "uniform",
-            "truncnorm",
-            "exponential",
-        ], "Please input the proper distribution and values: mutation_rate = {'dist':'uniform,'mean':mu/rho} | {'dist':'uniform','lower':mu/rho,'upper':mu/rho},{'dist':'truncnorm','mean':mu/rho,'std':mu/rho,'min':mu/rho,'max':mu/rho},{'dist':'exponential,'mean':mu/rho}"
 
         os.makedirs(self.output_folder, exist_ok=True)
         os.makedirs(self.output_folder + "/sweeps/", exist_ok=True)
@@ -108,8 +88,10 @@ class Simulator:
         if df_epochs.shape[1] > 2:
             df_epochs.iloc[0, 1] = df_epochs.iloc[0, 2]
             self.ne_0 = df_epochs.start_size.iloc[0]
+            self.ne = self.ne_0
         else:
             self.ne_0 = df_epochs.start_size.values[0]
+            self.ne = self.ne_0
 
         epochs = df_epochs.end_time[1:].values / (4 * self.ne_0)
         sizes = df_epochs.start_size.values[1:] / self.ne_0
@@ -120,49 +102,12 @@ class Simulator:
         return discoal_demes
 
     def random_distribution(self, num):
-        if (self.mutation_rate["dist"] == "exponential") or (
-            self.mutation_rate["dist"] == "uniform"
-        ):
-            dist = getattr(np.random, self.mutation_rate["dist"])
-            try:
-                mu = dist(self.mutation_rate["lower"], self.mutation_rate["upper"], num)
-            except:
-                mu = dist(self.mutation_rate["mean"], num)
-        elif self.mutation_rate["dist"] == "fixed":
-            next
-        else:
-            mu = stats.truncnorm(
-                (self.mutation_rate["min"] - self.mutation_rate["mean"])
-                / self.mutation_rate["std"],
-                (self.mutation_rate["max"] - self.mutation_rate["mean"])
-                / self.mutation_rate["std"],
-                loc=self.mutation_rate["mean"],
-                scale=self.mutation_rate["std"],
-            ).rvs(size=num)
-
-        if (self.recombination_rate["dist"] == "exponential") or (
-            self.recombination_rate["dist"] == "uniform"
-        ):
-            dist = getattr(np.random, self.recombination_rate["dist"])
-            try:
-                rho = dist(
-                    self.recombination_rate["lower"],
-                    self.recombination_rate["upper"],
-                    num,
-                )
-            except:
-                rho = dist(self.recombination_rate["mean"], num)
-        elif self.recombination_rate["dist"] == "fixed":
-            next
-        else:
-            rho = stats.truncnorm(
-                (self.recombination_rate["min"] - self.recombination_rate["mean"])
-                / self.recombination_rate["std"],
-                (self.recombination_rate["max"] - self.recombination_rate["mean"])
-                / self.recombination_rate["std"],
-                loc=self.recombination_rate["mean"],
-                scale=self.recombination_rate["std"],
-            ).rvs(size=num)
+        mu = np.random.uniform(self.mutation_rate[0], self.mutation_rate[1], num)
+        rho = np.random.uniform(
+            self.recombination_rate[0],
+            self.recombination_rate[1],
+            num,
+        )
 
         return mu, rho
 
@@ -206,31 +151,12 @@ class Simulator:
         theta_sweeps = 4 * self.ne * self.locus_length * mu
         rho_sweeps = 4 * self.ne * self.locus_length * rho
 
-        # sel_time = np.round(
-        #     np.random.uniform(self.time[0], self.time[1], self.num_simulations)
-        #     / (4 * self.ne),
-        #     3,
-        # )
-
-        sel_time = np.ceil(
+        sel_time = np.round(
             np.random.uniform(self.time[0], self.time[1], self.num_simulations)
+            / (4 * self.ne),
+            3,
         )
 
-        if len(self.demes_data.end_time.values) < 2:
-            # No intervals possible if arr1 has fewer than 2 elements
-            indices = np.full(sel_time.shape, -1).min()
-        else:
-            # Create a mask to find where each element in arr2 falls within intervals of arr1
-            mask = (sel_time[:, None] >= self.demes_data.end_time.values[:-1]) & (
-                sel_time[:, None] < self.demes_data.end_time.values[1:]
-            )
-
-            # Get the index of the interval where each sel_time element falls, or -1 if no match
-            indices = np.where(mask.any(axis=1), mask.argmax(axis=1), -1).min()
-
-        sel_time /= 4 * self.ne_0
-
-        self.ne = self.demes_data.start_size.values[indices]
         sel_coef = np.random.uniform(
             2 * self.ne * self.s[0], 2 * self.ne * self.s[1], self.num_simulations
         )

@@ -6,9 +6,9 @@ import pandas as pd
 import numpy as np
 import importlib
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_curve, roc_auc_score
 from itertools import product
 from collections import defaultdict
-
 
 # os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
@@ -29,7 +29,7 @@ class CNN:
         gpu (bool): Indicates whether to use GPU for training. Default is True.
     """
 
-    def __init__(self, train_data, output_folder, output_prediction="predictions.txt"):
+    def __init__(self, train_data, output_folder=None):
         """
         Initializes the CNN class with training data and output folder.
 
@@ -41,12 +41,14 @@ class CNN:
         self.train_data = train_data
         self.test_data = None
         self.output_folder = output_folder
-        self.output_prediction = output_prediction
+        self.output_prediction = "predicions.txt"
         self.num_stats = 11
         self.center = np.arange(5e5, 7e5 + 1e4, 1e4).astype(int)
         self.windows = np.array([50000, 100000, 200000, 500000, 1000000])
         self.number_stats = 11
         self.train_split = 0.8
+        self.prediction = None
+        self.history = None
         self.model = None
         self.gpu = True
         self.tf = None
@@ -374,7 +376,10 @@ class CNN:
         )
 
         df_history = pd.DataFrame(history.history)
-        df_history.to_csv(self.output_folder + "/model_history.txt", index=False)
+        self.history = df_history
+
+        if self.output_folder is not None:
+            model.save(self.output_folder + "/model.keras")
 
     def predict(self):
         """
@@ -469,15 +474,224 @@ class CNN:
 
             df_prediction = pd.concat(
                 [
-                    df_m.iloc[:, :5].reset_index(drop=True),
+                    df_m.iloc[:, [5, 1, 2, 3, 4]].reset_index(drop=True),
                     pd.DataFrame(
                         np.column_stack([predictions_class, preds]),
-                        columns=["predicted_class", "prob(sweep)", "prob(neutral)"],
+                        columns=["predicted_model", "prob(sweep)", "prob(neutral)"],
                     ),
                 ],
                 axis=1,
             )
             d_prediction[m] = df_prediction
 
-        # d_prediction.to_csv(self.output_folder + "/predictions.txt")
-        return d_prediction
+        df_prediction = pd.concat(d_prediction, axis=0).reset_index().iloc[:, 2:]
+        df_prediction.iloc[:, -2:] = df_prediction.iloc[:, -2:].astype(float)
+
+        self.prediction = df_prediction
+
+        if self.output_folder is not None:
+            df_prediction.to_csv(
+                self.output_folder + "/" + self.output_prediction, index=False
+            )
+
+        return df_prediction
+
+    def roc_curve(self):
+        """
+        Generates and plots ROC curves along with a history plot of model metrics.
+
+        Returns:
+            tuple: A tuple containing:
+                - plot_roc (Figure): The ROC curve plot.
+                - plot_history (Figure): The history plot of model metrics (loss, validation loss, accuracy, validation accuracy).
+
+        Example:
+            roc_plot, history_plot = model.roc_curves()
+            plt.show(roc_plot)
+            plt.show(history_plot)
+        """
+        import matplotlib.pyplot as plt
+
+        pred_data = self.prediction
+
+        # Create confusion dataframe
+        confusion_data = (
+            pred_data.groupby(["model", "predicted_model"]).size().reset_index(name="n")
+        )
+
+        confusion_data["true_false"] = np.select(
+            [
+                (confusion_data["model"] == confusion_data["predicted_model"])
+                & (confusion_data["model"] == "neutral"),
+                (confusion_data["model"] == confusion_data["predicted_model"])
+                & (confusion_data["model"] == "sweep"),
+                (confusion_data["model"] != confusion_data["predicted_model"])
+                & (confusion_data["model"] == "neutral"),
+            ],
+            ["true_negative", "true_positive", "false_positive"],
+            default="false_negative",
+        )
+
+        confusion_pivot = confusion_data.pivot_table(
+            index=None, columns="true_false", values="n", fill_value=0
+        ).reset_index(drop=True)
+
+        rate_data = confusion_pivot.copy()
+
+        # Compute the required row sums for normalization
+        required_cols = [
+            "false_negative",
+            "false_positive",
+            "true_negative",
+            "true_positive",
+        ]
+        for col in required_cols:
+            if col not in rate_data.columns:
+                rate_data[col] = 0
+
+        # Calculate row sums for normalization
+        rate_data["sum_fn_tp"] = rate_data[["false_negative", "true_positive"]].sum(
+            axis=1
+        )
+        rate_data["sum_fp_tn"] = rate_data[["false_positive", "true_negative"]].sum(
+            axis=1
+        )
+
+        # Compute normalized rates
+        rate_data["false_negative"] = (
+            rate_data["false_negative"] / rate_data["sum_fn_tp"]
+        )
+        rate_data["false_positive"] = (
+            rate_data["false_positive"] / rate_data["sum_fp_tn"]
+        )
+        rate_data["true_negative"] = rate_data["true_negative"] / rate_data["sum_fp_tn"]
+        rate_data["true_positive"] = rate_data["true_positive"] / rate_data["sum_fn_tp"]
+
+        # Replace NaN values with 0
+        rate_data[
+            ["false_negative", "false_positive", "true_negative", "true_positive"]
+        ] = rate_data[
+            ["false_negative", "false_positive", "true_negative", "true_positive"]
+        ].fillna(
+            0
+        )
+
+        # Calculate accuracy and precision
+        rate_data["accuracy"] = (
+            rate_data["true_positive"] + rate_data["true_negative"]
+        ) / (
+            rate_data["true_positive"]
+            + rate_data["true_negative"]
+            + rate_data["false_positive"]
+            + rate_data["false_negative"]
+        )
+
+        rate_data["precision"] = rate_data["true_positive"] / (
+            rate_data["true_positive"] + rate_data["false_positive"]
+        )
+        rate_data["precision"] = rate_data["precision"].fillna(
+            0
+        )  # Handle division by zero if any
+
+        # Compute ROC AUC and prepare roc_data. Set 'sweep' as the positive class
+        pred_rate_auc_data = pred_data.copy()
+        pred_rate_auc_data["model"] = pd.Categorical(
+            pred_rate_auc_data["model"], categories=["sweep", "neutral"], ordered=True
+        )
+
+        # Calculate ROC AUC
+        roc_auc_value = roc_auc_score(
+            (pred_rate_auc_data["model"] == "sweep").astype(int),
+            pred_rate_auc_data["prob(sweep)"],
+        )
+
+        # Create roc_data DataFrame
+        roc_data = pd.DataFrame({"AUC": [roc_auc_value]})
+
+        rate_roc_data = pd.concat([rate_data, roc_data], axis=1)
+
+        for col in rate_roc_data.columns:
+            pred_rate_auc_data[col] = rate_roc_data.iloc[0][col]
+
+        # Compute ROC curve using sklearn
+        fpr, tpr, thresholds = roc_curve(
+            (pred_rate_auc_data["model"] == "sweep").astype(int),
+            pred_rate_auc_data["prob(sweep)"],
+        )
+
+        roc_df = pd.DataFrame({"false_positive_rate": fpr, "sensitivity": tpr})
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(
+            roc_df["false_positive_rate"],
+            roc_df["sensitivity"],
+            color="orange",
+            linewidth=2,
+            label="ROC Curve",
+        )
+        ax.plot(
+            [0, 1], [0, 1], color="grey", linestyle="--"
+        )  # Diagonal line for reference
+        ax.set_xlabel("false positive rate")
+        ax.set_ylabel("power")
+        ax.set_title("ROC Curve")
+        ax.axis("equal")  # Equivalent to coord_equal in ggplot
+        ax.grid(True, which="both", linestyle="--", linewidth=0.5)
+        ax.legend()
+        fig.tight_layout()
+        plot_roc = fig
+
+        ## History
+        # Load and preprocess the data
+        history_data = self.history
+        h = history_data[["loss", "val_loss", "accuracy", "val_accuracy"]].copy()
+        h["epoch"] = h.index + 1
+        h_melted = h.melt(
+            id_vars="epoch",
+            value_vars=["loss", "val_loss", "accuracy", "val_accuracy"],
+            var_name="metric_name",
+            value_name="metric_val",
+        )
+
+        h_melted[["A", "B"]] = h_melted["metric_name"].str.split("_", expand=True)
+        h_melted["B"] = h_melted["B"].fillna(h_melted["A"])
+        h_melted["A"] = h_melted["A"].replace({"val": "validation"})
+
+        line_styles = {
+            "loss": "-",
+            "val_loss": "--",
+            "accuracy": "-",
+            "val_accuracy": "--",
+        }
+        colors = {
+            "loss": "orange",
+            "val_loss": "orange",
+            "accuracy": "blue",
+            "val_accuracy": "blue",
+        }
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        for _, df in h_melted.groupby("metric_name"):
+            ax.plot(
+                df["epoch"],
+                df["metric_val"],
+                label=df["metric_name"].iloc[0],
+                linestyle=line_styles[df["metric_name"].iloc[0]],
+                color=colors[df["metric_name"].iloc[0]],
+                linewidth=2,
+            )
+
+        ax.set_title("History")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Value")
+        ax.tick_params(axis="both", labelsize=10)
+        ax.grid(True)
+        ax.legend(title="", loc="upper right")
+
+        plot_history = fig
+
+        if self.output_folder is not None:
+            plot_roc.savefig(self.output_folder + "/roc_curve.svg")
+            plot_history.savefig(self.output_folder + "/train_history.svg")
+        return plot_roc, plot_history

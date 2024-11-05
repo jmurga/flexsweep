@@ -13,12 +13,12 @@ threadpoolctl.threadpool_limits(1)
 
 import subprocess
 
-from . import pd, np, Parallel, delayed
-from .data import Data
+# from . import pd, np, Parallel, delayed
+# from .data import Data
 
-# import pandas as pd
-# import numpy as np
-# from joblib import Parallel, delayed
+import pandas as pd
+import numpy as np
+from joblib import Parallel, delayed
 
 from math import comb
 from functools import partial, reduce
@@ -92,7 +92,7 @@ def mispolarize(hap, proportion=0.1):
     return hap_copy
 
 
-def filter_gt(hap, rec_map):
+def filter_gt(hap, rec_map, region=None):
     """
     Convert the 2d numpy haplotype matrix to HaplotypeArray from scikit-allel and change type np.int8. It filters and processes the haplotype matrix based on a recombination map and
     returns key information for further analysis such as allele frequencies and physical positions.
@@ -130,17 +130,24 @@ def filter_gt(hap, rec_map):
         except:
             hap = HaplotypeArray(load(hap).genotype_matrix())
 
-    positions = rec_map[:, 2]
-    physical_position = rec_map[:, 2]
+    # positions = rec_map[:, -1]
+    # physical_position = rec_map[:, -2]
 
     # HAP matrix centered to analyse whole chromosome
     hap_01, ac, biallelic_mask = filter_biallelics(hap)
     hap_int = hap_01.astype(np.int8)
     rec_map_01 = rec_map[biallelic_mask]
-    position_masked = rec_map_01[:, 2]
     sequence_length = int(1.2e6)
-
     freqs = ac.to_frequencies()[:, 1]
+
+    if region is not None:
+        tmp = list(map(int, region.split(":")[-1].split("-")))
+        d_pos = dict(zip(np.arange(tmp[0], tmp[1]), np.arange(sequence_length) + 1))
+        for r in rec_map_01:
+            r[-1] = d_pos[r[-1]]
+
+    position_masked = rec_map_01[:, -1]
+    physical_position_masked = rec_map_01[:, -2]
 
     return (
         hap_01,
@@ -149,7 +156,73 @@ def filter_gt(hap, rec_map):
         hap_int,
         rec_map_01,
         position_masked,
+        physical_position_masked,
         sequence_length,
+        freqs,
+    )
+
+
+def filter_gt2(hap, rec_map, region=None):
+    """
+    Convert the 2d numpy haplotype matrix to HaplotypeArray from scikit-allel and change type np.int8. It filters and processes the haplotype matrix based on a recombination map and
+    returns key information for further analysis such as allele frequencies and physical positions.
+
+    Parameters
+    ----------
+    hap : array-like, HaplotypeArray
+        The input haplotype data which can be in one of the following forms:
+        - A `HaplotypeArray` object.
+        - A genotype matrix (as a numpy array or similar).
+
+    rec_map : numpy.ndarray
+        A 2D numpy array representing the recombination map, where each row corresponds
+        to a genomic variant and contains recombination information. The third column (index 2)
+        of the recombination map provides the physical positions of the variants.
+
+    Returns
+    -------
+    tuple
+        A tuple containing the following elements:
+        - hap_01 (numpy.ndarray): The filtered haplotype matrix, with only biallelic variants.
+        - ac (AlleleCounts): An object that stores allele counts for the filtered variants.
+        - biallelic_mask (numpy.ndarray): A boolean mask indicating which variants are biallelic.
+        - hap_int (numpy.ndarray): The haplotype matrix converted to integer format (int8).
+        - rec_map_01 (numpy.ndarray): The recombination map filtered to include only biallelic variants.
+        - position_masked (numpy.ndarray): The physical positions of the biallelic variants.
+        - sequence_length (int): An arbitrary sequence length set to 1.2 million bases (1.2e6).
+        - freqs (numpy.ndarray): The frequencies of the alternate alleles for each biallelic variant.
+    """
+    try:
+        # Avoid unnecessary conversion if hap is already a HaplotypeArray
+        if not isinstance(hap, HaplotypeArray):
+            hap = HaplotypeArray(
+                hap if isinstance(hap, np.ndarray) else hap.genotype_matrix()
+            )
+    except:
+        hap = HaplotypeArray(load(hap).genotype_matrix())
+
+    # positions = rec_map[:, -1]
+    # physical_position = rec_map[:, -2]
+
+    # HAP matrix centered to analyse whole chromosome
+    hap_01, ac, freqs, biallelic_mask = filter_biallelics2(hap)
+    sequence_length = int(1.2e6)
+
+    if region is not None:
+        tmp = list(map(int, region.split(":")[-1].split("-")))
+        d_pos = dict(zip(np.arange(tmp[0], tmp[1]), np.arange(sequence_length) + 1))
+        for r in rec_map_01:
+            r[-1] = d_pos[r[-1]]
+
+    rec_map_01 = rec_map[biallelic_mask]
+    position_masked = rec_map_01[:, -1]
+    physical_position_masked = rec_map_01[:, -2]
+
+    return (
+        hap_01,
+        ac,
+        biallelic_mask,
+        physical_position_masked,
         freqs,
     )
 
@@ -168,6 +241,30 @@ def filter_biallelics(hap: HaplotypeArray) -> tuple:
     ac = hap.count_alleles()
     biallelic_mask = ac.is_biallelic_01()
     return (hap.subset(biallelic_mask), ac[biallelic_mask, :], biallelic_mask)
+
+
+def filter_biallelics2(hap: HaplotypeArray) -> tuple:
+    """
+    Filter out non-biallelic loci from the haplotype data.
+
+    Args:
+        hap (allel.HaplotypeArray): Haplotype data represented as a HaplotypeArray.
+
+    Returns:
+        tuple: A tuple containing three elements:
+            - hap_biallelic (allel.HaplotypeArray): Filtered biallelic haplotype data.
+            - ac_biallelic (numpy.ndarray): Allele counts for the biallelic loci.
+            - biallelic_mask (numpy.ndarray): Boolean mask indicating biallelic loci.
+    """
+    ac = hap.count_alleles()
+    biallelic_mask = ac.is_biallelic_01()
+
+    # Use a subset to filter directly, minimizing intermediate memory usage
+    hap_biallelic = hap.subset(biallelic_mask)
+
+    ac_biallelic = ac[biallelic_mask]
+
+    return (hap_biallelic.values, ac_biallelic.values, biallelic_mask)
 
 
 pd_merger = partial(pd.merge, how="outer")
@@ -201,6 +298,7 @@ def calculate_stats(
     step=1e4,
     neutral=False,
     mispolarize_ratio=None,
+    region=None,
 ):
     """
     Computes population genetic statistics across a given haplotype matrix,
@@ -282,9 +380,10 @@ def calculate_stats(
         hap_int,
         rec_map_01,
         position_masked,
+        physical_position_masked,
         sequence_length,
         freqs,
-    ) = filter_gt(hap, rec_map)
+    ) = filter_gt(hap, rec_map, region=region)
 
     if len(center) == 1:
         centers = np.arange(center[0], center[0] + step, step).astype(int)
@@ -304,6 +403,12 @@ def calculate_stats(
 
     haf_v = haf_top(hap_int.astype(np.float64), position_masked)
 
+    daf_w = 1.0
+    pos_w = int(6e5)
+    if np.isnan(h12_v) & np.isnan(haf_v):
+        daf_w = np.nan
+        pos_w = np.nan
+
     df_snps = reduce(
         pd_merger,
         [
@@ -320,7 +425,7 @@ def calculate_stats(
     df_snps.positions = df_snps.positions.astype(int)
 
     df_window = pd.DataFrame(
-        [[_iter, int(6e5), int(1e6), int(6e5), 1.0, h12_v, haf_v]],
+        [[_iter, int(6e5), int(1e6), pos_w, daf_w, h12_v, haf_v]],
         columns=["iter", "center", "window", "positions", "daf", "h12", "haf"],
     )
 
@@ -330,13 +435,14 @@ def calculate_stats(
         upper = c + w / 2
 
         p_mask = (position_masked >= lower) & (position_masked <= upper)
+        p_mask
         f_mask = freqs >= 0.05
 
         # Check whether the hap subset is empty or not
         if hap_int[p_mask].shape[0] == 0:
             df_centers_stats = pd.DataFrame(
                 {
-                    "iter": i,
+                    "iter": _iter,
                     "center": c,
                     "window": w,
                     "positions": np.nan,
@@ -354,10 +460,12 @@ def calculate_stats(
             df_ihs = ihs_ihh(
                 hap_01[p_mask],
                 position_masked[p_mask],
+                map_pos=physical_position_masked[p_mask],
                 min_ehh=0.05,
                 min_maf=0.05,
                 include_edges=False,
             )
+
             # df_ihs = run_hapbin(hap_int[p_mask], rec_map_01[p_mask], _iter=i, cutoff=0.05)
 
             nsl_v = nsl(hap_01.subset((p_mask) & (f_mask)), use_threads=False)
@@ -395,6 +503,10 @@ def calculate_stats(
     )
 
     df_stats = pd.merge(df_snps, df_window, how="outer")
+
+    if region is not None:
+        df_stats["iter"] = df_stats.loc[:, "iter"].astype(str)
+        df_stats.loc[:, "iter"] = region
 
     if neutral:
         # Whole chromosome statistic to normalize
@@ -448,6 +560,251 @@ def calculate_stats(
         return df_stats, df_stats_norm
     else:
         return df_stats
+
+
+def calculate_stats2(
+    hap,
+    rec_map,
+    _iter=1,
+    center=[5e5, 7e5],
+    windows=[1000000],
+    step=1e4,
+    neutral=False,
+    mispolarize_ratio=None,
+    region=None,
+):
+    """
+    Computes population genetic statistics across a given haplotype matrix,
+    centered on specified genomic regions, and using a recombination map.
+    It supports optional mispolarization of the haplotype matrix.
+    If neutral flag the estimation will be performed by calculating whole-chromosome statistics
+    to perfomr later neutral normalization.
+
+    Statistics calculated:
+    - iHS (Integrated haplotype score, Voight et al. 2006)
+    - nSL (Number of segregating sites by length, Ferrer-Admetlla et al. 2014)
+    - DIND (Derived intra-allelic nucleotide diversity, Barreiro et al. 2009)
+    - iSAFE (Integrated selection of allele favored by evolution, Akbari et al. 2018)
+    - HAF (Haplotype allele frequency, Ronen et al. 2015)
+    - H12 (Frequencies of first and second most common haplotypes, modified to use 80% identity threshold, Garud et al. 2015)
+    - hapdaf_o (Haplotype-derived allele frequency (old), Lauterbur et al. 2023)
+    - hapdaf_s (Haplotype-derived allele frequency (standing), Lauterbur et al. 2023)
+    - s_ratio (Segregating sites ratio, Lauterbur et al. 2023)
+    - lowfreq (Low-frequency alleles on derived background, Lauterbur et al. 2023)
+    - highfreq (High-frequency alleles on derived background, Lauterbur et al. 2023)
+
+    Parameters
+    ----------
+    hap : HaplotypeArray or numpy.ndarray
+        The input haplotype matrix or an object that can be converted to a haplotype matrix.
+
+    rec_map : numpy.ndarray
+        A 2D numpy array representing the recombination map, where each row corresponds
+        to a variant and contains recombination information. The third column (index 2)
+        is used for the physical positions of the variants.
+
+    _iter : int, optional (default=1)
+        An integer representing the iteration number or replicate for the analysis.
+
+    center : list of float, optional (default=[5e5, 7e5])
+        A list specifying the center positions (in base pairs) for the analysis window.
+        If one center is provided, it will use that as a single point; otherwise, it
+        calculates a range between the two provided points.
+
+    windows : list of int, optional (default=[1000000])
+        A list of window sizes (in base pairs) over which statistics will be calculated.
+
+    step : float, optional (default=1e4)
+        The step size (in base pairs) for sliding windows in the analysis.
+
+    neutral : bool, optional (default=False)
+        A flag indicating whether to normalize the statistics based on neutral expectations.
+        If True, the estimation will be performed by calculating whole-chromosome statistics.
+
+    mispolarize_ratio : float or None, optional (default=None)
+        A float representing the proportion of variants to mispolarize in the haplotype matrix.
+        If None, no mispolarization is applied.
+
+    Returns
+    -------
+    df_stats : pandas.DataFrame
+        A DataFrame containing the computed statistics for each genomic window and
+        population genetic measure.
+
+    df_stats_norm : pandas.DataFrame, optional
+        If `neutral=True`, an additional DataFrame is returned containing the normalized
+        statistics based on neutral expectations. If `neutral=False`, only `df_stats` is returned.
+    """
+
+    filterwarnings(
+        "ignore",
+        category=RuntimeWarning,
+        message="invalid value encountered in scalar divide",
+    )
+    np.seterr(divide="ignore", invalid="ignore")
+
+    if mispolarize_ratio is not None:
+        hap = mispolarize(hap, mispolarize_ratio)
+
+    # Open and filtering data
+    (
+        hap_int,
+        rec_map_01,
+        ac,
+        biallelic_mask,
+        position_masked,
+        physical_position_masked,
+        freqs,
+    ) = filter_gt2(hap, rec_map, region=region)
+    freqs = ac[:, 1] / ac.sum(axis=1)
+
+    if len(center) == 1:
+        centers = np.arange(center[0], center[0] + step, step).astype(int)
+    else:
+        centers = np.arange(center[0], center[1] + step, step).astype(int)
+
+    df_dind_high_low = dind_high_low(hap_int, ac, rec_map_01)
+    df_s_ratio = s_ratio(hap_int, ac, rec_map_01)
+    df_hapdaf_o = hapdaf_o(hap_int, ac, rec_map_01)
+    df_hapdaf_s = hapdaf_s(hap_int, ac, rec_map_01)
+
+    try:
+        h12_v = h12_enard(
+            hap_int, rec_map_01, window_size=int(5e5) if neutral else int(1.2e6)
+        )
+        # h12_v = run_h12(hap, rec_map, _iter=_iter, neutral=neutral)
+    except:
+        h12_v = np.nan
+
+    haf_v = haf_top(hap_int.astype(np.float64), position_masked)
+
+    daf_w = 1.0
+    pos_w = int(6e5)
+    if np.isnan(h12_v) & np.isnan(haf_v):
+        daf_w = np.nan
+        pos_w = np.nan
+
+    df_snps = reduce(
+        pd_merger,
+        [
+            df_dind_high_low,
+            df_s_ratio,
+            df_hapdaf_o,
+            df_hapdaf_s,
+        ],
+    )
+
+    df_snps.insert(0, "iter", _iter)
+    df_snps["positions"] = df_snps["positions"].astype(np.int32)
+
+    d_centers = {}
+
+    for c, w in product(centers, windows):
+        lower = c - w / 2
+        upper = c + w / 2
+
+        p_mask = (position_masked >= lower) & (position_masked <= upper)
+        p_mask
+        f_mask = freqs >= 0.05
+
+        # Check whether the hap subset is empty or not
+        if hap_int[p_mask].shape[0] == 0:
+            df_centers_stats = pd.DataFrame(
+                {
+                    "iter": _iter,
+                    # "center": c,
+                    # "window": w,
+                    "positions": np.nan,
+                    "daf": np.nan,
+                    "isafe": np.nan,
+                    "ihs": np.nan,
+                    "nsl": np.nan,
+                },
+                index=[0],
+            )
+            d_centers[c] = df_centers_stats
+        else:
+            df_isafe = run_isafe(hap_int[p_mask], position_masked[p_mask])
+
+            # iHS and nSL
+            df_ihs = ihs_ihh(
+                hap_int[p_mask],
+                position_masked[p_mask],
+                map_pos=physical_position_masked[p_mask],
+                min_ehh=0.05,
+                min_maf=0.05,
+                include_edges=False,
+            )
+
+            nsl_v = nsl(hap_int[(p_mask) & (f_mask)], use_threads=False)
+
+            df_nsl = pd.DataFrame(
+                {
+                    "positions": position_masked[(p_mask) & (f_mask)],
+                    "daf": freqs[(p_mask) & (f_mask)],
+                    "nsl": nsl_v,
+                }
+            )
+
+            # Consolidate the merge to reduce memory usage
+            df_centers_stats = reduce(pd_merger, [df_isafe, df_ihs, df_nsl])
+
+            df_centers_stats.insert(0, "iter", _iter)
+
+            # Avoid redundant merge
+            if c == int(6e5):
+                d_centers[c] = pd.merge(df_centers_stats, df_snps, how="outer")
+            else:
+                d_centers[c] = df_centers_stats
+
+    if region is not None:
+        for df in d_centers.values():
+            df["iter"] = region
+
+    if neutral:
+        # Whole chromosome statistic to normalize
+        df_isafe = run_isafe(hap_int, position_masked)
+        df_ihs = ihs_ihh(hap_int, position_masked, min_ehh=0.1, include_edges=True)
+        nsl_v = nsl(hap_int[(freqs >= 0.05)], use_threads=False)
+
+        df_nsl = pd.DataFrame(
+            {
+                "positions": position_masked[freqs >= 0.05],
+                "daf": freqs[freqs >= 0.05],
+                "nsl": nsl_v,
+            }
+        )
+
+        df_snps_norm = reduce(
+            pd_merger,
+            [
+                df_snps.iloc[
+                    :,
+                    ~df_snps.columns.isin(
+                        [
+                            "iter",
+                            "delta_ihh",
+                            "ihs",
+                            "isafe",
+                            "nsl",
+                        ]
+                    ),
+                ],
+                df_isafe,
+                df_ihs,
+                df_nsl,
+            ],
+        )
+
+        df_snps_norm.insert(0, "iter", _iter)
+
+        df_snps_norm.sort_values(by=["positions"], inplace=True).reset_index(drop=True)
+        # df_window.window = int(1.2e6)
+        df_stats_norm = pd.merge(df_snps_norm, df_window, how="outer")
+
+        return d_centers, df_stats_norm
+    else:
+        return d_centers
 
 
 def summary_statistics(
@@ -512,15 +869,19 @@ def summary_statistics(
                 neutral_norm = pickle.load(handle)
         else:
             neutral_norm = None
-    elif isinstance(data, list) or isinstance(data, tuple):
-        sims = {"sweeps": sims, "neutral": []}
+        regions = [None] * len(sims["sweeps"])
 
+    elif isinstance(data, dict) and "region" in data.keys():
+        assert neutral_save is not None, "Input neutral bins"
+
+        sims = {"sweeps": data["sweeps"], "neutral": []}
         with open(neutral_save, "rb") as handle:
             neutral_norm = pickle.load(handle)
         fvs_file = os.getcwd() + "/fvs.parquet"
 
         print("Output files will be written at {}".format(os.getcwd()))
-    elif isinstance(data, dict):
+
+    elif isinstance(data, dict) and "neutral" in data.keys():
         neutral_save = os.getcwd() + "/neutral_bins.pickle"
         fvs_file = os.getcwd() + "/fvs.parquet"
 
@@ -532,19 +893,25 @@ def summary_statistics(
     ), "Please input neutral and sweep simulations"
 
     for k, s in sims.items():
-        pars = [(i[0], i[1]) for i in s]
+        try:
+            regions = list(data["region"])
+            pars = [i[0][:2] + [i[1]] for i in zip(s, regions)]
+        except:
+            pars = [(i[0][:2] + (None,)) for i in zip(s, regions)]
+
         # Use joblib to parallelize the execution
         summ_stats = Parallel(n_jobs=nthreads, backend="multiprocessing", verbose=5)(
-            delayed(calculate_stats)(
-                ts,
+            delayed(calculate_stats2)(
+                hap,
                 rec_map,
                 _iter,
                 center=center,
                 step=step,
                 neutral=True if k == "neutral" else False,
                 mispolarize_ratio=mispolarize_ratio,
+                region=region,
             )
-            for _iter, (ts, rec_map) in enumerate(pars, 1)
+            for _iter, (hap, rec_map, region) in enumerate(pars, 1)
         )
 
         # Ensure params order
@@ -724,6 +1091,7 @@ def normalization(
 
     # Tried different nthreads/batch_size combinations for 100k sims, 200 threads
     df_fv_n = Parallel(n_jobs=nthreads, batch_size=1000, verbose=5)(
+        # df_fv_n = Parallel(n_jobs=nthreads, backend="multiprocessing", verbose=5)(
         delayed(normalize_cut)(
             _iter, v, expected=expected, stdev=stdev, center=center, windows=windows
         )
@@ -1664,7 +2032,7 @@ def sq_freq_pairs(hap, ac, rec_map, min_focal_freq, max_focal_freq, window_size)
         size = window_size / 2
 
         # Find indices within the window
-        z = np.flatnonzero(np.abs(rec_map[i, 2] - rec_map[:, 2]) <= size)
+        z = np.flatnonzero(np.abs(rec_map[i, -1] - rec_map[:, -1]) <= size)
 
         # Determine indices for slicing the arrays
         x_r, y_r = (i + 1, z[-1])
@@ -1694,7 +2062,7 @@ def sq_freq_pairs(hap, ac, rec_map, min_focal_freq, max_focal_freq, window_size)
         sq_out.append(sq_freqs)
 
         info.append(
-            (rec_map[i, 2], freqs[i], focal_derived_count[j], focal_ancestral_count[j])
+            (rec_map[i, -1], freqs[i], focal_derived_count[j], focal_ancestral_count[j])
         )
 
     return (sq_out, info)

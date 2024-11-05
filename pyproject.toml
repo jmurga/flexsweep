@@ -27,6 +27,7 @@ numba = "^0.60.0"
 demes = "^0.2.3"
 tensorflow = {extras = ["and-cuda"], version = "^2.18.0"}
 pyarrow = "^17.0.0"
+matplotlib = "^3.9.2"
 
 [tool.poetry.scripts]
 flexsweep = "flexsweep.main:cli"

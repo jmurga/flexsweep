@@ -4,13 +4,13 @@
 
 The second version of [Flexsweep software](https://doi.org/10.1093/molbev/msad139), a versatile tool for detecting selective sweeps. The software trains a convolutional neural network (CNN) to classify genomic loci as sweep or neutral regions. The workflow begins with simulating data under an appropriate demographic model and classify regions as neutral or sweeps, including several selection events regarding sweep strength, age, starting allele frequency (softness), and ending allele frequency (completeness).
 
-The new version simplifies and streamlines the project structure, files, simulations, summary statistics estimation and allows for the easy addition of custom CNN architectures. The software takes advantage of [demes](https://doi.org/10.1093/genetics/iyac131) to simulate custom demography histories and main [scikit-allel](https://scikit-allel.readthedocs.io/) formats data structures to avoid external software and temporal files. We included optimized versions of [iSAFE](https://doi.org/10.1038/nmeth.4606), [DIND](https://doi.org/10.1371/journal.pgen.1000562), hapdaf, S ratio, freqs as well as the custom HAF and H12 as described in [Flexsweep](https://doi.org/10.1093/molbev/msad139). The software now is also able to run the following statistics:
+The new version simplifies and streamlines the project structure, files, simulations, summary statistics estimation and allows for the easy addition of custom CNN architectures. The software takes advantage of [demes](https://doi.org/10.1093/genetics/iyac131) to simulate custom demography histories and main [scikit-allel](https://scikit-allel.readthedocs.io/) data structures to avoid external software and temporal files. The whole pipeline is parallelized using [joblib](https://joblib.readthedocs.io/en/stable/). We included optimized versions of [iSAFE](https://doi.org/10.1038/nmeth.4606), [DIND](https://doi.org/10.1371/journal.pgen.1000562), hapdaf, S ratio, freqs as well as the custom HAF and H12 as described in [Flexsweep manuscript](https://doi.org/10.1093/molbev/msad139). The software now is also able to run the following statistics:
 
 - [$\Delta$ IHH](https://doi.org/10.1126/science.1183863)
 - [$\pi$](https://scikit-allel.readthedocs.io/en/stable/stats/diversity.html#allel.mean_pairwise_difference)
-- [$\theta_{W}]([https://scikit-allel.readthedocs.io/en/stable/stats/diversity.html#allel.watterson_theta)
+- [$\theta_{W}$](https://scikit-allel.readthedocs.io/en/stable/stats/diversity.html#allel.watterson_theta)
 - [Kelly's Zns](https://doi.org/10.1093/genetics/146.3.1197)
-- [$\omega_{max}]([https://doi.org/10.1534/genetics.103.025387)
+- [$\omega_{max}$](https://doi.org/10.1534/genetics.103.025387)
 - [Fay & Wu's H](https://doi.org/10.1534/genetics.106.061432)
 - [Zeng's E](https://doi.org/10.1534/genetics.106.061432)
 - [Fu & Li's D and F](https://doi.org/10.1093/genetics/133.3.693)
