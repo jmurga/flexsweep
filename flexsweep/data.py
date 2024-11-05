@@ -155,6 +155,7 @@ class Data:
                     n_jobs=self.nthreads,
                     pre_dispatch="10*n_jobs",
                     batch_size=1000,
+                    backend="multiprocessing",
                     verbose=5,
                 )(
                     delayed(self.ms_parser)(m, param=p, seq_len=seq_len)
@@ -169,6 +170,7 @@ class Data:
                     n_jobs=self.nthreads,
                     pre_dispatch="10*n_jobs",
                     batch_size=1000,
+                    backend="multiprocessing",
                     verbose=5,
                 )(delayed(self.ms_parser)(m, seq_len=seq_len) for m in neutral)
             )

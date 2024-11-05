@@ -205,7 +205,7 @@ def filter_gt2(hap, rec_map, region=None):
     # physical_position = rec_map[:, -2]
 
     # HAP matrix centered to analyse whole chromosome
-    hap_01, ac, freqs, biallelic_mask = filter_biallelics2(hap)
+    hap_01, ac, biallelic_mask = filter_biallelics2(hap)
     sequence_length = int(1.2e6)
 
     if region is not None:
@@ -220,10 +220,11 @@ def filter_gt2(hap, rec_map, region=None):
 
     return (
         hap_01,
+        rec_map_01,
         ac,
         biallelic_mask,
+        position_masked,
         physical_position_masked,
-        freqs,
     )
 
 
@@ -563,8 +564,7 @@ def calculate_stats(
 
 
 def calculate_stats2(
-    hap,
-    rec_map,
+    hap_str,
     _iter=1,
     center=[5e5, 7e5],
     windows=[1000000],
@@ -636,6 +636,8 @@ def calculate_stats2(
         statistics based on neutral expectations. If `neutral=False`, only `df_stats` is returned.
     """
 
+    hap, rec_map, p = ms_parser(hap_str)
+
     filterwarnings(
         "ignore",
         category=RuntimeWarning,
@@ -654,7 +656,6 @@ def calculate_stats2(
         biallelic_mask,
         position_masked,
         physical_position_masked,
-        freqs,
     ) = filter_gt2(hap, rec_map, region=region)
     freqs = ac[:, 1] / ac.sum(axis=1)
 
@@ -798,7 +799,8 @@ def calculate_stats2(
 
         df_snps_norm.insert(0, "iter", _iter)
 
-        df_snps_norm.sort_values(by=["positions"], inplace=True).reset_index(drop=True)
+        df_snps_norm.sort_values(by=["positions"], inplace=True)
+        df_snps_norm.reset_index(drop=True, inplace=True)
         # df_window.window = int(1.2e6)
         df_stats_norm = pd.merge(df_snps_norm, df_window, how="outer")
 
@@ -893,6 +895,7 @@ def summary_statistics(
     ), "Please input neutral and sweep simulations"
 
     for k, s in sims.items():
+        # pars = s
         try:
             regions = list(data["region"])
             pars = [i[0][:2] + [i[1]] for i in zip(s, regions)]
@@ -901,17 +904,16 @@ def summary_statistics(
 
         # Use joblib to parallelize the execution
         summ_stats = Parallel(n_jobs=nthreads, backend="multiprocessing", verbose=5)(
-            delayed(calculate_stats2)(
+            delayed(calculate_stats)(
                 hap,
-                rec_map,
                 _iter,
                 center=center,
                 step=step,
                 neutral=True if k == "neutral" else False,
                 mispolarize_ratio=mispolarize_ratio,
-                region=region,
+                region=None,
             )
-            for _iter, (hap, rec_map, region) in enumerate(pars, 1)
+            for _iter, (hap) in enumerate(pars, 1)
         )
 
         # Ensure params order
@@ -3698,3 +3700,75 @@ def cut_t_m_argmax(
     out = pd.concat(out).reset_index(drop=True)
 
     return out
+
+
+def ms_parser(ms_file, param=None, seq_len=1.2e6):
+    """Read a ms file and output the positions and the genotypes.
+    Genotypes are a numpy array of 0s and 1s with shape (num_segsites, num_samples).
+    """
+
+    assert (
+        ms_file.endswith(".out")
+        or ms_file.endswith(".out.gz")
+        or ms_file.endswith(".ms")
+        or ms_file.endswith(".ms.gz")
+    )
+
+    open_function = gzip.open if ms_file.endswith(".gz") else open
+
+    with open_function(ms_file, "rt") as file:
+        file_content = file.read()
+
+    # Step 2: Split by pattern (e.g., `---`)
+    pattern = r"//"
+    partitions = re.split(pattern, file_content)
+
+    positions = []
+    haps = []
+    rec_map = []
+    for r in partitions[1:]:
+        # Read in number of segregating sites and positions
+        data = []
+        for line in r.splitlines()[1:]:
+            if line == "":
+                continue
+            # if "discoal" in line or "msout" in line:
+            # seq_len = int(line.strip().split()[3])
+            if line.startswith("segsites"):
+                num_segsites = int(line.strip().split()[1])
+                if num_segsites == 0:
+                    continue
+                    #     # Shape of data array for 0 segregating sites should be (0, 1)
+                    # return np.array([]), np.array([], ndmin=2, dtype=np.uint8).T
+            elif line.startswith("positions"):
+                tmp_pos = np.array([float(x) for x in line.strip().split()[1:]])
+                tmp_pos = np.round(tmp_pos * seq_len).astype(int)
+
+                # Find duplicates in the array
+                duplicates = np.diff(tmp_pos) == 0
+
+                # While there are any duplicates, increment them by 1
+                for i in np.where(duplicates)[0]:
+                    tmp_pos[i + 1] += 1
+                tmp_pos += 1
+                positions.append(tmp_pos)
+                tmp_map = np.column_stack(
+                    [
+                        np.repeat(1, tmp_pos.size),
+                        np.arange(tmp_pos.size),
+                        tmp_pos,
+                        tmp_pos,
+                    ]
+                )
+                rec_map.append(tmp_map)
+
+            else:
+                # Now read in the data
+                data.append(np.array(list(line), dtype=np.int8))
+        data = np.vstack(data).T
+        haps.append(data)
+
+    if param is None:
+        param = np.zeros(4)
+
+    return (haps[0], rec_map[0], param)
