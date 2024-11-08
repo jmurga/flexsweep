@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "flexsweep"
-version = "0.1.4"
+version = "0.1.6"
 description = ""
 authors = ["Jesus Murga-Moreno <murgamoreno@gmail.com>"]
 readme = "README.md"

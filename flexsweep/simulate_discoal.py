@@ -1,10 +1,10 @@
 import os
 
-# from . import pd, np, Parallel, delayed
+from . import pd, np, Parallel, delayed
 
-import numpy as np
-import pandas as pd
-from joblib import Parallel, delayed
+# import numpy as np
+# import pandas as pd
+# from joblib import Parallel, delayed
 
 import demes
 import subprocess
@@ -64,14 +64,14 @@ class Simulator:
 
     def check_inputs(self):
         assert isinstance(
-            self.mutation_rate, list
+            self.mutation_rate, dict
         ), "Please input distribution and mutation rates values"
         assert isinstance(
-            self.recombination_rate, list
+            self.recombination_rate, dict
         ), "Please input distribution and recombination_rate values"
 
         os.makedirs(self.output_folder, exist_ok=True)
-        os.makedirs(self.output_folder + "/sweeps/", exist_ok=True)
+        os.makedirs(self.output_folder + "/sweep/", exist_ok=True)
         os.makedirs(self.output_folder + "/neutral/", exist_ok=True)
 
         discoal_demes = self.read_demes()
@@ -102,12 +102,55 @@ class Simulator:
         return discoal_demes
 
     def random_distribution(self, num):
-        mu = np.random.uniform(self.mutation_rate[0], self.mutation_rate[1], num)
-        rho = np.random.uniform(
-            self.recombination_rate[0],
-            self.recombination_rate[1],
-            num,
-        )
+        if (self.mutation_rate["dist"] == "exponential") or (
+            self.mutation_rate["dist"] == "uniform"
+        ):
+            dist = getattr(np.random, self.mutation_rate["dist"])
+            try:
+                mu = dist(self.mutation_rate["lower"], self.mutation_rate["upper"], num)
+            except:
+                mu = dist(self.mutation_rate["mean"], num)
+        elif self.mutation_rate["dist"] == "fixed":
+            next
+        else:
+            mu = stats.truncnorm(
+                (self.mutation_rate["min"] - self.mutation_rate["mean"])
+                / self.mutation_rate["std"],
+                (self.mutation_rate["max"] - self.mutation_rate["mean"])
+                / self.mutation_rate["std"],
+                loc=self.mutation_rate["mean"],
+                scale=self.mutation_rate["std"],
+            ).rvs(size=num)
+
+        if (self.recombination_rate["dist"] == "exponential") or (
+            self.recombination_rate["dist"] == "uniform"
+        ):
+            dist = getattr(np.random, self.recombination_rate["dist"])
+            try:
+                rho = dist(
+                    self.recombination_rate["lower"],
+                    self.recombination_rate["upper"],
+                    num,
+                )
+            except:
+                rho = dist(self.recombination_rate["mean"], num)
+        elif self.recombination_rate["dist"] == "fixed":
+            next
+        else:
+            rho = stats.truncnorm(
+                (self.recombination_rate["min"] - self.recombination_rate["mean"])
+                / self.recombination_rate["std"],
+                (self.recombination_rate["max"] - self.recombination_rate["mean"])
+                / self.recombination_rate["std"],
+                loc=self.recombination_rate["mean"],
+                scale=self.recombination_rate["std"],
+            ).rvs(size=num)
+        # mu = np.random.uniform(self.mutation_rate[0], self.mutation_rate[1], num)
+        # rho = np.random.uniform(
+        #     self.recombination_rate[0],
+        #     self.recombination_rate[1],
+        #     num,
+        # )
 
         return mu, rho
 
@@ -238,7 +281,7 @@ class Simulator:
         df.to_csv(self.output_folder + "/params.txt.gz", index=False)
 
         sims = {
-            "sweeps": ms_sweeps,
+            "sweep": ms_sweeps,
             "neutral": ms_neutral,
         }
 
@@ -311,7 +354,7 @@ class Simulator:
         if discoal_demes != "constant":
             discoal_job += discoal_demes
 
-        output_file = self.output_folder + "/sweeps/sweep_" + str(_iter) + ".ms.gz"
+        output_file = self.output_folder + "/sweep/sweep_" + str(_iter) + ".ms.gz"
         with gzip.open(output_file, "wb") as output:
             result = subprocess.run(
                 discoal_job.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE

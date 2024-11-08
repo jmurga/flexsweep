@@ -85,12 +85,35 @@ def simulator(
     if discoal_path is None:
         discoal_path = fs.DISCOAL
 
-    mu_rate = parse_float_list(None, None, mutation_rate)
-    rho_rate = parse_float_list(None, None, recombination_rate)
+    mutation_rate_list = parse_float_list(None, None, mutation_rate)
+    recombination_rate_list = parse_float_list(None, None, recombination_rate)
 
-    assert (
-        len(mu_rate) == 2 or len(rho_rate) == 2
-    ), "Please input two comma-separated values as lower and upper values to draw values uniform distribution, e.g: 5e-9,2e-8"
+    if len(mutation_rate_list) == 2:
+        mu_rate = {
+            "dist": "uniform",
+            "lower": mutation_rate_list[0],
+            "upper": mutation_rate_list[1],
+        }
+    elif len(mutation_rate_list) == 1:
+        mu_rate = {
+            "dist": "exponential",
+            "mean": mutation_rate_list[0],
+        }
+    if len(recombination_rate_list) == 2:
+        rho_rate = {
+            "dist": "uniform",
+            "lower": recombination_rate_list[0],
+            "upper": recombination_rate_list[1],
+        }
+    elif len(recombination_rate_list) == 1:
+        rho_rate = {
+            "dist": "exponential",
+            "mean": recombination_rate_list[0],
+        }
+
+    # assert (
+    #     len(mu_rate) == 2 or len(rho_rate) == 2
+    # ), "Please input two comma-separated values as lower and upper values to draw values uniform distribution, e.g: 5e-9,2e-8"
 
     time_list = parse_float_list(None, None, time)
 
@@ -129,7 +152,7 @@ def fvs_discoal(simulations_path, nthreads):
 
 @cli.command()
 @click.option(
-    "--vcf", type=str, required=True, help="VCF file to parse. Must be indexed"
+    "--vcf_path", type=str, required=True, help="VCF file to parse. Must be indexed"
 )
 @click.option(
     "--neutral_bin",
@@ -137,26 +160,25 @@ def fvs_discoal(simulations_path, nthreads):
     required=True,
     help="Neutral bin data from discoal simulations",
 )
-@click.option("--contig_name", type=str, required=True, help="Chromosome name")
-@click.option(
-    "--contig_len", type=str, required=True, help="Chromosome length for sliding"
-)
-@click.option("--step", type=int, required=True, help="Sliding step")
 @click.option("--nthreads", type=int, required=True, help="Number of threads")
-@click.option("--rec_map", type=str, required=False, help="Recombination map")
-def fvs_vcf(vcf, contig_name, contig_length, window_size, step, nthreads):
-    """Run the summary statistic estimation from a VCF file to create CNN input feature vectors."""
+@click.option(
+    "--recombination_map",
+    type=str,
+    default=None,
+    required=False,
+    help="Recombination map. Decode CSV format: Chr,Begin,End,cMperMb,cM",
+)
+def fvs_vcf(vcf_path, neutral_bin, recombination_map, nthreads):
+    """Run the summary statistic estimation from a VCF file to create CNN input feature vectors. Feature vector file will be written within"""
     import flexsweep as fs
 
-    fs_data = fs.Data(
-        vcf,
-        step=step,
+    df_fv = fs.summary_statistics(
+        vcf_path,
         nthreads=nthreads,
-        recombination_map=rec_map,
+        neutral_save=neutral_bin,
+        vcf=True,
+        recombination_map=recombination_map,
     )
-    data = fs_data.read_vcf(contig_name, contig_length)
-
-    df_fv = fs.summary_statistics(data, nthreads=nthreads)
 
 
 @cli.command()
@@ -185,17 +207,16 @@ def cnn(data, output_folder, mode, model):
 
     os.makedirs(output_folder, exist_ok=True)
 
-    fs_cnn = fs.CNN(data, output_folder)
     if mode == "train":
+        fs_cnn = fs.CNN(train_data=data, output_folder=output_folder)
         fs_cnn.train()
         df_prediction = fs_cnn.predict()
         p_roc, p_history = fs_cnn.roc_curve()
 
     elif mode == "predict":
-        assert model is None, "Please input a model to make predictions"
-
-        fs_cnn.model = model
-        fs_cnn.predict()
+        assert model is not None, "Please input a model to make predictions"
+        fs_cnn = fs.CNN(test_data=data, output_folder=output_folder, model=model)
+        df_prediction = fs_cnn.predict()
 
 
 if __name__ == "__main__":

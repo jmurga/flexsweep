@@ -29,7 +29,7 @@ class CNN:
         gpu (bool): Indicates whether to use GPU for training. Default is True.
     """
 
-    def __init__(self, train_data, output_folder=None):
+    def __init__(self, train_data=None, test_data=None, output_folder=None, model=None):
         """
         Initializes the CNN class with training data and output folder.
 
@@ -39,17 +39,16 @@ class CNN:
         """
         # self.sweep_data = sweep_data
         self.train_data = train_data
-        self.test_data = None
+        self.test_data = test_data
         self.output_folder = output_folder
         self.output_prediction = "predicions.txt"
         self.num_stats = 11
         self.center = np.arange(5e5, 7e5 + 1e4, 1e4).astype(int)
         self.windows = np.array([50000, 100000, 200000, 500000, 1000000])
-        self.number_stats = 11
         self.train_split = 0.8
         self.prediction = None
         self.history = None
-        self.model = None
+        self.model = model
         self.gpu = True
         self.tf = None
 
@@ -190,6 +189,7 @@ class CNN:
         """
         tf = self.check_tf()
 
+        assert self.train_data is not None, "Please input training data"
         assert (
             "txt" in self.train_data
             or "csv" in self.train_data
@@ -392,14 +392,28 @@ class CNN:
         """
         tf = self.check_tf()
 
-        if self.model is None and os.path.exists(output_folder + "/model.keras"):
-            self.model = output_folder + "/model.keras"
-
         assert self.model is not None, "Please input the CNN trained model"
+
+        assert self.test_data is not None, "Please input training data"
+        assert (
+            "txt" in self.test_data
+            or "csv" in self.test_data
+            or self.test_data.endswith(".parquet")
+        ), "Please save your dataframe as CSV or parquet"
 
         # import data to predict
         if isinstance(self.test_data, str):
-            df_test = pd.read_csv(self.test_data, sep=",", engine="pyarrow")
+            try:
+                df_test = pd.read_parquet(self.test_data)
+            except:
+                df_test = pd.read_csv(self.test_data, sep=",", engine="pyarrow")
+            if self.num_stats < 17:
+                df_test = df_test.iloc[:, ~df_test.columns.str.contains("flip")]
+            regions = df_test.loc[:, "iter"].values
+            # Same folder custom fvs name based on input VCF.
+            self.output_prediction = os.path.basename(self.test_data).replace(
+                ".parquet", "_predictions.txt"
+            )
         else:
             df_test = self.test_data
 
@@ -487,6 +501,8 @@ class CNN:
         df_prediction = pd.concat(d_prediction, axis=0).reset_index().iloc[:, 2:]
         df_prediction.iloc[:, -2:] = df_prediction.iloc[:, -2:].astype(float)
 
+        if isinstance(self.test_data, str):
+            df_prediction.insert(0, "region", regions)
         self.prediction = df_prediction
 
         if self.output_folder is not None:

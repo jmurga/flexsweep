@@ -1,10 +1,11 @@
-# from . import pd, np, Parallel, delayed
+from . import pd, np, Parallel, delayed
 
 from allel import read_vcf, GenotypeArray, index_windows
 
-import numpy as np
-import pandas as pd
-from joblib import Parallel, delayed
+# import numpy as np
+# import pandas as pd
+# from joblib import Parallel, delayed
+
 from scipy.interpolate import interp1d
 from itertools import chain
 from tqdm import tqdm
@@ -12,6 +13,7 @@ from warnings import filterwarnings
 import re
 import gzip
 import glob
+from subprocess import run
 
 filterwarnings("ignore", message="invalid INFO header", module="allel.io.vcf_read")
 
@@ -38,7 +40,7 @@ class Data:
         self.step = step
         self.nthreads = nthreads
 
-    def genome_reader(self, region, samples, _iter=0):
+    def genome_reader(self, region, samples, _iter=1):
         filterwarnings(
             "ignore", message="invalid INFO header", module="allel.io.vcf_read"
         )
@@ -48,9 +50,6 @@ class Data:
         try:
             gt = GenotypeArray(raw_data["calldata/GT"])
         except:
-            gt = np.array([])
-
-        if gt.shape[0] == 0:
             return {region: None}
 
         pos = raw_data["variants/POS"]
@@ -64,9 +63,12 @@ class Data:
         biallelic_filter = ac.is_biallelic_01()
 
         hap = gt.to_haplotypes()
-        hap = hap.subset(biallelic_filter)
+        hap = hap.values[biallelic_filter]
         pos = pos[biallelic_filter]
         np_chrom = np_chrom[biallelic_filter]
+
+        if hap.shape[0] == 0:
+            return {region: None}
 
         if self.recombination_map is None:
             rec_map = pd.DataFrame(
@@ -88,16 +90,23 @@ class Data:
             # rec_map = np.column_stack([rec_map, f(rec_map[:, 2]).astype(int)])
 
         # return hap
-        return {region: (hap.values, rec_map[:, [0, 1, -1, 2]])}
+        return {region: (hap, rec_map[:, [0, 1, -1, 2]])}
 
-    def read_vcf(self, contig_name, contig_length):
+    def read_vcf(self):
         assert (
             "zarr" in self.data
             or "vcf" in self.data
-            or "vcf" in self.data
+            or "vcf.gz" in self.data
+            or "bcf.gz" in self.data
             or "bcf" in self.data
-            or "bcf in self.data" "VCF file must be zarr, vcf or bcf format"
+        ), "VCF file must be zarr, vcf or bcf format"
+
+        check_contig_length = (
+            f"{'zcat' if '.gz' in self.data else 'cat'} {self.data} | tail -n 1"
         )
+        contig_name, contig_length = run(
+            check_contig_length, shell=True, capture_output=True, text=True
+        ).stdout.split("\t")[:2]
 
         if self.step is None:
             step = None
@@ -106,10 +115,10 @@ class Data:
 
         window_iter = list(
             index_windows(
-                np.arange(1, int(contig_length) + 1),
-                int(self.window_size),
+                np.arange(1, int(contig_length)),
+                int(self.window_size - 1),
                 1,
-                int(contig_length),
+                int(contig_length) + int(self.window_size - 1),
                 int(self.step),
             )
         )
@@ -123,12 +132,12 @@ class Data:
 
         out_dict = dict(chain.from_iterable(d.items() for d in region_data))
 
-        sims = {"sweeps": [], "region": []}
+        sims = {"sweep": [], "region": []}
         for k, v in out_dict.items():
             if v is not None:
                 tmp = list(v)
                 tmp.append(np.zeros(4))
-                sims["sweeps"].append(tmp)
+                sims["sweep"].append(tmp)
                 sims["region"].append(k)
 
         return sims
@@ -137,17 +146,16 @@ class Data:
         assert isinstance(self.data, str)
         # df_sweeps = pd.read_csv(self.data + "/sweep_params.txt")
         df_params = pd.read_csv(self.data + "/params.txt.gz")
+        params = df_params.loc[:, ["model", "s", "t", "saf", "eaf"]]
         df_sweeps = df_params.loc[df_params.model == "sweep", :]
-        params = df_sweeps.loc[:, ["s", "t", "saf", "eaf"]].values
+        df_neutral = df_params.loc[df_params.model == "neutral", :]
 
         sweeps = (
-            self.data + "/sweeps/sweep_" + df_sweeps.iter.astype(str) + ".ms.gz"
+            self.data + "/sweep/sweep_" + df_sweeps.iter.astype(str) + ".ms.gz"
         ).values.astype(str)
-        neutral_l = glob.glob(self.data + "/neutral/*.ms.gz")
-        neutral = [
-            self.data + "/neutral/neutral_" + str(i) + ".ms.gz"
-            for i in range(1, len(neutral_l) + 1)
-        ]
+        neutral = (
+            self.data + "/neutral/neutral_" + df_neutral.iter.astype(str) + ".ms.gz"
+        ).values.astype(str)
 
         ms_sweeps = list(
             chain(
@@ -155,11 +163,10 @@ class Data:
                     n_jobs=self.nthreads,
                     pre_dispatch="10*n_jobs",
                     batch_size=1000,
-                    backend="multiprocessing",
                     verbose=5,
                 )(
                     delayed(self.ms_parser)(m, param=p, seq_len=seq_len)
-                    for (m, p) in zip(sweeps, params)
+                    for (m, p) in zip(sweeps, params.iloc[:, 1:].values)
                 )
             )
         )
@@ -170,16 +177,15 @@ class Data:
                     n_jobs=self.nthreads,
                     pre_dispatch="10*n_jobs",
                     batch_size=1000,
-                    backend="multiprocessing",
                     verbose=5,
                 )(delayed(self.ms_parser)(m, seq_len=seq_len) for m in neutral)
             )
         )
 
         sims = {
-            "sweeps": ms_sweeps,
+            "sweep": ms_sweeps,
             "neutral": ms_neutral,
-            # "sweeps": sweeps,
+            # "sweep": sweeps,
             # "neutral": neutral,
         }
 
