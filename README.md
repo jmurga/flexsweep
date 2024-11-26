@@ -5,16 +5,17 @@
 The second version of [Flexsweep software](https://doi.org/10.1093/molbev/msad139), a versatile tool for detecting selective sweeps. The software trains a convolutional neural network (CNN) to classify genomic loci as sweep or neutral regions. The workflow begins with simulating data under an appropriate demographic model and classify regions as neutral or sweeps, including several selection events regarding sweep strength, age, starting allele frequency (softness), and ending allele frequency (completeness).
 
 The new version simplifies and streamlines the project structure, files, simulations, summary statistics estimation and allows for the easy addition of custom CNN architectures. The software takes advantage of [demes](https://doi.org/10.1093/genetics/iyac131) to simulate custom demography histories and main [scikit-allel](https://scikit-allel.readthedocs.io/) data structures to avoid external software and temporal files. The whole pipeline is parallelized using [joblib](https://joblib.readthedocs.io/en/stable/). We included optimized versions of [iSAFE](https://doi.org/10.1038/nmeth.4606), [DIND](https://doi.org/10.1371/journal.pgen.1000562), hapdaf, S ratio, freqs as well as the custom HAF and H12 as described in [Flexsweep manuscript](https://doi.org/10.1093/molbev/msad139). The software now is also able to run the following statistics:
+Here are the metrics:
 
-- [$\Delta$ IHH](https://doi.org/10.1126/science.1183863)
-- [$\pi$](https://scikit-allel.readthedocs.io/en/stable/stats/diversity.html#allel.mean_pairwise_difference)
-- [$\theta_{W}$](https://scikit-allel.readthedocs.io/en/stable/stats/diversity.html#allel.watterson_theta)
-- [Kelly's Zns](https://doi.org/10.1093/genetics/146.3.1197)
-- [$\omega_{max}$](https://doi.org/10.1534/genetics.103.025387)
-- [Fay & Wu's H](https://doi.org/10.1534/genetics.106.061432)
-- [Zeng's E](https://doi.org/10.1534/genetics.106.061432)
-- [Fu & Li's D and F](https://doi.org/10.1093/genetics/133.3.693)
-- [LASSI $T$ and $m$](https://doi.org/10.1093/molbev/msaa115)
+- $\Delta$-IHH: [https://doi.org/10.1126/science.1183863](https://doi.org/10.1126/science.1183863)
+- $\pi$: [https://scikit-allel.readthedocs.io/en/stable/stats/diversity.html#allel.mean_pairwise_difference](https://scikit-allel.readthedocs.io/en/stable/stats/diversity.html#allel.mean_pairwise_difference)
+- $\theta_{W}$: [https://scikit-allel.readthedocs.io/en/stable/stats/diversity.html#allel.watterson_theta](https://scikit-allel.readthedocs.io/en/stable/stats/diversity.html#allel.watterson_theta)
+- Kelly's $Z_{nS}$: [https://doi.org/10.1093/genetics/146.3.1197](https://doi.org/10.1093/genetics/146.3.1197)
+- $\omega_{max}$: [https://doi.org/10.1534/genetics.103.025387](https://doi.org/10.1534/genetics.103.025387)
+- Fay & Wu's H: [https://doi.org/10.1534/genetics.106.061432](https://doi.org/10.1534/genetics.106.061432)
+- Zeng's E: [https://doi.org/10.1534/genetics.106.061432](https://doi.org/10.1534/genetics.106.061432)
+- Fu & Li's D and F: [https://doi.org/10.1093/genetics/133.3.693](https://doi.org/10.1093/genetics/133.3.693)
+- LASSI $T$ and $m$: [https://doi.org/10.1093/molbev/msaa115](https://doi.org/10.1093/molbev/msaa115)
 
 Similarly to the first version, Flexsweep works in three main steps: simulation, summary statistics estimation (feature vectors), and training/classification. Once installed, you can access the Command Line Interface to run any module as needed.
 
@@ -112,22 +113,26 @@ flexsweep fvs-vcf --help
 Usage: flexsweep fvs-vcf [OPTIONS]
 
   Run the summary statistic estimation from a VCF file to create CNN input
-  feature vectors
+  feature vectors. Feature vector file will be written within
 
 Options:
-  --vcf TEXT             VCF file to parse. Must be indexed [required]
-  --neutral_bin TEXT     Neutral bin data from discoal simulations  [required]
-  --contig_name TEXT           Chromosome name  [required]
-  --contig_len TEXT      Chromosome length for sliding  [required]
-  --window_size INTEGER  Window size  [required]
-  --step INTEGER         Sliding step  [required]
-  --help                 Show this message and exit.
+  --vcf_path TEXT           VCF file to parse. Must be indexed  [required]
+  --neutral_bin TEXT        Neutral bin data from discoal simulations
+                            [required]
+  --nthreads INTEGER        Number of threads  [required]
+  --recombination_map TEXT  Recombination map. Decode CSV format:
+                            Chr,Begin,End,cMperMb,cM
+  --help                    Show this message and exit.
 ```
 
 ### Training/prediction
 Train Flexsweep CNN with the normalized feature vectors to classify neutral and sweep regions.
 
-`--mode train` will output a CNN model for later classification in the selected `output_folder`. Note that `--mode train` must be executed before `--mode predict` because it will search the CNN model prior to predict execution.
+```bash
+flexsweep cnn --help
+```
+
+`--mode train` will output a CNN model for later classification in the selected `output_folder`, ROC curve and training history plots. Note that `--mode train` must be executed before `--mode predict` because it will search the CNN model prior to predict execution.
 
 ```
 Usage: flexsweep cnn [OPTIONS]
@@ -135,9 +140,9 @@ Usage: flexsweep cnn [OPTIONS]
   Run the Flexsweep CNN
 
 Options:
-  --train_data TEXT       Path to the training data  [required]
-  --output_folder TEXT    Output folder for the CNN model and logs  [required]
   --mode [train|predict]  Mode: 'train' or 'predict'  [required]
+  --data TEXT             Path to the training data  [required]
+  --output_folder TEXT    Output folder for the CNN model and logs  [required]
+  --model TEXT            Input a pretrained model
   --help                  Show this message and exit.
-
 ```
