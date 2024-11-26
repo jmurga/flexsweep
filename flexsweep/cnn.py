@@ -1,9 +1,7 @@
 import time, os, sys
 
-# from . import pd, np
+from . import pl, np
 
-import pandas as pd
-import numpy as np
 import importlib
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_curve, roc_auc_score
@@ -18,8 +16,8 @@ class CNN:
     A class for building and training a Convolutional Neural Network (CNN) for classification tasks using flex-sweep input statistics.
 
     Attributes:
-        train_data (str or pd.DataFrame): Path to the training data file or a pandas DataFrame containing the training data.
-        test_data (pd.DataFrame): DataFrame containing test data after being loaded from a file.
+        train_data (str or pl.DataFrame): Path to the training data file or a pandas DataFrame containing the training data.
+        test_data (pl.DataFrame): DataFrame containing test data after being loaded from a file.
         output_folder (str): Directory where the trained model and history will be saved.
         num_stats (int): Number of statistics/features in the training data. Default is 11.
         center (np.ndarray): Array defining the center positions for processing. Default ranges from 500000 to 700000.
@@ -34,7 +32,7 @@ class CNN:
         Initializes the CNN class with training data and output folder.
 
         Args:
-            train_data (str or pd.DataFrame): Path to the training data file or a pandas DataFrame containing the training data.
+            train_data (str or pl.DataFrame): Path to the training data file or a pandas DataFrame containing the training data.
             output_folder (str): Directory to save the trained model and history.
         """
         # self.sweep_data = sweep_data
@@ -196,22 +194,29 @@ class CNN:
             or self.train_data.endswith(".parquet")
         ), "Please save your dataframe as CSV or parquet"
 
-        if isinstance(self.train_data, pd.DataFrame):
+        if isinstance(self.train_data, pl.DataFrame):
             pass
         elif self.train_data.endswith(".gz"):
-            tmp = pd.read_csv(self.train_data, sep=",", engine="pyarrow")
+            tmp = pl.read_csv(self.train_data, separator=",")
         elif self.train_data.endswith(".parquet"):
-            tmp = pd.read_parquet(self.train_data)
+            tmp = pl.read_parquet(self.train_data)
 
         if self.num_stats < 17:
-            tmp = tmp.iloc[:, ~tmp.columns.str.contains("flip")]
+            tmp = tmp.select([col for col in tmp.columns if "flip" not in col])
+
+        tmp = tmp.with_columns(
+            pl.when((pl.col("model") != "neutral"))
+            .then(pl.lit("sweep"))
+            .otherwise(pl.lit("neutral"))
+            .alias("model")
+        )
 
         df_train, df_test = train_test_split(tmp, test_size=0.01)
-        df_train.loc[df_train.model != "neutral", "model"] = "sweep"
-        df_test.loc[df_test.model != "neutral", "model"] = "sweep"
 
         self.test_data = df_test
-        sweep_parameters = df_train[~df_train.model.str.contains("neutral")].iloc[:, :7]
+        sweep_parameters = df_train.filter("model" != "neutral").select(
+            df_train.columns[:5]
+        )
         # sweep_stats = df_sweep.iloc[:, 6:]
 
         stats = [
@@ -232,18 +237,28 @@ class CNN:
 
         train_stats = []
         for i in stats:
-            train_stats.append(df_train.iloc[:, df_train.columns.str.contains(i)])
-        train_stats = pd.concat(train_stats, axis=1)
+            # train_stats.append(df_train.iloc[:, df_train.columns.str.contains(i)])
+            train_stats.append(df_train.select(pl.col("^.*" + i + ".*$")))
+        train_stats = pl.concat(train_stats, how="horizontal")
 
-        train_stats_tensor = train_stats.iloc[:, 2:].values.reshape(
-            train_stats.shape[0],
-            self.num_stats,
-            self.windows.size * self.center.size,
-            1,
+        train_stats_tensor = (
+            train_stats.select(train_stats.columns[2:])
+            .to_numpy()
+            .reshape(
+                train_stats.shape[0],
+                self.num_stats,
+                self.windows.size * self.center.size,
+                1,
+            )
         )
 
         # y = np.concatenate((np.repeat(0, df_train[~df_train.model.str.contains("neutral")].shape[0]),np.repeat(1, df_train[df_train.model.str.contains("neutral")].shape[0]),))
-        y = train_stats.model.apply(lambda r: 1 if "neutral" in r else 0).values
+        y = train_stats.select(
+            (pl.col("model").str.contains("neutral").cast(pl.Int8)).alias(
+                "neutral_flag"
+            )
+        )["neutral_flag"].to_numpy()
+
         # y = np.concatenate((np.repeat(0, s1.shape[0]), np.repeat(1, n1.shape[0])))
 
         test_split = round(1 - self.train_split, 2)
@@ -375,7 +390,7 @@ class CNN:
             )
         )
 
-        df_history = pd.DataFrame(history.history)
+        df_history = pl.DataFrame(history.history)
         self.history = df_history
 
         if self.output_folder is not None:
@@ -396,29 +411,35 @@ class CNN:
 
         assert self.test_data is not None, "Please input training data"
         assert (
-            "txt" in self.test_data
+            isinstance(self.test_data, pl.DataFrame)
+            or "txt" in self.test_data
             or "csv" in self.test_data
             or self.test_data.endswith(".parquet")
-        ), "Please save your dataframe as CSV or parquet"
+        ), "Please input a pl.DataFrame or save it as CSV or parquet"
 
         # import data to predict
         if isinstance(self.test_data, str):
             try:
-                df_test = pd.read_parquet(self.test_data)
+                df_test = pl.read_parquet(self.test_data)
             except:
-                df_test = pd.read_csv(self.test_data, sep=",", engine="pyarrow")
+                df_test = pl.read_csv(self.test_data, separator=",")
             if self.num_stats < 17:
-                df_test = df_test.iloc[:, ~df_test.columns.str.contains("flip")]
-            regions = df_test.loc[:, "iter"].values
+                df_test = df_test.select(
+                    [col for col in df_test.columns if "flip" not in col]
+                )
+
+            regions = df_test["iter"].to_numpy()
             # Same folder custom fvs name based on input VCF.
-            self.output_prediction = os.path.basename(self.test_data).replace(
-                ".parquet", "_predictions.txt"
+            self.output_prediction = (
+                os.path.basename(self.test_data)
+                .replace("fvs_", "")
+                .replace(".parquet", "_predictions.txt")
             )
         else:
             df_test = self.test_data
 
         d_prediction = {}
-        for m, df_m in df_test.groupby("model"):
+        for m, df_m in df_test.group_by("model"):
             test_X = []
             for i in [
                 "dind",
@@ -433,9 +454,9 @@ class CNN:
                 "ihs",
                 "h12",
             ]:
-                test_X.append(df_m.iloc[:, df_m.columns.str.contains(i)])
+                test_X.append(df_m.select(pl.col("^.*" + i + ".*$")))
 
-            test_X = pd.concat(test_X, axis=1).values
+            test_X = pl.concat(test_X, how="horizontal").to_numpy()
 
             test_X = test_X.reshape(
                 test_X.shape[0],
@@ -486,29 +507,42 @@ class CNN:
             prediction_dict = {0: "sweep", 1: "neutral"}
             predictions_class = np.vectorize(prediction_dict.get)(predictions)
 
-            df_prediction = pd.concat(
+            df_prediction = pl.concat(
                 [
-                    df_m.iloc[:, [5, 1, 2, 3, 4]].reset_index(drop=True),
-                    pd.DataFrame(
+                    df_m.select(pl.nth([5, 1, 2, 3, 4])),
+                    pl.DataFrame(
                         np.column_stack([predictions_class, preds]),
-                        columns=["predicted_model", "prob(sweep)", "prob(neutral)"],
+                        schema=["predicted_model", "prob_sweep", "prob_neutral"],
                     ),
                 ],
-                axis=1,
+                how="horizontal",
             )
-            d_prediction[m] = df_prediction
+            d_prediction[m[0]] = df_prediction
 
-        df_prediction = pd.concat(d_prediction, axis=0).reset_index().iloc[:, 2:]
-        df_prediction.iloc[:, -2:] = df_prediction.iloc[:, -2:].astype(float)
+        df_prediction = pl.concat(d_prediction.values(), how="vertical")
+        # df_prediction.iloc[:, -2:] = df_prediction.iloc[:, -2:].astype(float)
 
         if isinstance(self.test_data, str):
-            df_prediction.insert(0, "region", regions)
+            df_prediction = df_prediction.with_columns(pl.Series("region", regions))
+            chr_start_end = np.array(
+                [item.replace(":", "-").split("-") for item in regions]
+            )
+
+            df_prediction = df_prediction.with_columns(
+                pl.Series("chr", chr_start_end[:, 0]),
+                pl.Series("start", chr_start_end[:, 1], dtype=pl.Int64),
+                pl.Series("end", chr_start_end[:, 2], dtype=pl.Int64),
+            )
+            df_prediction = (
+                df_prediction.select(pl.exclude("region"))
+                .sort("start")
+                .select(df_prediction.columns[-3:] + df_prediction.columns[:-4])
+            )
+
         self.prediction = df_prediction
 
         if self.output_folder is not None:
-            df_prediction.to_csv(
-                self.output_folder + "/" + self.output_prediction, index=False
-            )
+            df_prediction.write_csv(self.output_folder + "/" + self.output_prediction)
 
         return df_prediction
 
@@ -532,7 +566,10 @@ class CNN:
 
         # Create confusion dataframe
         confusion_data = (
-            pred_data.groupby(["model", "predicted_model"]).size().reset_index(name="n")
+            pred_data.to_pandas()
+            .groupby(["model", "predicted_model"])
+            .size()
+            .reset_index(name="n")
         )
 
         confusion_data["true_false"] = np.select(
@@ -610,21 +647,24 @@ class CNN:
         )  # Handle division by zero if any
 
         # Compute ROC AUC and prepare roc_data. Set 'sweep' as the positive class
-        pred_rate_auc_data = pred_data.copy()
-        pred_rate_auc_data["model"] = pd.Categorical(
-            pred_rate_auc_data["model"], categories=["sweep", "neutral"], ordered=True
+        pred_rate_auc_data = (
+            pred_data.clone()
+            .with_columns(pl.col("model").cast(pl.Categorical).alias("model"))
+            .to_pandas()
         )
 
         # Calculate ROC AUC
         roc_auc_value = roc_auc_score(
             (pred_rate_auc_data["model"] == "sweep").astype(int),
-            pred_rate_auc_data["prob(sweep)"],
+            pred_rate_auc_data["prob_sweep"],
         )
 
         # Create roc_data DataFrame
-        roc_data = pd.DataFrame({"AUC": [roc_auc_value]})
+        roc_data = pl.DataFrame({"AUC": [roc_auc_value]})
 
-        rate_roc_data = pd.concat([rate_data, roc_data], axis=1)
+        rate_roc_data = pl.concat(
+            [pl.DataFrame(rate_data), roc_data], how="horizontal"
+        ).to_pandas()
 
         for col in rate_roc_data.columns:
             pred_rate_auc_data[col] = rate_roc_data.iloc[0][col]
@@ -632,10 +672,12 @@ class CNN:
         # Compute ROC curve using sklearn
         fpr, tpr, thresholds = roc_curve(
             (pred_rate_auc_data["model"] == "sweep").astype(int),
-            pred_rate_auc_data["prob(sweep)"],
+            pred_rate_auc_data["prob_sweep"].astype(float),
         )
 
-        roc_df = pd.DataFrame({"false_positive_rate": fpr, "sensitivity": tpr})
+        roc_df = pl.DataFrame(
+            {"false_positive_rate": fpr, "sensitivity": tpr}
+        ).to_pandas()
 
         fig, ax = plt.subplots(figsize=(10, 6))
         ax.plot(
@@ -660,7 +702,11 @@ class CNN:
         ## History
         # Load and preprocess the data
         history_data = self.history
-        h = history_data[["loss", "val_loss", "accuracy", "val_accuracy"]].copy()
+        h = (
+            history_data.select(["loss", "val_loss", "accuracy", "val_accuracy"])
+            .clone()
+            .to_pandas()
+        )
         h["epoch"] = h.index + 1
         h_melted = h.melt(
             id_vars="epoch",

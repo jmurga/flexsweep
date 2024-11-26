@@ -203,6 +203,7 @@ def fvs_vcf(vcf_path, neutral_bin, recombination_map, nthreads):
 )
 def cnn(data, output_folder, mode, model):
     """Run the Flexsweep CNN"""
+
     import flexsweep as fs
 
     os.makedirs(output_folder, exist_ok=True)

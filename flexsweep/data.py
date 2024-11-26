@@ -1,9 +1,15 @@
-from . import pd, np, Parallel, delayed
+import os
+
+# os.environ["POLARS_MAX_THREADS"] = "1"
+
+
+from . import np, Parallel, delayed, pl
+
 
 from allel import read_vcf, GenotypeArray, index_windows
 
 # import numpy as np
-# import pandas as pd
+# import polars as pl
 # from joblib import Parallel, delayed
 
 from scipy.interpolate import interp1d
@@ -30,6 +36,7 @@ class Data:
         window_size=int(1.2e6),
         step=int(1e4),
         nthreads=1,
+        sequence_length=int(1.2e6),
     ):
         self.data = data
         self.region = region
@@ -39,6 +46,7 @@ class Data:
         self.window_size = window_size
         self.step = step
         self.nthreads = nthreads
+        self.sequence_length = sequence_length
 
     def genome_reader(self, region, samples, _iter=1):
         filterwarnings(
@@ -70,19 +78,32 @@ class Data:
         if hap.shape[0] == 0:
             return {region: None}
 
+        tmp = list(map(int, region.split(":")[-1].split("-")))
+
+        d_pos = dict(
+            zip(np.arange(tmp[0], tmp[1] + 1), np.arange(self.sequence_length) + 1)
+        )
+
         if self.recombination_map is None:
-            rec_map = pd.DataFrame(
+            rec_map = pl.DataFrame(
                 {"chrom": np_chrom, "idx": np.arange(pos.size), "pos": pos, "cm": pos}
-            ).values
+            ).to_numpy()
+
+            for r in rec_map:
+                r[-1] = d_pos[r[-1]]
+                r[-2] = d_pos[r[-2]]
         else:
-            df_recombination_map = pd.read_csv(self.recombination_map, sep=",")
+            df_recombination_map = pl.read_csv(self.recombination_map, separator=",")
             genetic_distance = self.get_cm(df_recombination_map, pos)
-            rec_map = pd.DataFrame(
+            rec_map = pl.DataFrame(
                 [np_chrom, np.arange(pos.size), pos, genetic_distance]
-            ).T.values
+            ).to_numpy()
+
+            for r in rec_map:
+                r[-2] = d_pos[r[-2]]
 
             if np.all(rec_map[:, -1] == 0):
-                rec_map[:, -1] = pos
+                rec_map[:, -1] = rec_map[:, -2]
 
             # # physical position to relative physical position (1,1.2e6)
             # # this way we do not perform any change on summary_statistics center/windows combinations
@@ -93,13 +114,18 @@ class Data:
         return {region: (hap, rec_map[:, [0, 1, -1, 2]])}
 
     def read_vcf(self):
-        assert (
-            "zarr" in self.data
-            or "vcf" in self.data
-            or "vcf.gz" in self.data
-            or "bcf.gz" in self.data
-            or "bcf" in self.data
-        ), "VCF file must be zarr, vcf or bcf format"
+        if (
+            not self.data.endswith(".vcf")
+            and not self.data.endswith(".vcf.gz")
+            and not self.data.endswith(".bcf")
+            and not self.data.endswith(".bcf.gz")
+        ):
+            raise IOError("VCF file must be vcf or bcf format")
+
+        if not os.path.exists(self.data + ".tbi"):
+            raise FileNotFoundError(
+                f"Please index the vcf/bcf file before continue using: tabix -p vcf {self.data}"
+            )
 
         check_contig_length = (
             f"{'zcat' if '.gz' in self.data else 'cat'} {self.data} | tail -n 1"
@@ -139,69 +165,72 @@ class Data:
                 tmp.append(np.zeros(4))
                 sims["sweep"].append(tmp)
                 sims["region"].append(k)
-
         return sims
 
-    def read_simulations(self, seq_len=1.2e6):
+    def read_simulations(self):
         assert isinstance(self.data, str)
         # df_sweeps = pd.read_csv(self.data + "/sweep_params.txt")
-        df_params = pd.read_csv(self.data + "/params.txt.gz")
-        params = df_params.loc[:, ["model", "s", "t", "saf", "eaf"]]
-        df_sweeps = df_params.loc[df_params.model == "sweep", :]
-        df_neutral = df_params.loc[df_params.model == "neutral", :]
+        df_params = pl.read_csv(self.data + "/params.txt.gz")
+        params = df_params.select(["model", "s", "t", "saf", "eaf"])
+        df_sweeps = df_params.filter(pl.col("model") != "neutral")
+        df_neutral = df_params.filter(model="neutral")
 
         sweeps = (
-            self.data + "/sweep/sweep_" + df_sweeps.iter.astype(str) + ".ms.gz"
-        ).values.astype(str)
+            (self.data + "/sweep/sweep_" + (df_sweeps.select("iter") + ".ms.gz"))
+            .to_numpy()
+            .flatten()
+        )
         neutral = (
-            self.data + "/neutral/neutral_" + df_neutral.iter.astype(str) + ".ms.gz"
-        ).values.astype(str)
-
-        ms_sweeps = list(
-            chain(
-                *Parallel(
-                    n_jobs=self.nthreads,
-                    pre_dispatch="10*n_jobs",
-                    batch_size=1000,
-                    verbose=5,
-                )(
-                    delayed(self.ms_parser)(m, param=p, seq_len=seq_len)
-                    for (m, p) in zip(sweeps, params.iloc[:, 1:].values)
-                )
-            )
+            (self.data + "/neutral/neutral_" + (df_neutral.select("iter") + ".ms.gz"))
+            .to_numpy()
+            .flatten()
         )
 
-        ms_neutral = list(
-            chain(
-                *Parallel(
-                    n_jobs=self.nthreads,
-                    pre_dispatch="10*n_jobs",
-                    batch_size=1000,
-                    verbose=5,
-                )(delayed(self.ms_parser)(m, seq_len=seq_len) for m in neutral)
-            )
-        )
+        # ms_sweeps = list(
+        #     chain(
+        #         *Parallel(
+        #             n_jobs=self.nthreads,
+        #             pre_dispatch="10*n_jobs",
+        #             batch_size=1000,
+        #             verbose=5,
+        #         )(
+        #             delayed(self.ms_parser)(m, param=p, self.sequence_length=self.sequence_length)
+        #             for (m, p) in zip(sweeps, params.iloc[:, 1:].values)
+        #         )
+        #     )
+        # )
+
+        # ms_neutral = list(
+        #     chain(
+        #         *Parallel(
+        #             n_jobs=self.nthreads,
+        #             pre_dispatch="10*n_jobs",
+        #             batch_size=1000,
+        #             verbose=5,
+        #         )(delayed(self.ms_parser)(m, self.sequence_length=self.sequence_length) for m in neutral)
+        #     )
+        # )
 
         sims = {
-            "sweep": ms_sweeps,
-            "neutral": ms_neutral,
-            # "sweep": sweeps,
-            # "neutral": neutral,
+            # "sweep": ms_sweeps,
+            # "neutral": ms_neutral,
+            "sweep": sweeps,
+            "neutral": neutral,
         }
 
         return sims, params
 
-    def read_ms_files(self, seq_len=1.2e6):
+    def read_ms_files(self):
         if not isinstance(self.data, list):
             self.data = [self.data]
 
         ms_data = Parallel(n_jobs=self.nthreads, verbose=5)(
-            delayed(self.ms_parser)(m, seq_len) for m in self.data
+            delayed(self.ms_parser)(m, self.sequence_length) for m in self.data
         )
 
         return tuple(chain(*ms_data))
 
-    def ms_parser(self, ms_file, param=None, seq_len=1.2e6):
+    def ms_parser(self, ms_file, param=None):
         """Read a ms file and output the positions and the genotypes.
         Genotypes are a numpy array of 0s and 1s with shape (num_segsites, num_samples).
         """
@@ -222,6 +251,9 @@ class Data:
         pattern = r"//"
         partitions = re.split(pattern, file_content)
 
+        if len(partitions) == 1:
+            raise IOError(f"File {ms_file} is malformed.")
+
         positions = []
         haps = []
         rec_map = []
@@ -232,7 +264,7 @@ class Data:
                 if line == "":
                     continue
                 # if "discoal" in line or "msout" in line:
-                # seq_len = int(line.strip().split()[3])
+                # self.sequence_length = int(line.strip().split()[3])
                 if line.startswith("segsites"):
                     num_segsites = int(line.strip().split()[1])
                     if num_segsites == 0:
@@ -241,7 +273,7 @@ class Data:
                         # return np.array([]), np.array([], ndmin=2, dtype=np.uint8).T
                 elif line.startswith("positions"):
                     tmp_pos = np.array([float(x) for x in line.strip().split()[1:]])
-                    tmp_pos = np.round(tmp_pos * seq_len).astype(int)
+                    tmp_pos = np.round(tmp_pos * self.sequence_length).astype(int)
 
                     # Find duplicates in the array
                     duplicates = np.diff(tmp_pos) == 0
@@ -264,7 +296,12 @@ class Data:
                 else:
                     # Now read in the data
                     data.append(np.array(list(line), dtype=np.int8))
-            data = np.vstack(data).T
+            try:
+                data = np.vstack(data).T
+            except:
+                raise IOError(f"File {ms_file} is malformed.")
+
+            # data = np.vstack(data).T
             haps.append(data)
 
         if param is None:
@@ -273,7 +310,8 @@ class Data:
         return list(zip(haps, rec_map, [param]))
 
     def read_region(self):
-        assert self.region is not None, "Please input a region"
+        if self.region is None:
+            raise ValueError("Please input a region")
 
         if not isinstance(self.data, list):
             self.data = [self.data]
@@ -311,15 +349,29 @@ class Data:
             chrom = chrom[biallelic_filter]
 
             if self.recombination_map is None:
-                rec_map = pd.DataFrame(
-                    {"chrom": chrom, "idx": np.arange(pos.size), "pos": pos, "cm": pos}
-                ).values
+                rec_map = (
+                    pl.DataFrame(
+                        {
+                            "chrom": chrom,
+                            "idx": np.arange(pos.size),
+                            "pos": pos,
+                            "cm": pos,
+                        }
+                    )
+                    .to_numpy()
+                    .flatten()
+                )
             else:
-                df_recombination_map = pd.read_csv(self.recombination_map, sep="\t")
+                df_recombination_map = pl.read_csv(
+                    self.recombination_map, separator="\t"
+                )
                 genetic_distance = self.get_cm(df_recombination_map, pos)
-                rec_map = pd.DataFrame(
-                    [chrom, np.arange(pos.size), pos, genetic_distance]
-                ).T.values
+                rec_map = (
+                    pl.DataFrame([chrom, np.arange(pos.size), pos, genetic_distance])
+                    .to_numpy()
+                    .flatten()
+                    .T
+                )
 
             window_iter = list(
                 allel.index_windows(
@@ -349,8 +401,8 @@ class Data:
     def get_cm(self, df_rec_map, positions):
         # Create the interpolating function
         interp_func = interp1d(
-            df_rec_map.iloc[:, 1].values,
-            df_rec_map.iloc[:, -1].values,
+            df_rec_map.select(df_rec_map.columns[1]).to_numpy().flatten(),
+            df_rec_map.select(df_rec_map.columns[-1]).to_numpy().flatten(),
             kind="linear",
             fill_value="extrapolate",
         )

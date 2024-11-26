@@ -1,6 +1,6 @@
 import os
 
-from . import pd, np, Parallel, delayed
+from . import pl, np, Parallel, delayed
 
 # import numpy as np
 # import pandas as pd
@@ -82,19 +82,20 @@ class Simulator:
         assert ".yaml" in self.demes, "Please input a demes model"
 
         pop_history = demes.load(self.demes).asdict_simplified()["demes"][0]["epochs"]
-        df_epochs = pd.DataFrame.from_dict(pop_history).iloc[::-1]
+        df_epochs = pl.DataFrame(pop_history).reverse()
 
         self.demes_data = df_epochs
         if df_epochs.shape[1] > 2:
+            df_epochs = df_epochs.to_pandas()
             df_epochs.iloc[0, 1] = df_epochs.iloc[0, 2]
             self.ne_0 = df_epochs.start_size.iloc[0]
             self.ne = self.ne_0
         else:
-            self.ne_0 = df_epochs.start_size.values[0]
+            self.ne_0 = df_epochs["start_size"].to_numpy()[0]
             self.ne = self.ne_0
 
-        epochs = df_epochs.end_time[1:].values / (4 * self.ne_0)
-        sizes = df_epochs.start_size.values[1:] / self.ne_0
+        epochs = df_epochs["end_time"].to_numpy()[1:] / (4 * self.ne_0)
+        sizes = df_epochs["start_size"].to_numpy()[1:] / self.ne_0
 
         discoal_demes = " "
         for i, j in zip(epochs, sizes):
@@ -168,15 +169,15 @@ class Simulator:
             for (i, v) in enumerate(zip(theta_neutral, rho_neutral), 1)
         )
 
-        df_neutral = pd.DataFrame(
+        df_neutral = pl.DataFrame(
             {
                 "iter": np.arange(1, self.num_simulations + 1),
                 "theta": theta_neutral / (4 * self.ne * self.locus_length),
                 "rho": rho_neutral / (4 * self.ne * self.locus_length),
-                "eaf": 0,
-                "saf": 0,
-                "s": 0,
-                "t": 0,
+                "eaf": 0.0,
+                "saf": 0.0,
+                "s": 0.0,
+                "t": 0.0,
                 "model": "neutral",
             }
         )
@@ -253,7 +254,7 @@ class Simulator:
             )
         )
 
-        df_sweeps = pd.DataFrame(
+        df_sweeps = pl.DataFrame(
             {
                 "iter": np.arange(1, self.num_simulations + 1),
                 "theta": theta_sweeps / (4 * self.ne * self.locus_length),
@@ -266,7 +267,7 @@ class Simulator:
             }
         )
 
-        params = df_sweeps.loc[:, ["s", "t", "saf", "eaf"]].values
+        params = df_sweeps.select(["s", "t", "saf", "eaf"]).to_numpy()
 
         ms_sweeps = list(
             chain(
@@ -277,8 +278,8 @@ class Simulator:
             )
         )
 
-        df = pd.concat([df_neutral, df_sweeps])
-        df.to_csv(self.output_folder + "/params.txt.gz", index=False)
+        df = pl.concat([df_neutral, df_sweeps], how="vertical")
+        df.write_csv(self.output_folder + "/params.txt.gz")
 
         sims = {
             "sweep": ms_sweeps,
