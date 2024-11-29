@@ -15,10 +15,8 @@ from itertools import chain
 import re
 import importlib.resources
 
-
-DISCOAL = os.path.join(
-    os.path.dirname(importlib.resources.path("data", "discoal")), "discoal"
-)
+with importlib.resources.path("data", "discoal") as discoal_path:
+    DISCOAL = os.path.join(os.path.dirname(discoal_path), "discoal")
 
 
 class Simulator:

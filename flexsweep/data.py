@@ -14,7 +14,6 @@ from allel import read_vcf, GenotypeArray, index_windows
 
 from scipy.interpolate import interp1d
 from itertools import chain
-from tqdm import tqdm
 from warnings import filterwarnings
 import re
 import gzip
@@ -380,7 +379,7 @@ class Data:
             )
 
             region_data = []
-            for w in tqdm(window_iter):
+            for w in window_iter:
                 tmp_hap, tmp_rec_map = self.get_hap_window(hap, pos, rec_map, w)
 
                 if tmp_hap is not None:
