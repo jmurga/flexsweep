@@ -1,4 +1,4 @@
-{% set name = "package" %}
+{% set name = "." %}
 {% set version = environ.get('GIT_DESCRIBE_TAG', 'untagged')|string|replace('-','_') %}
 {% set build_number = environ.get('GIT_DESCRIBE_NUMBER', '0') %}
 
@@ -43,10 +43,10 @@ test:
   # Some packages might need a `test/commands` key to check CLI.
   # List all the packages/modules that `run_test.py` imports.
   imports:
-    - package
+    - .
   # Run your test commands here
   commands:
-    - package --help
+    - . --help
     - pytest
   # declare any test-only requirements here
   requires:
@@ -55,7 +55,7 @@ test:
   source_files:
     - tests/
 
-# Uncomment and fill in package metadata
+# Uncomment and fill in . metadata
 #about:
 #  home: https://github.com/conda-forge/conda-smithy
 #  license: BSD-3-Clause
