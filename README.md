@@ -1,11 +1,10 @@
 # Flexsweep v2.0
 
-(In development, not recommended for end users. Need to solve RAM issues when performing large number of simulations ~200K. All the statistic are uneficiently saved on a Dataframe where most values are nan, was easy to work with).
+(In development, not recommended for end users).
 
 The second version of [Flexsweep software](https://doi.org/10.1093/molbev/msad139), a versatile tool for detecting selective sweeps. The software trains a convolutional neural network (CNN) to classify genomic loci as sweep or neutral regions. The workflow begins with simulating data under an appropriate demographic model and classify regions as neutral or sweeps, including several selection events regarding sweep strength, age, starting allele frequency (softness), and ending allele frequency (completeness).
 
 The new version simplifies and streamlines the project structure, files, simulations, summary statistics estimation and allows for the easy addition of custom CNN architectures. The software takes advantage of [demes](https://doi.org/10.1093/genetics/iyac131) to simulate custom demography histories and main [scikit-allel](https://scikit-allel.readthedocs.io/) data structures to avoid external software and temporal files. The whole pipeline is parallelized using [joblib](https://joblib.readthedocs.io/en/stable/). We included optimized versions of [iSAFE](https://doi.org/10.1038/nmeth.4606), [DIND](https://doi.org/10.1371/journal.pgen.1000562), hapdaf, S ratio, freqs as well as the custom HAF and H12 as described in [Flexsweep manuscript](https://doi.org/10.1093/molbev/msad139). The software now is also able to run the following statistics:
-Here are the metrics:
 
 - $\Delta$-IHH: [https://doi.org/10.1126/science.1183863](https://doi.org/10.1126/science.1183863)
 - $\pi$: [https://scikit-allel.readthedocs.io/en/stable/stats/diversity.html#allel.mean_pairwise_difference](https://scikit-allel.readthedocs.io/en/stable/stats/diversity.html#allel.mean_pairwise_difference)

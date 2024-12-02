@@ -275,7 +275,7 @@ class CNN:
 
         return X_train, X_test, Y_train, Y_test, X_valid, Y_valid
 
-    def train(self):
+    def train(self, cnn=None):
         """
         Trains the CNN model on the training data.
 
@@ -283,6 +283,9 @@ class CNN:
         compiles the model, and fits it to the training data while saving the best model and training history.
         """
         tf = self.check_tf()
+
+        if cnn is None:
+            cnn = self.cnn_flexsweep
 
         (X_train, X_test, Y_train, Y_test, X_valid, Y_valid) = self.load_training_data()
 
@@ -311,7 +314,7 @@ class CNN:
         # put model together
         input_to_model = tf.keras.Input(X_train.shape[1:])
         model = tf.keras.models.Model(
-            inputs=[input_to_model], outputs=[self.cnn_flexsweep(input_to_model)]
+            inputs=[input_to_model], outputs=[cnn(input_to_model)]
         )
         model_path = self.output_folder + "/model.keras"
         weights_path = self.output_folder + "/model_weights.hdf5"
