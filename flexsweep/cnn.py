@@ -568,31 +568,39 @@ class CNN:
         pred_data = self.prediction
 
         # Create confusion dataframe
-        confusion_data = (
-            pred_data.to_pandas()
-            .groupby(["model", "predicted_model"])
-            .size()
-            .reset_index(name="n")
+        confusion_data = pred_data.group_by(["model", "predicted_model"]).agg(
+            pl.len().alias("n")
         )
 
-        confusion_data["true_false"] = np.select(
-            [
-                (confusion_data["model"] == confusion_data["predicted_model"])
-                & (confusion_data["model"] == "neutral"),
-                (confusion_data["model"] == confusion_data["predicted_model"])
-                & (confusion_data["model"] == "sweep"),
-                (confusion_data["model"] != confusion_data["predicted_model"])
-                & (confusion_data["model"] == "neutral"),
-            ],
-            ["true_negative", "true_positive", "false_positive"],
-            default="false_negative",
+        # Adding the "true_false" column
+        confusion_data = confusion_data.with_columns(
+            pl.when(
+                (pl.col("model") == pl.col("predicted_model"))
+                & (pl.col("model") == "neutral")
+            )
+            .then(pl.lit("true_negative"))  # Explicit literal for Polars
+            .when(
+                (pl.col("model") == pl.col("predicted_model"))
+                & (pl.col("model") == "sweep")
+            )
+            .then(pl.lit("true_positive"))  # Explicit literal for Polars
+            .when(
+                (pl.col("model") != pl.col("predicted_model"))
+                & (pl.col("model") == "neutral")
+            )
+            .then(pl.lit("false_positive"))  # Explicit literal for Polars
+            .otherwise(pl.lit("false_negative"))  # Explicit literal for Polars
+            .alias("true_false")
         )
 
-        confusion_pivot = confusion_data.pivot_table(
-            index=None, columns="true_false", values="n", fill_value=0
-        ).reset_index(drop=True)
+        confusion_pivot = confusion_data.pivot(
+            values="n", index=None, on="true_false", aggregate_function="sum"
+        ).fill_null(0)
 
-        rate_data = confusion_pivot.copy()
+        # Copying the pivoted data (optional as Polars is immutable)
+        rate_data = confusion_pivot.select(
+            ["false_negative", "false_positive", "true_negative", "true_positive"]
+        ).sum()
 
         # Compute the required row sums for normalization
         required_cols = [
@@ -606,81 +614,84 @@ class CNN:
                 rate_data[col] = 0
 
         # Calculate row sums for normalization
-        rate_data["sum_fn_tp"] = rate_data[["false_negative", "true_positive"]].sum(
-            axis=1
+        rate_data = rate_data.with_columns(
+            (pl.col("false_negative") + pl.col("true_positive")).alias("sum_fn_tp")
         )
-        rate_data["sum_fp_tn"] = rate_data[["false_positive", "true_negative"]].sum(
-            axis=1
+        rate_data = rate_data.with_columns(
+            (pl.col("false_positive") + pl.col("true_negative")).alias("sum_fp_tn")
         )
 
         # Compute normalized rates
-        rate_data["false_negative"] = (
-            rate_data["false_negative"] / rate_data["sum_fn_tp"]
+        rate_data = rate_data.with_columns(
+            (pl.col("false_negative") / pl.col("sum_fn_tp")).alias("false_negative"),
+            (pl.col("false_positive") / pl.col("sum_fp_tn")).alias("false_positive"),
+            (pl.col("true_negative") / pl.col("sum_fp_tn")).alias("true_negative"),
+            (pl.col("true_positive") / pl.col("sum_fn_tp")).alias("true_positive"),
         )
-        rate_data["false_positive"] = (
-            rate_data["false_positive"] / rate_data["sum_fp_tn"]
-        )
-        rate_data["true_negative"] = rate_data["true_negative"] / rate_data["sum_fp_tn"]
-        rate_data["true_positive"] = rate_data["true_positive"] / rate_data["sum_fn_tp"]
 
         # Replace NaN values with 0
-        rate_data[
-            ["false_negative", "false_positive", "true_negative", "true_positive"]
-        ] = rate_data[
-            ["false_negative", "false_positive", "true_negative", "true_positive"]
-        ].fillna(
-            0
+        rate_data = rate_data.with_columns(
+            [
+                pl.col("false_negative").fill_null(0).alias("false_negative"),
+                pl.col("false_positive").fill_null(0).alias("false_positive"),
+                pl.col("true_negative").fill_null(0).alias("true_negative"),
+                pl.col("true_positive").fill_null(0).alias("true_positive"),
+            ]
         )
 
         # Calculate accuracy and precision
-        rate_data["accuracy"] = (
-            rate_data["true_positive"] + rate_data["true_negative"]
-        ) / (
-            rate_data["true_positive"]
-            + rate_data["true_negative"]
-            + rate_data["false_positive"]
-            + rate_data["false_negative"]
+        rate_data = rate_data.with_columns(
+            [
+                (
+                    (pl.col("true_positive") + pl.col("true_negative"))
+                    / (
+                        pl.col("true_positive")
+                        + pl.col("true_negative")
+                        + pl.col("false_positive")
+                        + pl.col("false_negative")
+                    )
+                ).alias("accuracy"),
+                (
+                    pl.col("true_positive")
+                    / (pl.col("true_positive") + pl.col("false_positive"))
+                )
+                .fill_null(0)
+                .alias("precision"),
+            ]
         )
-
-        rate_data["precision"] = rate_data["true_positive"] / (
-            rate_data["true_positive"] + rate_data["false_positive"]
-        )
-        rate_data["precision"] = rate_data["precision"].fillna(
-            0
-        )  # Handle division by zero if any
 
         # Compute ROC AUC and prepare roc_data. Set 'sweep' as the positive class
-        pred_rate_auc_data = (
-            pred_data.clone()
-            .with_columns(pl.col("model").cast(pl.Categorical).alias("model"))
-            .to_pandas()
+        pred_rate_auc_data = pred_data.clone().with_columns(
+            pl.col("model").cast(pl.Categorical).alias("model")
         )
 
         # Calculate ROC AUC
         roc_auc_value = roc_auc_score(
-            (pred_rate_auc_data["model"] == "sweep").astype(int),
+            (pred_rate_auc_data["model"] == "sweep").cast(int),
             pred_rate_auc_data["prob_sweep"],
         )
 
         # Create roc_data DataFrame
         roc_data = pl.DataFrame({"AUC": [roc_auc_value]})
 
-        rate_roc_data = pl.concat(
-            [pl.DataFrame(rate_data), roc_data], how="horizontal"
-        ).to_pandas()
+        rate_roc_data = pl.concat([pl.DataFrame(rate_data), roc_data], how="horizontal")
 
-        for col in rate_roc_data.columns:
-            pred_rate_auc_data[col] = rate_roc_data.iloc[0][col]
+        first_row_values = rate_roc_data.row(0)
+
+        pred_rate_auc_data = pred_rate_auc_data.with_columns(
+            [
+                pl.lit(value).alias(col)
+                for col, value in zip(rate_roc_data.columns, first_row_values)
+            ]
+        )
 
         # Compute ROC curve using sklearn
         fpr, tpr, thresholds = roc_curve(
-            (pred_rate_auc_data["model"] == "sweep").astype(int),
-            pred_rate_auc_data["prob_sweep"].astype(float),
+            (pred_rate_auc_data["model"] == "sweep").cast(int),
+            pred_rate_auc_data["prob_sweep"].cast(float),
         )
 
-        roc_df = pl.DataFrame(
-            {"false_positive_rate": fpr, "sensitivity": tpr}
-        ).to_pandas()
+        roc_df = pl.DataFrame({"false_positive_rate": fpr, "sensitivity": tpr})
 
         fig, ax = plt.subplots(figsize=(10, 6))
         ax.plot(
@@ -705,22 +716,18 @@ class CNN:
         ## History
         # Load and preprocess the data
         history_data = self.history
-        h = (
-            history_data.select(["loss", "val_loss", "accuracy", "val_accuracy"])
-            .clone()
-            .to_pandas()
-        )
-        h["epoch"] = h.index + 1
-        h_melted = h.melt(
-            id_vars="epoch",
-            value_vars=["loss", "val_loss", "accuracy", "val_accuracy"],
-            var_name="metric_name",
+        h = history_data.select(
+            ["loss", "val_loss", "accuracy", "val_accuracy"]
+        ).clone()
+
+        h = h.with_columns((pl.arange(0, h.height) + 1).alias("epoch"))
+
+        h_melted = h.unpivot(
+            index=["epoch"],
+            on=["loss", "val_loss", "accuracy", "val_accuracy"],
+            variable_name="metric_name",
             value_name="metric_val",
         )
-
-        h_melted[["A", "B"]] = h_melted["metric_name"].str.split("_", expand=True)
-        h_melted["B"] = h_melted["B"].fillna(h_melted["A"])
-        h_melted["A"] = h_melted["A"].replace({"val": "validation"})
 
         line_styles = {
             "loss": "-",
