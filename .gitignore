@@ -3,4 +3,5 @@ __pycache__/
 # conda smithy ci-skeleton start
 *.pyc
 build_artifacts
+_build
 # conda smithy ci-skeleton end
