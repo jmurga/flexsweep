@@ -13,13 +13,18 @@ import multiprocessing
 multiprocessing.set_start_method("spawn", force=True)
 
 # Set Polars environment variables before importing it
+
+
+os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_MAX_THREADS"] = "1"
 os.environ["NUMBA_NUM_THREADS"] = "1"
+os.environ["NUMBA_THREADING_LAYER"] = "workqueue"
 os.environ["POLARS_MAX_THREADS"] = "1"
+
 
 import threadpoolctl
 
@@ -33,7 +38,7 @@ import polars as pl
 from .simulate_discoal import Simulator, DISCOAL
 from .fv import summary_statistics
 from .data import Data
-from .cnn import CNN
+from .cnn import CNN, rank_probabilities
 
 try:
     from . import _version

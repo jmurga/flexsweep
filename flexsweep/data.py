@@ -7,18 +7,14 @@ from . import np, Parallel, delayed, pl
 
 
 from allel import read_vcf, GenotypeArray, index_windows
-
-# import numpy as np
-# import polars as pl
-# from joblib import Parallel, delayed
-
 from scipy.interpolate import interp1d
 from itertools import chain
-from warnings import filterwarnings
+from warnings import filterwarnings, warn
 import re
 import gzip
 import glob
 from subprocess import run
+from collections import OrderedDict
 
 filterwarnings("ignore", message="invalid INFO header", module="allel.io.vcf_read")
 
@@ -36,6 +32,7 @@ class Data:
         step=int(1e4),
         nthreads=1,
         sequence_length=int(1.2e6),
+        in_memory=False,
     ):
         self.data = data
         self.region = region
@@ -46,6 +43,7 @@ class Data:
         self.step = step
         self.nthreads = nthreads
         self.sequence_length = sequence_length
+        self.in_memory = in_memory
 
     def genome_reader(self, region, samples, _iter=1):
         filterwarnings(
@@ -133,6 +131,18 @@ class Data:
             check_contig_length, shell=True, capture_output=True, text=True
         ).stdout.split("\t")[:2]
 
+        check_contig_start = (
+            f'zgrep -v "#" {self.data} | head -n 1'
+            if self.data.endswith(".gz")
+            else f'fgrep -v "^#" {self.data} | head -n 1'
+        )
+        contig_start = run(
+            check_contig_start, shell=True, capture_output=True, text=True
+        ).stdout.split("\t")[1]
+
+        if (int(contig_start) - 6e5) < 0:
+            contig_start = 1
+
         if self.step is None:
             step = None
         else:
@@ -148,86 +158,100 @@ class Data:
             )
         )
 
-        region_data = Parallel(n_jobs=self.nthreads, verbose=5)(
-            delayed(self.genome_reader)(
-                contig_name + ":" + str(w[0]) + "-" + str(w[1]), self.samples
-            )
-            for w in window_iter
-        )
+        if self.in_memory:
+            with Parallel(
+                n_jobs=self.nthreads, backend="multiprocessing", verbose=5
+            ) as parallel:
+                region_data = parallel(
+                    delayed(self.genome_reader)(
+                        contig_name + ":" + str(w[0]) + "-" + str(w[1]), self.samples
+                    )
+                    for w in window_iter
+                )
 
-        out_dict = dict(chain.from_iterable(d.items() for d in region_data))
+            out_dict = dict(chain.from_iterable(d.items() for d in region_data))
 
-        sims = {"sweep": [], "region": []}
-        for k, v in out_dict.items():
-            if v is not None:
-                tmp = list(v)
-                tmp.append(np.zeros(4))
-                sims["sweep"].append(tmp)
-                sims["region"].append(k)
+            sims = {"sweep": [], "region": []}
+            for k, v in out_dict.items():
+                if v is not None:
+                    tmp = list(v)
+                    tmp.append(np.zeros(4))
+                    sims["sweep"].append(tmp)
+                    sims["region"].append(k)
+        else:
+            sims = OrderedDict({"sweep": [], "region": []})
+            sims["sweep"] = self.data
+
+            for w in window_iter:
+                # if v is not None:
+                sims["region"].append(contig_name + ":" + str(w[0]) + "-" + str(w[1]))
+
         return sims
 
     def read_simulations(self):
         assert isinstance(self.data, str)
-        # df_sweeps = pd.read_csv(self.data + "/sweep_params.txt")
+
+        for folder in ("sweep", "neutral"):
+            folder_path = os.path.join(self.data, folder)
+            if not os.path.exists(folder_path):
+                raise ValueError(f"Required directory not found: {folder_path}")
+            if not glob.glob(os.path.join(folder_path, "*")):
+                raise ValueError(f"Directory is empty: {folder_path}")
+
         df_params = pl.read_csv(self.data + "/params.txt.gz")
         params = df_params.select(["model", "s", "t", "saf", "eaf"])
-        df_sweeps = df_params.filter(pl.col("model") != "neutral")
         df_neutral = df_params.filter(model="neutral")
+        df_sweeps = df_params.filter(model="sweep")
 
-        sweeps = (
-            (self.data + "/sweep/sweep_" + (df_sweeps.select("iter") + ".ms.gz"))
-            .to_numpy()
-            .flatten()
+        if self.in_memory:
+            with Parallel(
+                n_jobs=self.nthreads,
+                pre_dispatch="10*n_jobs",
+                batch_size=1000,
+                backend="multiprocessing",
+                verbose=5,
+            ) as parallel:
+                sweeps = list(
+                    chain(
+                        *parallel(
+                            delayed(self.ms_parser)(m, param=p)
+                            for (m, p) in zip(
+                                sweeps,
+                                params.filter(pl.col("model") == "sweep").to_numpy()[
+                                    :, 1:
+                                ],
+                            )
+                        )
+                    )
+                )
+
+                neutral = list(
+                    chain(*parallel(delayed(self.ms_parser)(m) for m in neutral))
+                )
+        else:
+            sweeps = (
+                (self.data + "/sweep/sweep_" + (df_sweeps.select("iter") + ".ms.gz"))
+                .to_numpy()
+                .flatten()
+            )
+            neutral = (
+                (
+                    self.data
+                    + "/neutral/neutral_"
+                    + (df_neutral.select("iter") + ".ms.gz")
+                )
+                .to_numpy()
+                .flatten()
+            )
+
+        sims = OrderedDict(
+            {
+                "neutral": neutral,
+                "sweep": sweeps,
+            }
         )
-        neutral = (
-            (self.data + "/neutral/neutral_" + (df_neutral.select("iter") + ".ms.gz"))
-            .to_numpy()
-            .flatten()
-        )
-
-        # ms_sweeps = list(
-        #     chain(
-        #         *Parallel(
-        #             n_jobs=self.nthreads,
-        #             pre_dispatch="10*n_jobs",
-        #             batch_size=1000,
-        #             verbose=5,
-        #         )(
-        #             delayed(self.ms_parser)(m, param=p, self.sequence_length=self.sequence_length)
-        #             for (m, p) in zip(sweeps, params.iloc[:, 1:].values)
-        #         )
-        #     )
-        # )
-
-        # ms_neutral = list(
-        #     chain(
-        #         *Parallel(
-        #             n_jobs=self.nthreads,
-        #             pre_dispatch="10*n_jobs",
-        #             batch_size=1000,
-        #             verbose=5,
-        #         )(delayed(self.ms_parser)(m, self.sequence_length=self.sequence_length) for m in neutral)
-        #     )
-        # )
-
-        sims = {
-            # "sweep": ms_sweeps,
-            # "neutral": ms_neutral,
-            "sweep": sweeps,
-            "neutral": neutral,
-        }
 
         return sims, params
-
-    def read_ms_files(self):
-        if not isinstance(self.data, list):
-            self.data = [self.data]
-
-        ms_data = Parallel(n_jobs=self.nthreads, verbose=5)(
-            delayed(self.ms_parser)(m, self.sequence_length) for m in self.data
-        )
-
-        return tuple(chain(*ms_data))
 
     def ms_parser(self, ms_file, param=None):
         """Read a ms file and output the positions and the genotypes.
@@ -251,151 +275,65 @@ class Data:
         partitions = re.split(pattern, file_content)
 
         if len(partitions) == 1:
-            raise IOError(f"File {ms_file} is malformed.")
-
-        positions = []
-        haps = []
-        rec_map = []
-        for r in partitions[1:]:
-            # Read in number of segregating sites and positions
-            data = []
-            for line in r.splitlines()[1:]:
-                if line == "":
-                    continue
-                # if "discoal" in line or "msout" in line:
-                # self.sequence_length = int(line.strip().split()[3])
-                if line.startswith("segsites"):
-                    num_segsites = int(line.strip().split()[1])
-                    if num_segsites == 0:
+            warn(f"File {ms_file} is malformed.")
+            haps = [None]
+            rec_map = [None]
+        else:
+            positions = []
+            haps = []
+            rec_map = []
+            for r in partitions[1:]:
+                # Read in number of segregating sites and positions
+                data = []
+                for line in r.splitlines()[1:]:
+                    if line == "":
                         continue
-                        #     # Shape of data array for 0 segregating sites should be (0, 1)
-                        # return np.array([]), np.array([], ndmin=2, dtype=np.uint8).T
-                elif line.startswith("positions"):
-                    tmp_pos = np.array([float(x) for x in line.strip().split()[1:]])
-                    tmp_pos = np.round(tmp_pos * self.sequence_length).astype(int)
+                    # if "discoal" in line or "msout" in line:
+                    # self.sequence_length = int(line.strip().split()[3])
+                    if line.startswith("segsites"):
+                        num_segsites = int(line.strip().split()[1])
+                        if num_segsites == 0:
+                            continue
+                            #     # Shape of data array for 0 segregating sites should be (0, 1)
+                            # return np.array([]), np.array([], ndmin=2, dtype=np.uint8).T
+                    elif line.startswith("positions"):
+                        tmp_pos = np.array([float(x) for x in line.strip().split()[1:]])
+                        tmp_pos = np.round(tmp_pos * self.sequence_length).astype(int)
 
-                    # Find duplicates in the array
-                    duplicates = np.diff(tmp_pos) == 0
+                        # Find duplicates in the array
+                        duplicates = np.diff(tmp_pos) == 0
 
-                    # While there are any duplicates, increment them by 1
-                    for i in np.where(duplicates)[0]:
-                        tmp_pos[i + 1] += 1
-                    tmp_pos += 1
-                    positions.append(tmp_pos)
-                    tmp_map = np.column_stack(
-                        [
-                            np.repeat(1, tmp_pos.size),
-                            np.arange(tmp_pos.size),
-                            tmp_pos,
-                            tmp_pos,
-                        ]
-                    )
-                    rec_map.append(tmp_map)
+                        # While there are any duplicates, increment them by 1
+                        for i in np.where(duplicates)[0]:
+                            tmp_pos[i + 1] += 1
+                        tmp_pos += 1
+                        positions.append(tmp_pos)
+                        tmp_map = np.column_stack(
+                            [
+                                np.repeat(1, tmp_pos.size),
+                                np.arange(tmp_pos.size),
+                                tmp_pos,
+                                tmp_pos,
+                            ]
+                        )
+                        rec_map.append(tmp_map)
 
-                else:
-                    # Now read in the data
-                    data.append(np.array(list(line), dtype=np.int8))
-            try:
-                data = np.vstack(data).T
-            except:
-                raise IOError(f"File {ms_file} is malformed.")
+                    else:
+                        # Now read in the data
+                        data.append(np.array(list(line), dtype=np.int8))
+                try:
+                    data = np.vstack(data).T
+                except:
+                    warn(f"File {ms_file} is malformed.")
+                    data = None
 
-            # data = np.vstack(data).T
-            haps.append(data)
+                # data = np.vstack(data).T
+                haps.append(data)
 
         if param is None:
             param = np.zeros(4)
 
         return list(zip(haps, rec_map, [param]))
-
-    def read_region(self):
-        if self.region is None:
-            raise ValueError("Please input a region")
-
-        if not isinstance(self.data, list):
-            self.data = [self.data]
-
-            if isinstance(self.region, list):
-                self.data = self.data * len(self.region)
-            else:
-                self.region = [self.region]
-
-        sims = []
-        for v, r in zip(self.data, self.region):
-            assert (
-                "zarr" in v
-                or "vcf" in v
-                or "vcf" in v
-                or "bcf" in v
-                or "bcf in self.data" "VCF file must be zarr, vcf or bcf format"
-            )
-
-            raw_data = allel.read_vcf(v, region=r, samples=self.samples)
-            gt = allel.GenotypeArray(raw_data["calldata/GT"])
-            pos = raw_data["variants/POS"]
-            chrom = np.char.replace(raw_data["variants/CHROM"].astype(str), "chr", "")
-            np_region = np.array(r.split(":")[-1].split("-")).astype(int)
-            try:
-                chrom = chrom.astype(int)
-            except:
-                pass
-            ac = gt.count_alleles()
-            biallelic_filter = ac.is_biallelic_01()
-
-            hap = gt.to_haplotypes()
-            hap = hap.subset(biallelic_filter)
-            pos = pos[biallelic_filter]
-            chrom = chrom[biallelic_filter]
-
-            if self.recombination_map is None:
-                rec_map = (
-                    pl.DataFrame(
-                        {
-                            "chrom": chrom,
-                            "idx": np.arange(pos.size),
-                            "pos": pos,
-                            "cm": pos,
-                        }
-                    )
-                    .to_numpy()
-                    .flatten()
-                )
-            else:
-                df_recombination_map = pl.read_csv(
-                    self.recombination_map, separator="\t"
-                )
-                genetic_distance = self.get_cm(df_recombination_map, pos)
-                rec_map = (
-                    pl.DataFrame([chrom, np.arange(pos.size), pos, genetic_distance])
-                    .to_numpy()
-                    .flatten()
-                    .T
-                )
-
-            window_iter = list(
-                allel.index_windows(
-                    pos, int(self.window_size), pos[0], pos[-1], int(self.step)
-                )
-            )
-
-            region_data = []
-            for w in window_iter:
-                tmp_hap, tmp_rec_map = self.get_hap_window(hap, pos, rec_map, w)
-
-                if tmp_hap is not None:
-                    # physical position to relative physical position (1,1.2e6)
-                    # this way we do not perform any change on summary_statistics center/windows combinations
-                    f = interp1d(w, [1, int(self.window_size) + 1])
-                    tmp_rec_map = np.column_stack(
-                        [tmp_rec_map, f(tmp_rec_map[:, 2]).astype(int)]
-                    )
-
-                    region_data.append((tmp_hap, tmp_rec_map[:, [0, 1, -1, 2, 3]]))
-
-            sims.append(region_data)
-        if len(sims) == 1:
-            sims = sims[0]
-        return sims
 
     def get_cm(self, df_rec_map, positions):
         # Create the interpolating function
@@ -422,3 +360,110 @@ class Data:
             return None, None
         else:
             return np.array(hap_data[flt]), rec_map[flt]
+
+
+# def read_ms_files(self):
+#     if not isinstance(self.data, list):
+#         self.data = [self.data]
+
+#     ms_data = Parallel(n_jobs=self.nthreads, verbose=5)(
+#         delayed(self.ms_parser)(m, self.sequence_length) for m in self.data
+#     )
+
+#     return tuple(chain(*ms_data))
+
+
+# # def read_region(self):
+#     if self.region is None:
+#         raise ValueError("Please input a region")
+
+#     if not isinstance(self.data, list):
+#         self.data = [self.data]
+
+#         if isinstance(self.region, list):
+#             self.data = self.data * len(self.region)
+#         else:
+#             self.region = [self.region]
+
+#     sims = []
+#     for v, r in zip(self.data, self.region):
+#         assert (
+#             "zarr" in v
+#             or "vcf" in v
+#             or "vcf" in v
+#             or "bcf" in v
+#             or "bcf in self.data" "VCF file must be zarr, vcf or bcf format"
+#         )
+
+#         raw_data = allel.read_vcf(v, region=r, samples=self.samples)
+#         gt = allel.GenotypeArray(raw_data["calldata/GT"])
+#         pos = raw_data["variants/POS"]
+#         chrom = np.char.replace(raw_data["variants/CHROM"].astype(str), "chr", "")
+#         np_region = np.array(r.split(":")[-1].split("-")).astype(int)
+#         try:
+#             chrom = chrom.astype(int)
+#         except:
+#             pass
+#         ac = gt.count_alleles()
+#         biallelic_filter = ac.is_biallelic_01()
+
+#         hap = gt.to_haplotypes()
+#         hap = hap.subset(biallelic_filter)
+#         pos = pos[biallelic_filter]
+#         chrom = chrom[biallelic_filter]
+
+#         if self.recombination_map is None:
+#             rec_map = (
+#                 pl.DataFrame(
+#                     {
+#                         "chrom": chrom,
+#                         "idx": np.arange(pos.size),
+#                         "pos": pos,
+#                         "cm": pos,
+#                     }
+#                 )
+#                 .to_numpy()
+#                 .flatten()
+#             )
+#         else:
+#             df_recombination_map = pl.read_csv(
+#                 self.recombination_map, separator="\t"
+#             )
+#             genetic_distance = self.get_cm(df_recombination_map, pos)
+#             rec_map = (
+#                 pl.DataFrame([chrom, np.arange(pos.size), pos, genetic_distance])
+#                 .to_numpy()
+#                 .flatten()
+#                 .T
+#             )
+
+#         window_iter = list(
+#             allel.index_windows(
+#                 pos, int(self.window_size), pos[0], pos[-1], int(self.step)
+#             )
+#         )
+
+#         region_data = []
+#         for w in window_iter:
+#             tmp_hap, tmp_rec_map = self.get_hap_window(hap, pos, rec_map, w)
+
+#             if tmp_hap is not None:
+#                 # physical position to relative physical position (1,1.2e6)
+#                 # this way we do not perform any change on summary_statistics center/windows combinations
+#                 f = interp1d(w, [1, int(self.window_size) + 1])
+#                 tmp_rec_map = np.column_stack(
+#                     [tmp_rec_map, f(tmp_rec_map[:, 2]).astype(int)]
+#                 )
+
+#                 region_data.append((tmp_hap, tmp_rec_map[:, [0, 1, -1, 2, 3]]))
+
+#         sims.append(region_data)
+#     if len(sims) == 1:
+#         sims = sims[0]
+#     return sims
+
+
+# )
+
+# "sweep": ms_sweeps,
+# "neutral": ms_neutral,

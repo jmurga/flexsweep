@@ -16,25 +16,33 @@ import re
 import importlib.resources
 
 # Extract the resource path using the recommended `files` API
-DISCOAL = os.path.join(
-    os.path.dirname(importlib.resources.files("data") / "discoal"), "discoal"
-)
+# DISCOAL = os.path.join(
+#     os.path.dirname(importlib.resources.files("data") / "discoal"), "discoal"
+# )
+DISCOAL = "/home/jmurgamoreno/software/discoal_mod/discoal"
+
 
 class Simulator:
     def __init__(
         self,
         sample_size,
-        mutation_rate,
-        recombination_rate,
-        locus_length,
         demes,
         output_folder,
+        mutation_rate={"dist": "uniform", "min": 5e-9, "max": 2e-8},
+        recombination_rate={
+            "dist": "exponential",
+            "min": 1e-9,
+            "max": 4e-8,
+            "mean": 1e-8,
+        },
+        locus_length=int(1.2e6),
         discoal_path=DISCOAL,
-        num_simulations=int(1e4),
+        num_simulations=int(1.25e4),
         ne=int(1e4),
         time=[0, 5000],
         nthreads=1,
         fixed_ratio=0.1,
+        split=False,
     ):
         """
         Initializes the Simulator with given parameters.
@@ -60,6 +68,8 @@ class Simulator:
         self.fixed_ratio = 0.1
         self.reset_simulations = False
         self.demes_data = None
+        self.split = split
+        self.parameters = None
 
     def check_inputs(self):
         assert isinstance(
@@ -102,14 +112,25 @@ class Simulator:
         return discoal_demes
 
     def random_distribution(self, num):
-        if (self.mutation_rate["dist"] == "exponential") or (
-            self.mutation_rate["dist"] == "uniform"
-        ):
-            dist = getattr(np.random, self.mutation_rate["dist"])
-            try:
-                mu = dist(self.mutation_rate["lower"], self.mutation_rate["upper"], num)
-            except:
-                mu = dist(self.mutation_rate["mean"], num)
+        # eyre-walker = U(5e-9,2-e8 (1e-8 +- 50%)) two small to match mean segregating sites
+        # mbe = U(2e-9,5e-8) if uniform to match sweep/neutral with high/low segregating sites, no way to discern
+        # mbe
+        # N('dist':'normal','mean':1.25e-8,'std':1e-8,'min':2e-9,'max':5.2e-8)
+        if self.mutation_rate["dist"] == "uniform":
+            mu = np.random.uniform(
+                self.mutation_rate["min"], self.mutation_rate["max"], num
+            )
+        elif self.mutation_rate["dist"] == "exponential":
+            mu = []
+            while len(mu) < num:
+                tmp_mu = np.random.exponential(self.mutation_rate["mean"], num)
+                valid_values = tmp_mu[
+                    (tmp_mu >= self.mutation_rate["min"])
+                    & (tmp_mu <= self.mutation_rate["max"])
+                ]
+                remaining = num - len(mu)
+                mu.extend(valid_values[:remaining])
+            mu = np.array(mu)
         elif self.mutation_rate["dist"] == "fixed":
             next
         else:
@@ -122,18 +143,26 @@ class Simulator:
                 scale=self.mutation_rate["std"],
             ).rvs(size=num)
 
-        if (self.recombination_rate["dist"] == "exponential") or (
-            self.recombination_rate["dist"] == "uniform"
-        ):
-            dist = getattr(np.random, self.recombination_rate["dist"])
-            try:
-                rho = dist(
-                    self.recombination_rate["lower"],
-                    self.recombination_rate["upper"],
-                    num,
-                )
-            except:
-                rho = dist(self.recombination_rate["mean"], num)
+        #
+        # mbe = U('dist': 'normal','min':1e-9,'max':5e-8,'mean':1e-8,'std':5e-9)
+        # mbe high r = U('dist': 'normal','min':1e-9,'max':5e-8,'mean':1e-8,'std':1e-8)
+        if self.recombination_rate["dist"] == "uniform":
+            rho = np.random.uniform(
+                self.recombination_rate["min"],
+                self.recombination_rate["max"],
+                num,
+            )
+        elif self.recombination_rate["dist"] == "exponential":
+            rho = []
+            while len(rho) < num:
+                tmp_rho = np.random.exponential(self.recombination_rate["mean"], num)
+                valid_values = tmp_rho[
+                    (tmp_rho >= self.recombination_rate["min"])
+                    & (tmp_rho <= self.recombination_rate["max"])
+                ]
+                remaining = num - len(rho)
+                rho.extend(valid_values[:remaining])
+            rho = np.array(rho)
         elif self.recombination_rate["dist"] == "fixed":
             next
         else:
@@ -145,63 +174,35 @@ class Simulator:
                 loc=self.recombination_rate["mean"],
                 scale=self.recombination_rate["std"],
             ).rvs(size=num)
-        # mu = np.random.uniform(self.mutation_rate[0], self.mutation_rate[1], num)
-        # rho = np.random.uniform(
-        #     self.recombination_rate[0],
-        #     self.recombination_rate[1],
-        #     num,
-        # )
 
         return mu, rho
 
-    def simulate(self):
+    def split_recombination(self, rho, threshold=2e-8):
+        mask = rho < threshold
+
+        return mask
+
+    def create_params(self):
         discoal_demes = self.check_inputs()
 
+        scaling = 4 * self.ne * self.locus_length
+
         # Neutral simulations
-        mu, rho = self.random_distribution(self.num_simulations)
-        theta_neutral = 4 * self.ne * self.locus_length * mu
-        rho_neutral = 4 * self.ne * self.locus_length * rho
-
-        print("Performing neutral simulations")
-        sims_n = Parallel(n_jobs=self.nthreads, backend="multiprocessing", verbose=5)(
-            delayed(self.neutral)(v[0], v[1], discoal_demes, i)
-            for (i, v) in enumerate(zip(theta_neutral, rho_neutral), 1)
-        )
-
-        df_neutral = pl.DataFrame(
-            {
-                "iter": np.arange(1, self.num_simulations + 1),
-                "theta": theta_neutral / (4 * self.ne * self.locus_length),
-                "rho": rho_neutral / (4 * self.ne * self.locus_length),
-                "eaf": 0.0,
-                "saf": 0.0,
-                "s": 0.0,
-                "t": 0.0,
-                "model": "neutral",
-            }
-        )
-
-        ms_neutral = list(
-            chain(
-                *Parallel(n_jobs=self.nthreads, verbose=0)(
-                    delayed(self.ms_parser)(m, seq_len=1.2e6) for m in sims_n
-                )
-            )
-        )
+        mu_neutral, r_neutral = self.random_distribution(self.num_simulations)
+        theta_neutral = scaling * mu_neutral
+        rho_neutral = scaling * r_neutral
 
         # Sweep simulations
-        mu, rho = self.random_distribution(self.num_simulations)
-        theta_sweeps = 4 * self.ne * self.locus_length * mu
-        rho_sweeps = 4 * self.ne * self.locus_length * rho
+        mu_sweep, r_sweep = self.random_distribution(self.num_simulations)
+        theta_sweep = scaling * mu_sweep
+        rho_sweep = scaling * r_sweep
 
-        sel_time = np.round(
-            np.random.uniform(self.time[0], self.time[1], self.num_simulations)
-            / (4 * self.ne),
-            3,
-        )
+        sel_time = np.random.uniform(
+            self.time[0], self.time[1], self.num_simulations
+        ) / (4 * self.ne)
 
-        sel_coef = np.random.uniform(
-            2 * self.ne * self.s[0], 2 * self.ne * self.s[1], self.num_simulations
+        sel_coef = (
+            np.random.uniform(self.s[0], self.s[1], self.num_simulations) * 2 * self.ne
         )
 
         num_hard = int(self.num_simulations * 0.5)
@@ -244,20 +245,24 @@ class Simulator:
             ]
         )
 
-        print("Performing sweep simulations")
-
-        sims_s = Parallel(n_jobs=self.nthreads, verbose=5)(
-            delayed(self.sweep)(v[0], v[1], v[2], v[3], v[4], v[5], discoal_demes, i)
-            for (i, v) in enumerate(
-                zip(theta_sweeps, rho_sweeps, eaf, saf, sel_time, sel_coef), 1
-            )
+        df_neutral = pl.DataFrame(
+            {
+                "iter": np.arange(1, self.num_simulations + 1),
+                "mu": theta_neutral / scaling,
+                "r": rho_neutral / scaling,
+                "eaf": 0.0,
+                "saf": 0.0,
+                "s": 0.0,
+                "t": 0.0,
+                "model": "neutral",
+            }
         )
 
         df_sweeps = pl.DataFrame(
             {
                 "iter": np.arange(1, self.num_simulations + 1),
-                "theta": theta_sweeps / (4 * self.ne * self.locus_length),
-                "rho": rho_sweeps / (4 * self.ne * self.locus_length),
+                "mu": theta_sweep / scaling,
+                "r": rho_sweep / scaling,
                 "eaf": eaf,
                 "saf": saf,
                 "s": sel_coef / (2 * self.ne),
@@ -268,21 +273,191 @@ class Simulator:
 
         params = df_sweeps.select(["s", "t", "saf", "eaf"]).to_numpy()
 
-        ms_sweeps = list(
-            chain(
-                *Parallel(n_jobs=self.nthreads, verbose=0)(
-                    delayed(self.ms_parser)(m, param=p, seq_len=1.2e6)
-                    for (m, p) in zip(sims_s, params)
-                )
-            )
-        )
+        # Simulating
+        df_params = pl.concat([df_neutral, df_sweeps], how="vertical")
+        df_params.write_csv(self.output_folder + "/params.txt.gz")
 
-        df = pl.concat([df_neutral, df_sweeps], how="vertical")
-        df.write_csv(self.output_folder + "/params.txt.gz")
+        self.parameters = df_params
+
+        return df_params
+
+    def simulate(self, start=-1, end=-1):
+        discoal_demes = self.check_inputs()
+        scaling = 4 * self.ne * self.locus_length
+
+        if self.split:
+            try:
+                df_params = pl.read_csv(self.output_folder + "/params.txt.gz")
+            except:
+                raise FileNotFoundError(
+                    f"File not found: {self.output_folder}/params.txt.gz"
+                )
+
+            # Adjust bounds if needed
+            if start == -1 or end == -1 or end > self.num_simulations:
+                start = 1
+                end = self.num_simulations
+
+            df_params = df_params.filter(
+                (pl.col("iter") >= start) & (pl.col("iter") <= end)
+            )
+
+            # Neutral
+            r_neutral = df_params.filter(pl.col("model") == "neutral")["r"].to_numpy()
+            mask_neutral = self.split_recombination(r_neutral)
+
+            # Sweeps
+            r_sweep = df_params.filter(pl.col("model") != "neutral")["r"].to_numpy()
+            mask_sweep = self.split_recombination(r_sweep)
+
+            with Parallel(n_jobs=self.nthreads, backend="loky", verbose=1) as parallel:
+                sims_n_low = parallel(
+                    delayed(self.neutral)(
+                        v["mu"] * scaling, v["r"] * scaling, discoal_demes, v["iter"]
+                    )
+                    for v in df_params.filter(pl.col("model") == "neutral")
+                    .filter(mask_neutral)
+                    .iter_rows(named=True)
+                )
+
+                sims_s_low = parallel(
+                    delayed(self.sweep)(
+                        v["mu"] * scaling,
+                        v["r"] * scaling,
+                        v["eaf"],
+                        v["saf"],
+                        v["t"] / (4 * self.ne),
+                        2 * self.ne * v["s"],
+                        discoal_demes,
+                        v["iter"],
+                    )
+                    for v in df_params.filter(pl.col("model") != "neutral")
+                    .filter(mask_sweep)
+                    .iter_rows(named=True)
+                )
+
+            with Parallel(
+                n_jobs=self.nthreads // 5, backend="loky", verbose=1
+            ) as parallel:
+                sims_n_high = parallel(
+                    delayed(self.neutral)(
+                        v["mu"] * scaling, v["r"] * scaling, discoal_demes, v["iter"]
+                    )
+                    for (i, v) in enumerate(
+                        df_params.filter(pl.col("model") == "neutral")
+                        .filter(~mask_neutral)
+                        .iter_rows(named=True)
+                    )
+                )
+
+                sims_s_high = parallel(
+                    delayed(self.sweep)(
+                        v["mu"] * scaling,
+                        v["r"] * scaling,
+                        v["eaf"],
+                        v["saf"],
+                        v["t"] / (4 * self.ne),
+                        2 * self.ne * v["s"],
+                        discoal_demes,
+                        v["iter"],
+                    )
+                    for (i, v) in enumerate(
+                        df_params.filter(pl.col("model") != "neutral")
+                        .filter(~mask_sweep)
+                        .iter_rows(named=True)
+                    )
+                )
+
+            sims_n = sims_n_low + sims_n_high
+            sims_s = sims_s_low + sims_s_high
+        else:
+            try:
+                df_params = pl.read_csv(self.output_folder + "/params.txt.gz")
+            except:
+                raise FileNotFoundError(
+                    f"File not found: {self.output_folder}/params.txt.gz"
+                )
+
+            # Adjust bounds if needed
+            if start < 0 or end > self.num_simulations or start >= end:
+                start = 1
+                end = self.num_simulations
+            else:
+                df_params = df_params.filter(
+                    (pl.col("iter") >= start) & (pl.col("iter") <= end)
+                )
+
+            with Parallel(n_jobs=self.nthreads, backend="loky", verbose=1) as parallel:
+                print("Performing neutral simulations")
+
+                sims_n = parallel(
+                    delayed(self.neutral)(
+                        v["mu"] * scaling, v["r"] * scaling, discoal_demes, v["iter"]
+                    )
+                    for (i, v) in enumerate(
+                        df_params.filter(pl.col("model") == "neutral").iter_rows(
+                            named=True
+                        ),
+                        start,
+                    )
+                    # for (i, v) in enumerate(zip(theta_neutral, rho_neutral), 1)
+                )
+                print("Performing sweep simulations")
+                sims_s = parallel(
+                    delayed(self.sweep)(
+                        v["mu"] * scaling,
+                        v["r"] * scaling,
+                        v["eaf"],
+                        v["saf"],
+                        v["t"] / (4 * self.ne),
+                        2 * self.ne * v["s"],
+                        discoal_demes,
+                        v["iter"],
+                    )
+                    for (i, v) in enumerate(
+                        df_params.filter(pl.col("model") != "neutral").iter_rows(
+                            named=True
+                        ),
+                        start,
+                    )
+                    # for (i, v) in enumerate(
+                    # zip(theta_sweep, rho_sweep, eaf, saf, sel_time, sel_coef), 1
+                    # zip(theta_sweep, rho_sweep, eaf, saf, sel_time, sel_coef), 1
+                    # )
+                )
+
+        # print("Performing neutral simulations")
+        # sims_n = Parallel(n_jobs=self.nthreads, backend="multiprocessing", verbose=5)(
+        #     delayed(self.neutral)(v[0], v[1], discoal_demes, i)
+        # )
+        # ms_neutral = list(
+        #     chain(
+        #         *Parallel(n_jobs=self.nthreads, verbose=0)(
+        #             delayed(self.ms_parser)(m, seq_len=1.2e6) for m in sims_n
+        #         )
+        #     )
+        # )
+
+        # print("Performing sweep simulations")
+
+        # sims_s = Parallel(n_jobs=self.nthreads, verbose=5)(
+        #     delayed(self.sweep)(v[0], v[1], v[2], v[3], v[4], v[5], discoal_demes, i)
+        #     for (i, v) in enumerate(
+        #         zip(theta_sweeps, rho_sweeps, eaf, saf, sel_time, sel_coef), 1
+        #     )
+        # )
+        # ms_sweeps = list(
+        #     chain(
+        #         *Parallel(n_jobs=self.nthreads, verbose=0)(
+        #             delayed(self.ms_parser)(m, param=p, seq_len=1.2e6)
+        #             for (m, p) in zip(sims_s, params)
+        #         )
+        #     )
+        # )
 
         sims = {
-            "sweep": ms_sweeps,
-            "neutral": ms_neutral,
+            "sweep": sims_s,
+            "neutral": sims_n,
         }
 
         return sims

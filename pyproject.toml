@@ -7,16 +7,10 @@ license = "MIT"
 homepage = "https://github.com/jmurga/flexsweep"
 repository = "https://github.com/jmurga/flexsweep"
 readme = "README.md"
-
-include = [
-    "data/discoal",
-    "data/constant.yaml",
-    "data/twoepoch.yaml",
-    "data/yri_spiedel_2019.yaml"
-]
+packages = [{include = "flexsweep"}]
 
 [tool.poetry.dependencies]
-python = ">=3.10,<3.12"
+python = ">=3.12"
 scipy = "^1.14.0"
 scikit-allel = "^1.3.8"
 scikit-learn = "^1.5.1"
@@ -30,6 +24,8 @@ tensorflow = {extras = ["and-cuda"], version = "^2.18.0"}
 pyarrow = "^17.0.0"
 matplotlib = "^3.9.2"
 polars = "^1.14.0"
+pybedtools = "^0.12.0"
+tbb = "^2022.1.0"
 
 [tool.poetry.scripts]
 flexsweep = "flexsweep.main:cli"
@@ -37,3 +33,4 @@ flexsweep = "flexsweep.main:cli"
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
+
