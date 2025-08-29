@@ -30,7 +30,7 @@ The software is now able to estimate summary statistics in custom genomic center
 
 We refactor the entire package, focusing on speed and traceability. The code was refactored and takes advantage of `Numba <https://numba.pydata.org/>`_ as much as possible for all the previous statistics except for nSL and iHS, which rely on scikit-allel functions. All the summary statistic outputs and feature vectors rely on `Polars DataFrames <https://pola.rs/>`_ to avoid the previous huge number of intermediate files and easily inspect outputs while reducing RAM consumption as much as possible.
 
-The new version included optimised versions of `iSAFE <https://doi.org/10.1038/nmeth.4606>`_, `DIND <https://doi.org/10.1371/journal.pgen.1000562>`_, hapDAF, Sratio, highfreq, lowfreq as well as the custom HAF and H12 as described in `Flex-sweep manuscript <https://doi.org/10.1093/molbev/msad139>`_.
+The new version included optimised versions of `iSAFE <https://doi.org/10.1038/nmeth.4606>`_, `DIND <https://doi.org/10.1371/journal.pgen.1000562>`_, hapDAF-o/s, Sratio, highfreq, lowfreq as well as the custom HAF and H12 as described in `Flex-sweep manuscript <https://doi.org/10.1093/molbev/msad139>`_.
 
 Because we intend to make Flex-sweep as flexible as possible, we included several other summary statistics (note that any other statistic already available in scikit-allel can be used straightforwardly):
 
