@@ -1,8 +1,13 @@
+[![Documentation Status](https://readthedocs.org/projects/flexsweep/badge/?version=latest)](https://flexsweep.readthedocs.io/en/latest/?badge=latest)
+
 # Flexsweep v2.0
 
 (In development, not recommended for end users).
 
 The second version of [Flexsweep software](https://doi.org/10.1093/molbev/msad139), a versatile tool for detecting selective sweeps. The software trains a convolutional neural network (CNN) to classify genomic loci as sweep or neutral regions. The workflow begins with simulating data under an appropriate demographic model and classify regions as neutral or sweeps, including several selection events regarding sweep strength, age, starting allele frequency (softness), and ending allele frequency (completeness).
+
+Please see [documentation](https://flexsweep.readthedocs.io/en/latest/) for further details.
+
 
 The new version simplifies and streamlines the project structure, files, simulations, summary statistics estimation and allows for the easy addition of custom CNN architectures. The software takes advantage of [demes](https://doi.org/10.1093/genetics/iyac131) to simulate custom demography histories and main [scikit-allel](https://scikit-allel.readthedocs.io/) data structures to avoid external software and temporal files. The whole pipeline is parallelized using [joblib](https://joblib.readthedocs.io/en/stable/). We included optimized versions of [iSAFE](https://doi.org/10.1038/nmeth.4606), [DIND](https://doi.org/10.1371/journal.pgen.1000562), hapdaf, S ratio, freqs as well as the custom HAF and H12 as described in [Flexsweep manuscript](https://doi.org/10.1093/molbev/msad139). The software now is also able to run the following statistics:
 

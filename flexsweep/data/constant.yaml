@@ -1,0 +1,5 @@
+time_units: generations
+demes:
+  - name: Equilibrium
+    epochs:
+      - start_size: 10000

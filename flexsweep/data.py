@@ -1,10 +1,6 @@
 import os
 
-# os.environ["POLARS_MAX_THREADS"] = "1"
-
-
 from . import np, Parallel, delayed, pl
-
 
 from allel import read_vcf, GenotypeArray, index_windows
 from scipy.interpolate import interp1d
@@ -23,29 +19,71 @@ class Data:
     def __init__(
         self,
         data,
-        sweep_parameters=None,
         region=None,
         samples=None,
         recombination_map=None,
-        mask=None,
         window_size=int(1.2e6),
         step=int(1e4),
         nthreads=1,
         sequence_length=int(1.2e6),
         in_memory=False,
     ):
+        """
+        Utilities for loading VCF/ms-style simulations and producing windowed inputs.
+
+        Args:
+            data (str | Any):
+                Path to input data:
+                  - Path containing VCF/BCF files
+                  - Path contiaining discoal simulations
+            region (str, default=None):
+                Optional genomic region string 'CHR:START-END' to read from VCF/BCF.
+            samples (list[str] | np.ndarray | None, default=None):
+                Optional subset of samples (names or indices) to read from VCF/BCF.
+            recombination_map (str | None, default=None):
+                Optional path to recombination map CSV with columns:
+                [Chr, Begin, End, cMperMb, cM]. If None, assumes physical distance ~ genetic distance.
+            window_size (int, default=1_200_000):
+                Genomic window size in base pairs when scanning a VCF.
+            step (int, default=10_000):
+                Sliding step in base pairs between adjacent windows when scanning a VCF.
+            nthreads (int, default=1):
+                Number of parallel workers for joblib.
+            sequence_length (int, default=1_200_000):
+                Sequence length used to scale ms/discoal 'positions' (0..1) into bp.
+
+        Notes:
+            - The class handle both functions to read VCF files and discoal simulations.
+            - Randomness is not used here; outputs are deterministic given inputs.
+        """
         self.data = data
         self.region = region
         self.samples = samples
         self.recombination_map = recombination_map
-        self.mask = mask
         self.window_size = window_size
         self.step = step
         self.nthreads = nthreads
         self.sequence_length = sequence_length
-        self.in_memory = in_memory
 
-    def genome_reader(self, region, samples, _iter=1):
+    def genome_reader(self, region, samples):
+        """
+        Read a genomic region from a VCF/BCF and return haplotypes and rec_map given the region  interval.
+
+        Args:
+            region (str): Region string 'CHR:START-END'.
+            samples (list[str] | np.ndarray): Sample subset to read.
+
+        Returns:
+            dict[str, tuple[np.ndarray, np.ndarray] | None]:
+                {region: (hap, rec_map_subset)} or {region: None} if no biallelic sites.
+                - hap: (S x N) int8 array of phased haplotypes (derived-allele indicators).
+                - rec_map_subset: (S x 4) array [chrom, idx, genetic_pos(cm or proxy), physical_pos].
+
+        Notes:
+            - Filters to biallelic variants via scikit-allel's AlleleCounts.is_biallelic_01.
+            - If no recombination map is supplied, genetic distance is set to physical pos and
+              later remapped to a relative [1..sequence_length] coordinate system.
+        """
         filterwarnings(
             "ignore", message="invalid INFO header", module="allel.io.vcf_read"
         )
@@ -111,6 +149,27 @@ class Data:
         return {region: (hap, rec_map[:, [0, 1, -1, 2]])}
 
     def read_vcf(self):
+        """
+        Slide windows across a single-contig VCF/BCF and collect per-window data haplotypes
+
+        Returns:
+            dict | OrderedDict:
+                If in_memory=True:
+                    {'sweep': list[[hap, rec_map, zeros(4)]], 'region': list[str]}
+                    where each element corresponds to a window with data.
+                If in_memory=False:
+                    OrderedDict({'sweep': <vcf_path>, 'region': list[str]})
+                    with region strings to be used downstream for lazy reading.
+
+        Raises:
+            IOError: If the file extension is not one of [.vcf, .vcf.gz, .bcf, .bcf.gz].
+            FileNotFoundError: If the VCF/BCF is not tabix-indexed (<path>.tbi is missing).
+
+        Notes:
+            - Determines contig name/length by reading last line of the vcf file.
+            - Generates overlapping windows of size `window_size` and step `step`.
+            - Uses multiprocessing when in_memory=True to read per-window haplotypes.
+        """
         if (
             not self.data.endswith(".vcf")
             and not self.data.endswith(".vcf.gz")
@@ -189,6 +248,23 @@ class Data:
         return sims
 
     def read_simulations(self):
+        """
+        Load paths (or parsed data if in_memory=True) for discoal simulations.
+
+        Expects a directory structure:
+            <self.data>/neutral/*.ms.gz
+            <self.data>/sweep/*.ms.gz
+            <self.data>/params.txt.gz
+
+        Returns:
+            tuple[OrderedDict, pl.DataFrame]:
+                sims: OrderedDict({'neutral': <list|array>, 'sweep': <list|array>})
+                params: polars DataFrame with columns ['model', 's', 't', 'saf', 'eaf'].
+
+        Raises:
+            AssertionError: If self.data is not a string.
+            ValueError: If required 'neutral' or 'sweep' subfolders are missing or empty.
+        """
         assert isinstance(self.data, str)
 
         for folder in ("sweep", "neutral"):
@@ -203,46 +279,16 @@ class Data:
         df_neutral = df_params.filter(model="neutral")
         df_sweeps = df_params.filter(model="sweep")
 
-        if self.in_memory:
-            with Parallel(
-                n_jobs=self.nthreads,
-                pre_dispatch="10*n_jobs",
-                batch_size=1000,
-                backend="multiprocessing",
-                verbose=5,
-            ) as parallel:
-                sweeps = list(
-                    chain(
-                        *parallel(
-                            delayed(self.ms_parser)(m, param=p)
-                            for (m, p) in zip(
-                                sweeps,
-                                params.filter(pl.col("model") == "sweep").to_numpy()[
-                                    :, 1:
-                                ],
-                            )
-                        )
-                    )
-                )
-
-                neutral = list(
-                    chain(*parallel(delayed(self.ms_parser)(m) for m in neutral))
-                )
-        else:
-            sweeps = (
-                (self.data + "/sweep/sweep_" + (df_sweeps.select("iter") + ".ms.gz"))
-                .to_numpy()
-                .flatten()
-            )
-            neutral = (
-                (
-                    self.data
-                    + "/neutral/neutral_"
-                    + (df_neutral.select("iter") + ".ms.gz")
-                )
-                .to_numpy()
-                .flatten()
-            )
+        sweeps = (
+            (self.data + "/sweep/sweep_" + (df_sweeps.select("iter") + ".ms.gz"))
+            .to_numpy()
+            .flatten()
+        )
+        neutral = (
+            (self.data + "/neutral/neutral_" + (df_neutral.select("iter") + ".ms.gz"))
+            .to_numpy()
+            .flatten()
+        )
 
         sims = OrderedDict(
             {
@@ -253,90 +299,23 @@ class Data:
 
         return sims, params
 
-    def ms_parser(self, ms_file, param=None):
-        """Read a ms file and output the positions and the genotypes.
-        Genotypes are a numpy array of 0s and 1s with shape (num_segsites, num_samples).
-        """
-
-        assert (
-            ms_file.endswith(".out")
-            or ms_file.endswith(".out.gz")
-            or ms_file.endswith(".ms")
-            or ms_file.endswith(".ms.gz")
-        )
-
-        open_function = gzip.open if ms_file.endswith(".gz") else open
-
-        with open_function(ms_file, "rt") as file:
-            file_content = file.read()
-
-        # Step 2: Split by pattern (e.g., `---`)
-        pattern = r"//"
-        partitions = re.split(pattern, file_content)
-
-        if len(partitions) == 1:
-            warn(f"File {ms_file} is malformed.")
-            haps = [None]
-            rec_map = [None]
-        else:
-            positions = []
-            haps = []
-            rec_map = []
-            for r in partitions[1:]:
-                # Read in number of segregating sites and positions
-                data = []
-                for line in r.splitlines()[1:]:
-                    if line == "":
-                        continue
-                    # if "discoal" in line or "msout" in line:
-                    # self.sequence_length = int(line.strip().split()[3])
-                    if line.startswith("segsites"):
-                        num_segsites = int(line.strip().split()[1])
-                        if num_segsites == 0:
-                            continue
-                            #     # Shape of data array for 0 segregating sites should be (0, 1)
-                            # return np.array([]), np.array([], ndmin=2, dtype=np.uint8).T
-                    elif line.startswith("positions"):
-                        tmp_pos = np.array([float(x) for x in line.strip().split()[1:]])
-                        tmp_pos = np.round(tmp_pos * self.sequence_length).astype(int)
-
-                        # Find duplicates in the array
-                        duplicates = np.diff(tmp_pos) == 0
-
-                        # While there are any duplicates, increment them by 1
-                        for i in np.where(duplicates)[0]:
-                            tmp_pos[i + 1] += 1
-                        tmp_pos += 1
-                        positions.append(tmp_pos)
-                        tmp_map = np.column_stack(
-                            [
-                                np.repeat(1, tmp_pos.size),
-                                np.arange(tmp_pos.size),
-                                tmp_pos,
-                                tmp_pos,
-                            ]
-                        )
-                        rec_map.append(tmp_map)
-
-                    else:
-                        # Now read in the data
-                        data.append(np.array(list(line), dtype=np.int8))
-                try:
-                    data = np.vstack(data).T
-                except:
-                    warn(f"File {ms_file} is malformed.")
-                    data = None
-
-                # data = np.vstack(data).T
-                haps.append(data)
-
-        if param is None:
-            param = np.zeros(4)
-
-        return list(zip(haps, rec_map, [param]))
-
     def get_cm(self, df_rec_map, positions):
-        # Create the interpolating function
+        """
+        Interpolate genetic distances (cM) for given physical positions.
+
+        Args:
+            df_rec_map (pl.DataFrame):
+                Recombination map with numeric columns where:
+                  - df_rec_map.columns[1] holds physical coordinate (bp),
+                  - df_rec_map.columns[-1] holds cumulative genetic distance (cM).
+            positions (np.ndarray[int]): Physical positions to interpolate.
+
+        Returns:
+            np.ndarray[float]: Interpolated cumulative cM values (negative values clamped to 0).
+
+        Notes:
+            - Uses linear interpolation with extrapolation at ends.
+        """
         interp_func = interp1d(
             df_rec_map.select(df_rec_map.columns[1]).to_numpy().flatten(),
             df_rec_map.select(df_rec_map.columns[-1]).to_numpy().flatten(),
@@ -348,18 +327,20 @@ class Data:
         rr1 = interp_func(positions)
         # rr2 = interp_func(positions[:, 1])
         rr1[rr1 < 0] = 0
+
         # Calculate the recombination rate in cM/Mb
         # rate = (rr2 - rr1) / ((positions[:, 1] - positions[:, 0]) / 1e6)
 
         return rr1
 
-    def get_hap_window(self, hap_data, positions, rec_map, window):
-        flt = (positions >= window[0]) & (positions <= window[-1])
 
-        if flt.sum() == 0:
-            return None, None
-        else:
-            return np.array(hap_data[flt]), rec_map[flt]
+# def get_hap_window(self, hap_data, positions, rec_map, window):
+#     flt = (positions >= window[0]) & (positions <= window[-1])
+
+#     if flt.sum() == 0:
+#         return None, None
+#     else:
+#         return np.array(hap_data[flt]), rec_map[flt]
 
 
 # def read_ms_files(self):

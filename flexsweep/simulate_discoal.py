@@ -2,27 +2,40 @@ import os
 
 from . import pl, np, Parallel, delayed
 
-# import numpy as np
-# import pandas as pd
-# from joblib import Parallel, delayed
-
 import demes
 import subprocess
 
 import gzip
 from scipy import stats
-from itertools import chain
-import re
-import importlib.resources
 
-# Extract the resource path using the recommended `files` API
-# DISCOAL = os.path.join(
-#     os.path.dirname(importlib.resources.files("data") / "discoal"), "discoal"
-# )
-DISCOAL = "/home/jmurgamoreno/software/discoal_mod/discoal"
+
+# Extract default data and binaries
+DISCOAL = os.path.join(os.path.dirname(__file__), "data", "discoal")
+DECODE_MAP = os.path.join(os.path.dirname(__file__), "data", "decode_sexavg_2019.txt")
+DEMES_EXAMPLES = {
+    "constant": os.path.join(os.path.dirname(__file__), "data", "constant.yaml"),
+    "yri": os.path.join(
+        os.path.dirname(__file__), "data", "yri_spiedel_2019_full.yaml"
+    ),
+    "ceu": os.path.join(
+        os.path.dirname(__file__), "data", "ceu_spiedel_2019_full.yaml"
+    ),
+    "chb": os.path.join(
+        os.path.dirname(__file__), "data", "chb_spiedel_2019_full.yaml"
+    ),
+}
 
 
 class Simulator:
+    """
+    Initialize discoal coalescent simulations.
+
+    The simulator draws per-replicate mutation (:math:`\\mu`) and recombination
+    (:math:`r`) rates, scales them to :math:`\\theta = 4N_eL\\mu` and
+    :math:`\\rho = 4N_eLr`, and prepares neutral and sweep configurations to be
+    executed via the ``discoal`` binary.
+    """
+
     def __init__(
         self,
         sample_size,
@@ -45,10 +58,50 @@ class Simulator:
         split=False,
     ):
         """
-        Initializes the Simulator with given parameters.
+        Initialize discoal coalescent simulations.
 
-        Args:
-                parameters (dataclass): A configuration dataclass containing simulation parameters and mean diffusion times.
+        The simulator prepares neutral and sweep configurations to be executed via
+        the ``discoal`` binary.
+
+        :param int sample_size: Number of haplotypes per replicate.
+        :param str demes: Path to a demes YAML file describing demography.
+        :param str output_folder: Directory to write ms outputs and parameters.
+        :param dict mutation_rate: Mutation rate distribution (per-bp :math:`\\mu`).
+            Supported forms:
+
+            * ``{"dist": "uniform", "min": float, "max": float}``
+            * ``{"dist": "exponential", "min": float, "max": float, "mean": float}``
+            * ``{"dist": "truncnorm", "min": float, "max": float, "mean": float, "std": float}``
+            * ``{"dist": "fixed", "value": float}`` (placeholder, not implemented)
+
+            **Default:** ``{"dist": "uniform", "min": 5e-9, "max": 2e-8}``.
+        :param dict recombination_rate: Recombination rate distribution (per-bp :math:`r`).
+            Same schema as ``mutation_rate``. **Default:**
+            ``{"dist": "exponential", "min": 1e-9, "max": 4e-8, "mean": 1e-8}``.
+        :param int locus_length: Sequence length in base pairs.
+            **Default:** ``1_200_000``.
+        :param str discoal_path: Path to the discoal executable.
+            **Default:** value of module/global ``DISCOAL``.
+        :param int num_simulations: Number of neutral and number of sweep replicates (each).
+            **Default:** ``12500``.
+        :param int ne: Effective population size :math:`N_e`. **Default:** ``10000``.
+        :param list time: Sweep time window in generations ``[min, max]``.
+            **Default:** ``[0, 5000]``.
+        :param int nthreads: Maximum joblib workers. **Default:** ``1``.
+        :param float fixed_ratio: Fraction of complete sweeps within hard/soft sets.
+            **Default:** ``0.1``.
+        :param bool split: If ``True``, split jobs into low/high recombination groups.
+            **Default:** ``False``.
+
+        .. note::
+           Random number generation is **not seeded** (non-deterministic runs).
+
+        .. warning::
+           The implementation later overwrites some constructor values internally
+           (e.g., ``self.time``, ``self.s``, ``self.fixed_ratio``) to fixed ranges.
+           If you want the arguments above to take effect, remove those reassignments
+           in the code.
+
         """
         self.ne_0 = ne
         self.ne = ne
@@ -61,10 +114,10 @@ class Simulator:
         self.discoal_path = discoal_path
         self.nthreads = nthreads
         self.num_simulations = num_simulations
-        self.f_t = [0.2, 1]
+        self.f_t = [0.5, 1]
         self.f_i = [0, 0.1]
         self.time = [0, 5000]
-        self.s = [0.001, 0.01]
+        self.s = [0.005, 0.02]
         self.fixed_ratio = 0.1
         self.reset_simulations = False
         self.demes_data = None
@@ -72,6 +125,16 @@ class Simulator:
         self.parameters = None
 
     def check_inputs(self):
+        """
+        Validate inputs and prepare output directories.
+
+        Ensures mutation and recombination distributions are dictionaries,
+        creates subdirectories for sweep and neutral simulations,
+        and reads demography from the provided demes YAML.
+
+        Returns:
+            str: Discoal demographic flags string (e.g., " -en <t> 0 <size> ...").
+        """
         assert isinstance(
             self.mutation_rate, dict
         ), "Please input distribution and mutation rates values"
@@ -88,6 +151,18 @@ class Simulator:
         return discoal_demes
 
     def read_demes(self):
+        """
+        Parse the demes YAML and build the discoal -en demography string.
+
+        Behavior:
+            - Loads the first deme and reverses epochs (oldest first).
+            - Sets self.ne_0 to initial population size.
+            - Converts epoch end times to 4Ne units and start sizes to Ne ratios.
+            - Produces strings of the form ' -en <time> 0 <size>'.
+
+        Returns:
+            str: Concatenated discoal '-en' flags
+        """
         assert ".yaml" in self.demes, "Please input a demes model"
 
         pop_history = demes.load(self.demes).asdict_simplified()["demes"][0]["epochs"]
@@ -112,6 +187,24 @@ class Simulator:
         return discoal_demes
 
     def random_distribution(self, num):
+        """
+        Draw mutation (μ) and recombination (ρ) rates.
+
+        Args:
+            num (int): Number of draws.
+
+        Returns:
+            tuple[np.ndarray, np.ndarray]: Arrays (mu, rho) each of length `num`.
+
+        Supported distributions:
+            - 'uniform': Uniform[min, max]
+            - 'exponential': Exponential(mean), truncated to [min, max]
+            - 'truncnorm': Truncated normal with mean/std/min/max
+            - 'fixed': Placeholder only (currently not implemented)
+
+        Notes:
+            - Values are in per-basepair units.
+        """
         # eyre-walker = U(5e-9,2-e8 (1e-8 +- 50%)) two small to match mean segregating sites
         # mbe = U(2e-9,5e-8) if uniform to match sweep/neutral with high/low segregating sites, no way to discern
         # mbe
@@ -177,12 +270,21 @@ class Simulator:
 
         return mu, rho
 
-    def split_recombination(self, rho, threshold=2e-8):
-        mask = rho < threshold
-
-        return mask
-
     def create_params(self):
+        """
+        Generate and save parameter sets for neutral and sweep simulations into a Polars DataFrame
+
+        Steps:
+            1. Draw μ and ρ, compute θ = 4NeLμ and ρ = 4NeLr.
+            2. Sample sweep times (uniform between time[0], time[1]).
+            3. Sample selection coefficients between s[0] and s[1].
+            4. Partition simulations into hard/soft and complete/incomplete sweeps.
+            5. Save all parameters to '<output_folder>/params.txt.gz'.
+
+        Returns:
+            pl.DataFrame: Parameters with columns
+                ['iter', 'mu', 'r', 'eaf', 'saf', 's', 't', 'model'].
+        """
         discoal_demes = self.check_inputs()
 
         scaling = 4 * self.ne * self.locus_length
@@ -281,179 +383,56 @@ class Simulator:
 
         return df_params
 
-    def simulate(self, start=-1, end=-1):
+    def simulate(self):
+        """
+        Run neutral and sweep simulations via discoal.
+
+        Returns:
+            dict[str, list[str]]: Paths to gzipped ms files, with keys 'neutral' and 'sweep'.
+        """
         discoal_demes = self.check_inputs()
         scaling = 4 * self.ne * self.locus_length
 
-        if self.split:
-            try:
-                df_params = pl.read_csv(self.output_folder + "/params.txt.gz")
-            except:
-                raise FileNotFoundError(
-                    f"File not found: {self.output_folder}/params.txt.gz"
-                )
-
-            # Adjust bounds if needed
-            if start == -1 or end == -1 or end > self.num_simulations:
-                start = 1
-                end = self.num_simulations
-
-            df_params = df_params.filter(
-                (pl.col("iter") >= start) & (pl.col("iter") <= end)
+        try:
+            df_params = pl.read_csv(self.output_folder + "/params.txt.gz")
+        except:
+            raise FileNotFoundError(
+                f"File not found: {self.output_folder}/params.txt.gz"
             )
 
-            # Neutral
-            r_neutral = df_params.filter(pl.col("model") == "neutral")["r"].to_numpy()
-            mask_neutral = self.split_recombination(r_neutral)
+        with Parallel(n_jobs=self.nthreads, backend="loky", verbose=1) as parallel:
+            print("Performing neutral simulations")
 
-            # Sweeps
-            r_sweep = df_params.filter(pl.col("model") != "neutral")["r"].to_numpy()
-            mask_sweep = self.split_recombination(r_sweep)
-
-            with Parallel(n_jobs=self.nthreads, backend="loky", verbose=1) as parallel:
-                sims_n_low = parallel(
-                    delayed(self.neutral)(
-                        v["mu"] * scaling, v["r"] * scaling, discoal_demes, v["iter"]
-                    )
-                    for v in df_params.filter(pl.col("model") == "neutral")
-                    .filter(mask_neutral)
-                    .iter_rows(named=True)
+            sims_n = parallel(
+                delayed(self.neutral)(
+                    v["mu"] * scaling, v["r"] * scaling, discoal_demes, v["iter"]
                 )
-
-                sims_s_low = parallel(
-                    delayed(self.sweep)(
-                        v["mu"] * scaling,
-                        v["r"] * scaling,
-                        v["eaf"],
-                        v["saf"],
-                        v["t"] / (4 * self.ne),
-                        2 * self.ne * v["s"],
-                        discoal_demes,
-                        v["iter"],
-                    )
-                    for v in df_params.filter(pl.col("model") != "neutral")
-                    .filter(mask_sweep)
-                    .iter_rows(named=True)
+                for (i, v) in enumerate(
+                    df_params.filter(pl.col("model") == "neutral").iter_rows(
+                        named=True
+                    ),
+                    1,
                 )
-
-            with Parallel(
-                n_jobs=self.nthreads // 5, backend="loky", verbose=1
-            ) as parallel:
-                sims_n_high = parallel(
-                    delayed(self.neutral)(
-                        v["mu"] * scaling, v["r"] * scaling, discoal_demes, v["iter"]
-                    )
-                    for (i, v) in enumerate(
-                        df_params.filter(pl.col("model") == "neutral")
-                        .filter(~mask_neutral)
-                        .iter_rows(named=True)
-                    )
+            )
+            print("Performing sweep simulations")
+            sims_s = parallel(
+                delayed(self.sweep)(
+                    v["mu"] * scaling,
+                    v["r"] * scaling,
+                    v["eaf"],
+                    v["saf"],
+                    v["t"] / (4 * self.ne),
+                    2 * self.ne * v["s"],
+                    discoal_demes,
+                    v["iter"],
                 )
-
-                sims_s_high = parallel(
-                    delayed(self.sweep)(
-                        v["mu"] * scaling,
-                        v["r"] * scaling,
-                        v["eaf"],
-                        v["saf"],
-                        v["t"] / (4 * self.ne),
-                        2 * self.ne * v["s"],
-                        discoal_demes,
-                        v["iter"],
-                    )
-                    for (i, v) in enumerate(
-                        df_params.filter(pl.col("model") != "neutral")
-                        .filter(~mask_sweep)
-                        .iter_rows(named=True)
-                    )
+                for (i, v) in enumerate(
+                    df_params.filter(pl.col("model") != "neutral").iter_rows(
+                        named=True
+                    ),
+                    1,
                 )
-
-            sims_n = sims_n_low + sims_n_high
-            sims_s = sims_s_low + sims_s_high
-        else:
-            try:
-                df_params = pl.read_csv(self.output_folder + "/params.txt.gz")
-            except:
-                raise FileNotFoundError(
-                    f"File not found: {self.output_folder}/params.txt.gz"
-                )
-
-            # Adjust bounds if needed
-            if start < 0 or end > self.num_simulations or start >= end:
-                start = 1
-                end = self.num_simulations
-            else:
-                df_params = df_params.filter(
-                    (pl.col("iter") >= start) & (pl.col("iter") <= end)
-                )
-
-            with Parallel(n_jobs=self.nthreads, backend="loky", verbose=1) as parallel:
-                print("Performing neutral simulations")
-
-                sims_n = parallel(
-                    delayed(self.neutral)(
-                        v["mu"] * scaling, v["r"] * scaling, discoal_demes, v["iter"]
-                    )
-                    for (i, v) in enumerate(
-                        df_params.filter(pl.col("model") == "neutral").iter_rows(
-                            named=True
-                        ),
-                        start,
-                    )
-                    # for (i, v) in enumerate(zip(theta_neutral, rho_neutral), 1)
-                )
-                print("Performing sweep simulations")
-                sims_s = parallel(
-                    delayed(self.sweep)(
-                        v["mu"] * scaling,
-                        v["r"] * scaling,
-                        v["eaf"],
-                        v["saf"],
-                        v["t"] / (4 * self.ne),
-                        2 * self.ne * v["s"],
-                        discoal_demes,
-                        v["iter"],
-                    )
-                    for (i, v) in enumerate(
-                        df_params.filter(pl.col("model") != "neutral").iter_rows(
-                            named=True
-                        ),
-                        start,
-                    )
-                    # for (i, v) in enumerate(
-                    # zip(theta_sweep, rho_sweep, eaf, saf, sel_time, sel_coef), 1
-                    # zip(theta_sweep, rho_sweep, eaf, saf, sel_time, sel_coef), 1
-                    # )
-                )
-
-        # print("Performing neutral simulations")
-        # sims_n = Parallel(n_jobs=self.nthreads, backend="multiprocessing", verbose=5)(
-        #     delayed(self.neutral)(v[0], v[1], discoal_demes, i)
-        # )
-        # ms_neutral = list(
-        #     chain(
-        #         *Parallel(n_jobs=self.nthreads, verbose=0)(
-        #             delayed(self.ms_parser)(m, seq_len=1.2e6) for m in sims_n
-        #         )
-        #     )
-        # )
-
-        # print("Performing sweep simulations")
-
-        # sims_s = Parallel(n_jobs=self.nthreads, verbose=5)(
-        #     delayed(self.sweep)(v[0], v[1], v[2], v[3], v[4], v[5], discoal_demes, i)
-        #     for (i, v) in enumerate(
-        #         zip(theta_sweeps, rho_sweeps, eaf, saf, sel_time, sel_coef), 1
-        #     )
-        # )
-        # ms_sweeps = list(
-        #     chain(
-        #         *Parallel(n_jobs=self.nthreads, verbose=0)(
-        #             delayed(self.ms_parser)(m, param=p, seq_len=1.2e6)
-        #             for (m, p) in zip(sims_s, params)
-        #         )
-        #     )
-        # )
+            )
 
         sims = {
             "sweep": sims_s,
@@ -463,6 +442,18 @@ class Simulator:
         return sims
 
     def neutral(self, theta, rho, discoal_demes, _iter=1):
+        """
+        Run a single neutral simulation.
+
+        Args:
+            theta (float): 4NeLμ.
+            rho (float): 4NeLr.
+            discoal_demes (str): Demography string (from read_demes).
+            _iter (int, default=1): Iteration index.
+
+        Returns:
+            str: Path to output gzipped ms file.
+        """
         discoal_job = (
             self.discoal_path
             + " "
@@ -499,6 +490,23 @@ class Simulator:
         discoal_demes,
         _iter=1,
     ):
+        """
+        Run a single sweep simulation
+
+        Args:
+            theta (float): 4NeLμ.
+            rho (float): 4NeLr.
+            f_t (float, default=1): Terminal frequency (completed sweep if =1).
+            f_i (float, default=0): Initial frequency (0 = hard sweep).
+            t (float): Sweep onset time in 4Ne generations.
+            s (float): Selection coefficient scaled by 2Ne.
+            discoal_demes (str): Demography string.
+            _iter (int, default=1): Iteration index.
+
+        Returns:
+            str: Path to output gzipped ms file.
+        """
+
         # Default job is a hard/complete sweep in equilibrium population
         # -c, -f, and -en flags not defined
         discoal_job = (
@@ -537,75 +545,3 @@ class Simulator:
             output.write(result.stdout)
 
         return output_file
-
-    def ms_parser(self, ms_file, param=None, seq_len=1.2e6):
-        """Read a ms file and output the positions and the genotypes.
-        Genotypes are a numpy array of 0s and 1s with shape (num_segsites, num_samples).
-        """
-
-        assert (
-            ms_file.endswith(".ms.gz")
-            or ms_file.endswith(".ms")
-            or ms_file.endswith(".out.gz")
-            or ms_file.endswith(".out")
-        )
-
-        open_function = gzip.open if ms_file.endswith(".gz") else open
-
-        with open_function(ms_file, "rt") as file:
-            file_content = file.read()
-
-        # Step 2: Split by pattern (e.g., `---`)
-        pattern = r"//"
-        partitions = re.split(pattern, file_content)
-
-        positions = []
-        haps = []
-        rec_map = []
-        for r in partitions[1:]:
-            # Read in number of segregating sites and positions
-            data = []
-            for line in r.splitlines()[1:]:
-                if line == "":
-                    continue
-                # if "discoal" in line or "msout" in line:
-                # seq_len = int(line.strip().split()[3])
-                if line.startswith("segsites"):
-                    num_segsites = int(line.strip().split()[1])
-                    if num_segsites == 0:
-                        continue
-                        #     # Shape of data array for 0 segregating sites should be (0, 1)
-                        # return np.array([]), np.array([], ndmin=2, dtype=np.uint8).T
-                elif line.startswith("positions"):
-                    tmp_pos = np.array([float(x) for x in line.strip().split()[1:]])
-                    tmp_pos = np.round(tmp_pos * seq_len).astype(int)
-
-                    # Find duplicates in the array
-                    duplicates = np.diff(tmp_pos) == 0
-
-                    # While there are any duplicates, increment them by 1
-                    for i in np.where(duplicates)[0]:
-                        tmp_pos[i + 1] += 1
-
-                    tmp_pos += 1
-                    positions.append(tmp_pos)
-                    tmp_map = np.column_stack(
-                        [
-                            np.repeat(1, tmp_pos.size),
-                            np.arange(tmp_pos.size),
-                            tmp_pos,
-                            tmp_pos,
-                        ]
-                    )
-                    rec_map.append(tmp_map)
-
-                else:
-                    # Now read in the data
-                    data.append(np.array(list(line), dtype=np.int8))
-            data = np.row_stack(data).T
-            haps.append(data)
-
-        if param is None:
-            param = np.zeros(4)
-
-        return list(zip(haps, rec_map, [param]))

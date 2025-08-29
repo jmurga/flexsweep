@@ -1,0 +1,35 @@
+time_units: generations
+demes:
+  - name: CEU
+    description: CEU relate
+    epochs:
+      - {end_time: 357143.0000, start_size: 65597.859}
+      - {end_time: 257031.0000, start_size: 26056.052}
+      - {end_time: 184981.0000, start_size: 19989.126}
+      - {end_time: 133128.0000, start_size: 24064.724}
+      - {end_time: 95810.6000, start_size: 22088.513}
+      - {end_time: 68953.5000, start_size: 16922.765}
+      - {end_time: 49624.8000, start_size: 15301.048}
+      - {end_time: 35714.3000, start_size: 15971.634}
+      - {end_time: 25703.1000, start_size: 17359.423}
+      - {end_time: 18498.1000, start_size: 22032.644}
+      - {end_time: 13312.8000, start_size: 27700.524}
+      - {end_time: 9581.0600, start_size: 29860.195}
+      - {end_time: 6895.3500, start_size: 27001.631}
+      - {end_time: 4962.4800, start_size: 20473.931}
+      - {end_time: 3571.4300, start_size: 13625.463}
+      - {end_time: 2570.3100, start_size: 8625.627}
+      - {end_time: 1849.8100, start_size: 5213.362}
+      - {end_time: 1331.2800, start_size: 2882.193}
+      - {end_time: 958.1060, start_size: 1903.689}
+      - {end_time: 689.5350, start_size: 2146.218}
+      - {end_time: 496.2480, start_size: 3714.076}
+      - {end_time: 357.1430, start_size: 5795.079}
+      - {end_time: 257.0310, start_size: 8068.889}
+      - {end_time: 184.9810, start_size: 12811.315}
+      - {end_time: 133.1280, start_size: 37628.218}
+      - {end_time: 95.8106, start_size: 183812.041}
+      - {end_time: 68.9535, start_size: 604020.116}
+      - {end_time: 49.6248, start_size: 1317439.740}
+      - {end_time: 35.7143, start_size: 2376075.768}
+      - {end_time: 0.0000, start_size: 6798253.665}

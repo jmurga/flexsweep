@@ -7,7 +7,9 @@ license = "MIT"
 homepage = "https://github.com/jmurga/flexsweep"
 repository = "https://github.com/jmurga/flexsweep"
 readme = "README.md"
-packages = [{include = "flexsweep"}]
+packages = [
+    { include = "flexsweep" },
+]
 
 [tool.poetry.dependencies]
 python = ">=3.12"
@@ -26,6 +28,7 @@ matplotlib = "^3.9.2"
 polars = "^1.14.0"
 pybedtools = "^0.12.0"
 tbb = "^2022.1.0"
+sphinx-copybutton = "^0.5.2"
 
 [tool.poetry.scripts]
 flexsweep = "flexsweep.main:cli"
@@ -38,3 +41,5 @@ build-backend = "poetry.core.masonry.api"
 [tool.poetry.group.docs.dependencies]
 sphinx = "^7.0"
 sphinx-rtd-theme = "^2.0"
+
+

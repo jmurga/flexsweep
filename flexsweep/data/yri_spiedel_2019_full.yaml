@@ -1,0 +1,35 @@
+time_units: generations
+demes:
+  - name: YRI
+    description: YRI relate
+    epochs:
+      - {end_time: 357143.0000, start_size: 58751.921}
+      - {end_time: 257031.0000, start_size: 25981.044}
+      - {end_time: 184981.0000, start_size: 20640.772}
+      - {end_time: 133128.0000, start_size: 26066.783}
+      - {end_time: 95810.6000, start_size: 23802.270}
+      - {end_time: 68953.5000, start_size: 18140.063}
+      - {end_time: 49624.8000, start_size: 16325.624}
+      - {end_time: 35714.3000, start_size: 15093.565}
+      - {end_time: 25703.1000, start_size: 13102.657}
+      - {end_time: 18498.1000, start_size: 14347.202}
+      - {end_time: 13312.8000, start_size: 19526.673}
+      - {end_time: 9581.0600, start_size: 25053.991}
+      - {end_time: 6895.3500, start_size: 26247.546}
+      - {end_time: 4962.4800, start_size: 22717.773}
+      - {end_time: 3571.4300, start_size: 17618.475}
+      - {end_time: 2570.3100, start_size: 14060.149}
+      - {end_time: 1849.8100, start_size: 12700.993}
+      - {end_time: 1331.2800, start_size: 12551.429}
+      - {end_time: 958.1060, start_size: 12359.962}
+      - {end_time: 689.5350, start_size: 11326.824}
+      - {end_time: 496.2480, start_size: 9830.387}
+      - {end_time: 357.1430, start_size: 8446.559}
+      - {end_time: 257.0310, start_size: 7440.797}
+      - {end_time: 184.9810, start_size: 7301.818}
+      - {end_time: 133.1280, start_size: 10022.511}
+      - {end_time: 95.8106, start_size: 32254.319}
+      - {end_time: 68.9535, start_size: 211230.715}
+      - {end_time: 49.6248, start_size: 786194.426}
+      - {end_time: 35.7143, start_size: 1883622.281}
+      - {end_time: 0.0000, start_size: 7219559.809}

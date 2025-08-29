@@ -3,22 +3,39 @@
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
-Flexsweep documentation
-=======================
+Flex-sweep documentation
+========================
 
-# Flexsweep v2.0
-
-(In development, not recommended for end users).
-
-The second version of `Flexsweep software <https://doi.org/10.1093/molbev/msad139>`, a versatile tool for detecting selective sweeps. The software trains a convolutional neural network (CNN) to classify genomic loci as sweep or neutral regions. The workflow begins with simulating data under an appropriate demographic model and classify regions as neutral or sweeps, including several selection events regarding sweep strength, age, starting allele frequency (softness), and ending allele frequency (completeness).
-
-The new version simplifies and streamlines the project structure, files, simulations, summary statistics estimation and allows for the easy addition of custom CNN architectures. The software takes advantage of `demes <https://doi.org/10.1093/genetics/iyac131>` to simulate custom demography histories and main `scikit-allel <https://scikit-allel.readthedocs.io/>` data structures to avoid external software and temporal files. The whole pipeline is parallelized using `joblib <https://joblib.readthedocs.io/en/stable/>`. 
-
+Second version of `Flex-sweep <https://doi.org/10.1093/molbev/msad139>`_, a versatile tool for detecting selective sweeps. The software simulates, estimates summary statistics, and trains a convolutional neural network (CNN) to classify genomic regions as sweeps or neutrals.
 
 
 .. toctree::
    :maxdepth: 2
    :caption: Contents:
    
-   command_line
+   introduction
+   installation
+   basic_usage
+   advanced_usage
+   api
+
+
+Citing Flex-sweep
+-----------------
+
+If you use flexsweep in your research, please cite:
+
+Lauterbur, M.E., Munch, K. and Enard, D. (2023) Versatile detection of diverse selective sweeps with flex-sweep, *Molecular Biology and Evolution*, 40(6).
+
+Kern, A.D. and Schrider, D.R. (2016). discoal: flexible coalescent simulations with selection. *Bioinformatics*, 32(24), 3839-3841.
+
+Support
+-------
+
+ * Report issues on `GitHub <https://github.com/jmurga/flexsweep>`_
+
+ * Contact: murgamoreno@arizona.edu, denard@arizona.edu
+
+..
+.. API
 

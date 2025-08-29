@@ -6,30 +6,32 @@
 # -- Project information -----------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
-project = 'Flexsweep'
-copyright = '2025, Jesús Murga-Moreno'
-author = 'Jesús Murga-Moreno, David Enard'
+project = "Flex-sweep"
+copyright = "2025, Jesús Murga-Moreno"
+author = "Jesús Murga-Moreno, David Enard"
 
-version = '2.0'
-release = '2.0'
+version = "2.0"
+release = "2.0"
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
 
 extensions = [
-    'sphinx.ext.autodoc',
-    'sphinx.ext.mathjax',
-    'sphinx.ext.githubpages',
+    "sphinx.ext.autodoc",
+    "sphinx.ext.autosummary",
+    "sphinx.ext.mathjax",
+    "sphinx.ext.githubpages",
+    "sphinx_copybutton",
 ]
 
-templates_path = ['_templates']
-exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
+templates_path = ["_templates"]
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 
-language = 'en'
+language = "en"
 
 # -- Options for HTML output -------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
-html_theme = 'sphinx_rtd_theme'
-html_static_path = ['_static']
+html_theme = "sphinx_rtd_theme"
+html_static_path = ["_static"]

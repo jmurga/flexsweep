@@ -13,15 +13,6 @@ import sys
 import gc
 
 
-# from jax import config
-
-# config.update("jax_enable_x64", True)
-# config.update("jax_platform_name", "cpu")
-
-# import jax.numpy as jnp
-# from jax import jit
-# from jax.lax import fori_loop
-
 from numba import njit, prange, float64, int64, uint64, types
 from numba.typed import List, Dict
 from typing import Tuple
@@ -47,7 +38,6 @@ from allel.util import asarray_ndim, check_dim0_aligned, check_integer_dtype
 from allel.stats.selection import compute_ihh_gaps
 from scipy.interpolate import interp1d
 
-from tqdm import tqdm
 from copy import deepcopy
 from collections import defaultdict, namedtuple, OrderedDict
 from itertools import product, chain
@@ -71,22 +61,23 @@ from contextlib import contextmanager
 ################## Utils
 
 
-# @jit
-# def jax_dot(hap):
-#     _hap = hap.astype(jnp.float32)
-#     return hap @ hap.T
-
-
 @contextmanager
 def omp_num_threads(n_threads: int):
     """
-    Temporarily set the OMP_NUM_THREADS environment variable.
+    Context manager to temporarily set the OMP_NUM_THREADS environment variable.
+
+    Args:
+        n_threads (int): Number of OpenMP threads to expose inside the context.
 
     Usage:
         with omp_num_threads(10):
-            # within this block: OMP_NUM_THREADS == "10"
+            # Inside this block, os.environ['OMP_NUM_THREADS'] == "10"
             heavy_compute()
-        # outside: OMP_NUM_THREADS is back to whatever it was
+        # On exit, the previous value (or absence) is restored.
+
+    Notes:
+        - Only affects libraries honoring OMP_NUM_THREADS (e.g., numexpr, MKL-backed numpy).
+        - This modifies process environment for the duration of the context only.
     """
     key = "OMP_NUM_THREADS"
     old_val = os.environ.get(key, None)
@@ -101,184 +92,45 @@ def omp_num_threads(n_threads: int):
             os.environ[key] = old_val
 
 
-def filter_gt(hap, rec_map, region=None):
+def parse_and_filter_ms(
+    ms_file: str,
+    seq_len: int = int(1.2e6),
+    return_haplotypearray: bool = False,
+):
     """
-    Convert the 2d numpy haplotype matrix to HaplotypeArray from scikit-allel and change type np.int8. It filters and processes the haplotype matrix based on a recombination map and
-    returns key information for further analysis such as allele frequencies and physical positions.
+    Parse the **first** ms replicate in a file and filter/deduplicate sites. ms files simulated through flexsweep.Simulator will only contain one replica
 
-    Parameters
-    ----------
-    hap : array-like, HaplotypeArray
-        The input haplotype data which can be in one of the following forms:
-        - A `HaplotypeArray` object.
-        - A genotype matrix (as a numpy array or similar).
-
-    rec_map : numpy.ndarray
-        A 2D numpy array representing the recombination map, where each row corresponds
-        to a genomic variant and contains recombination information. The third column (index 2)
-        of the recombination map provides the physical positions of the variants.
-
-    Returns
-    -------
-    tuple
-        A tuple containing the following elements:
-        - hap_01 (numpy.ndarray): The filtered haplotype matrix, with only biallelic variants.
-        - ac (AlleleCounts): An object that stores allele counts for the filtered variants.
-        - biallelic_mask (numpy.ndarray): A boolean mask indicating which variants are biallelic.
-        - hap_int (numpy.ndarray): The haplotype matrix converted to integer format (int8).
-        - rec_map_01 (numpy.ndarray): The recombination map filtered to include only biallelic variants.
-        - position_masked (numpy.ndarray): The physical positions of the biallelic variants.
-        - sequence_length (int): An arbitrary sequence length set to 1.2 million bases (1.2e6).
-        - freqs (numpy.ndarray): The frequencies of the alternate alleles for each biallelic variant.
-    """
-    try:
-        # Avoid unnecessary conversion if hap is already a HaplotypeArray
-        if not isinstance(hap, HaplotypeArray):
-            hap = HaplotypeArray(
-                hap if isinstance(hap, np.ndarray) else hap.genotype_matrix()
-            )
-    except:
-        hap = HaplotypeArray(load(hap).genotype_matrix())
-
-    # positions = rec_map[:, -1]
-    # physical_position = rec_map[:, -2]
-
-    # HAP matrix centered to analyse whole chromosome
-    hap_01, ac, biallelic_mask = filter_biallelics(hap)
-    sequence_length = int(1.2e6)
-
-    rec_map_01 = rec_map[biallelic_mask]
-
-    mask_dup = (~pl.DataFrame(rec_map_01)[:, -1].is_duplicated()).to_numpy()
-
-    hap_01 = hap_01[mask_dup]
-    rec_map_01 = rec_map_01[mask_dup]
-    position_masked = rec_map_01[:, -1].astype(int)
-    genetic_position_masked = rec_map_01[:, -2]
-
-    ac = ac[mask_dup]
-
-    return (
-        hap_01,
-        rec_map_01,
-        ac,
-        biallelic_mask,
-        position_masked,
-        genetic_position_masked,
-    )
-
-
-def filter_biallelics(hap: HaplotypeArray) -> tuple:
-    """
-    Filter out non-biallelic loci from the haplotype data.
+    Processing steps:
+      1) Parse the first replicate section ('//').
+      2) Build haplotypes (shape: (num_sites, num_samples)).
+      3) Filter to biallelic 0/1 sites via scikit-allel (is_biallelic_01).
+      4) Drop duplicated physical positions, **keeping the first occurrence** (like Polars `~is_duplicated()`).
+      5) Build a simple recombination map array with columns [1, idx, genetic_pos, physical_pos].
+         (Here, genetic_pos == physical_pos by construction.)
 
     Args:
-        hap (allel.HaplotypeArray): Haplotype data represented as a HaplotypeArray.
+        ms_file (str): Path to '.out', '.out.gz', '.ms', or '.ms.gz' file.
+        seq_len (int, default=1_200_000): Length used to scale 'positions' from (0,1) to bp.
+        return_haplotypearray (bool, default=False):
+            If True, returns scikit-allel `HaplotypeArray`; otherwise returns underlying `np.ndarray`.
 
     Returns:
-        tuple: A tuple containing three elements:
-            - hap_biallelic (allel.HaplotypeArray): Filtered biallelic haplotype data.
-            - ac_biallelic (numpy.ndarray): Allele counts for the biallelic loci.
-            - biallelic_mask (numpy.ndarray): Boolean mask indicating biallelic loci.
-    """
-    ac = hap.count_alleles()
-    biallelic_mask = ac.is_biallelic_01()
+        tuple:
+          - hap_01 : np.ndarray(int8) or HaplotypeArray (if `return_haplotypearray=True`)
+          - rec_map_01 : np.ndarray(int64) of shape (n_kept, 4) with columns [1, idx, genetic_pos, physical_pos]
+          - ac : np.ndarray with allele counts for kept sites
+          - biallelic_mask : np.ndarray(bool) mask on all parsed sites **before** deduplication
+          - position_masked : np.ndarray(int64) physical positions retained after filtering/dedup
+          - genetic_position_masked : np.ndarray of genetic positions retained (== physical here)
 
-    # Use a subset to filter directly, minimizing intermediate memory usage
-    hap_biallelic = hap.subset(biallelic_mask)
+    Warnings:
+        - Emits a warning and returns None if the file/replicate appears malformed.
+        - If segsites == 0 for the first replicate, continues scanning for the next replicate.
 
-    ac_biallelic = ac[biallelic_mask]
-
-    return (hap_biallelic.values, ac_biallelic.values, biallelic_mask)
-
-
-def ms_parser(ms_file, param=None, seq_len=1.2e6):
-    """Read a ms file and output the positions and the genotypes.
-    Genotypes are a numpy array of 0s and 1s with shape (num_segsites, num_samples).
-    """
-
-    assert (
-        ms_file.endswith(".out")
-        or ms_file.endswith(".out.gz")
-        or ms_file.endswith(".ms")
-        or ms_file.endswith(".ms.gz")
-    )
-
-    open_function = gzip.open if ms_file.endswith(".gz") else open
-
-    with open_function(ms_file, "rt") as file:
-        file_content = file.read()
-
-    # Step 2: Split by pattern (e.g., `---`)
-    pattern = r"//"
-    partitions = re.split(pattern, file_content)
-
-    if len(partitions) == 1:
-        warn(f"File {ms_file} is malformed.")
-        return None
-    else:
-        positions = []
-        haps = []
-        rec_map = []
-        for r in partitions[1:]:
-            # Read in number of segregating sites and positions
-            data = []
-            for line in r.splitlines()[1:]:
-                if line == "":
-                    continue
-                # if "discoal" in line or "msout" in line:
-                # seq_len = int(line.strip().split()[3])
-                if line.startswith("segsites"):
-                    num_segsites = int(line.strip().split()[1])
-                    if num_segsites == 0:
-                        continue
-                        #     # Shape of data array for 0 segregating sites should be (0, 1)
-                        # return np.array([]), np.array([], ndmin=2, dtype=np.uint8).T
-                elif line.startswith("positions"):
-                    tmp_pos = np.array([float(x) for x in line.strip().split()[1:]])
-                    tmp_pos = np.round(tmp_pos * seq_len).astype(int)
-
-                    # Find duplicates in the array
-                    duplicates = np.diff(tmp_pos) == 0
-
-                    # While there are any duplicates, increment them by 1
-                    for i in np.where(duplicates)[0]:
-                        tmp_pos[i + 1] += 1
-                    tmp_pos += 1
-                    positions.append(tmp_pos)
-                    tmp_map = np.column_stack(
-                        [
-                            np.repeat(1, tmp_pos.size),
-                            np.arange(tmp_pos.size),
-                            tmp_pos,
-                            tmp_pos,
-                        ]
-                    )
-                    rec_map.append(tmp_map)
-
-                else:
-                    # Now read in the data
-                    data.append(np.array(list(line), dtype=np.int8))
-            try:
-                data = np.vstack(data).T
-            except:
-                data = None
-                warn(f"File {ms_file} is malformed.")
-                return None
-
-            # data = np.vstack(data).T
-            haps.append(data)
-
-    if param is None:
-        param = np.zeros(4)
-
-    return (haps[0], rec_map[0], param)
-
-
-def ms_parser_np(ms_file, param=None, seq_len=1.2e6):
-    """Read an ms/msms/hudson file and return (haps, rec_map, param) for the FIRST replicate.
-    haps: (num_segsites, num_samples) int8 array of 0/1
-    rec_map: (num_segsites, 4) int64 array: [1, idx, pos, pos]
+    Notes:
+        - Duplicates are resolved by incrementing the *next* duplicate by +1 once, then adding +1 globally
+          (matching your existing logic).
+        - Only the **first** replicate is returned even if multiple are present.
     """
     if not ms_file.endswith((".out", ".out.gz", ".ms", ".ms.gz")):
         warn(f"File {ms_file} has an unexpected extension.")
@@ -288,54 +140,88 @@ def ms_parser_np(ms_file, param=None, seq_len=1.2e6):
     in_rep = False
     num_segsites = None
     pos_arr = None
-    hap_rows = []  # strings of '0'/'1', one per sample
+    hap_rows = []  # one string per sample line ('0'/'1')
 
-    def finish_and_return(p_in):
-        # Validate minimal structure
+    def finalize_and_return():
+        # Match segsites, positions, and hap rows
         if num_segsites is None or pos_arr is None or not hap_rows:
             warn(f"File {ms_file} is malformed.")
             return None
 
-        # Build hap matrix fast: bytes -> uint8 -> 0/1 -> int8, then transpose
+        # Build hap (num_samples x num_sites) and transpose
         try:
             n_samples = len(hap_rows)
             n_sites = len(hap_rows[0])
             H = np.empty((n_samples, n_sites), dtype=np.int8)
             for i, s in enumerate(hap_rows):
-                H[i, :] = (
-                    np.frombuffer(s.encode("ascii"), dtype=np.uint8) - 48
-                ).astype(np.int8, copy=False)
+                H[i, :] = np.frombuffer(s.encode("ascii"), dtype=np.uint8) - 48
             H = H.T  # (num_segsites, num_samples)
         except Exception:
             warn(f"File {ms_file} is malformed.")
             return None
 
+        # rec_map: [chrom=1, idx, gen_pos, phys_pos]
         n = pos_arr.size
         rec_map = np.column_stack(
             (np.repeat(1, n), np.arange(n, dtype=np.int64), pos_arr, pos_arr)
         ).astype(np.int64, copy=False)
 
-        p_out = np.zeros(4) if p_in is None else p_in
-        return (H, rec_map, p_out)
+        # HaplotypeArray and, biallelic_01 mask
+        hap = HaplotypeArray(H, copy=False)
+        ac = hap.count_alleles()
+        biallelic_mask = ac.is_biallelic_01()
+
+        hap_bi = hap.compress(biallelic_mask, axis=0)
+        ac_bi = ac.compress(biallelic_mask, axis=0)
+        rec_bi = rec_map[biallelic_mask]
+
+        # Remove duplicate positions, keeping first occurrence
+        phys = rec_bi[:, 3]
+        keep = np.zeros(phys.shape[0], dtype=bool)
+
+        # np.unique returns sorted unique; return_index gives index of first occurrence
+        _, first_idx = np.unique(phys, return_index=True)
+        keep[first_idx] = True
+
+        hap_kept = hap_bi.compress(keep, axis=0)
+        ac_kept = ac_bi.compress(keep, axis=0)
+        rec_kept = rec_bi[keep]
+
+        # Outputs
+        position_masked = rec_kept[:, 3].astype(np.int64, copy=False)
+        genetic_position_masked = rec_kept[:, 2]  # equals physical in this parser
+
+        hap_out = hap_kept if return_haplotypearray else hap_kept.view(np.ndarray)
+        ac_out = ac_kept.view(np.ndarray)
+
+        return (
+            hap_out,
+            rec_kept,
+            ac_out,
+            biallelic_mask,
+            position_masked,
+            genetic_position_masked,
+        )
 
     with open_function(ms_file, "rt") as fh:
         for raw in fh:
             line = raw.strip()
+            if not line:
+                continue
 
-            # start of a replicate
+            # Start of a replicate
             if line.startswith("//"):
                 if in_rep:
-                    out = finish_and_return(param)
+                    out = finalize_and_return()
                     if out is not None:
                         return out
-                    # else, malformed replicate; continue scanning for next
                 in_rep = True
                 num_segsites = None
                 pos_arr = None
                 hap_rows.clear()
                 continue
 
-            if not in_rep or not line:
+            if not in_rep:
                 continue
 
             if line.startswith("segsites"):
@@ -343,6 +229,11 @@ def ms_parser_np(ms_file, param=None, seq_len=1.2e6):
                 if len(parts) >= 2:
                     try:
                         num_segsites = int(parts[1])
+                        # If segsites==0: this replicate has no data; keep scanning for next
+                        if num_segsites == 0:
+                            # Reset any partial state so finalize() won't trigger
+                            pos_arr = None
+                            hap_rows.clear()
                     except ValueError:
                         warn(f"File {ms_file} is malformed.")
                         return None
@@ -352,68 +243,94 @@ def ms_parser_np(ms_file, param=None, seq_len=1.2e6):
                 continue
 
             if line.startswith("positions"):
-                # line like: "positions: 0.123 0.456 ..."
+                # "positions: 0.123 0.456 ..."
                 try:
                     _, values = line.split(":", 1)
-                    tmp_pos = np.fromstring(values, sep=" ", dtype=np.float64)
+                    tmp = np.fromstring(values, sep=" ", dtype=np.float64)
                 except Exception:
                     warn(f"File {ms_file} is malformed.")
                     return None
-
-                # EXACTLY match original: np.round then single-pass bump of consecutive duplicates, then +1
-                tmp_pos = np.round(tmp_pos * seq_len).astype(np.int64, copy=False)
-
-                dups = np.diff(tmp_pos) == 0
+                pos = np.round(tmp * seq_len).astype(np.int64, copy=False)
+                dups = np.diff(pos) == 0
                 if dups.any():
                     idxs = np.nonzero(dups)[0]
-                    tmp_pos[idxs + 1] += 1  # bump NEXT duplicate once
-
-                tmp_pos += 1
-                pos_arr = tmp_pos
+                    pos[idxs + 1] += 1
+                pos += 1
+                pos_arr = pos
                 continue
 
-            # haplotype row ('0'/'1' string)
+            # haplotype line ('0'/'1')
             c0 = line[0]
             if c0 == "0" or c0 == "1":
                 hap_rows.append(line)
 
-        # EOF: if a replicate was started, finalize it
+        # finalize
         if in_rep:
-            return finish_and_return(param)
+            return finalize_and_return()
 
     warn(f"File {ms_file} is malformed.")
     return None
 
 
-def check_malformed(ms, _iter):
-    try:
-        hap, r, p = ms_parser(ms)
-        return -1
-    except:
-        return _iter
+def cleaning_summaries(summ_stats, params, model):
+    """
+    Cleans summary statistics by removing entries where either list in summ_stats has None.
 
+    Args:
+        data: Unused input (kept for compatibility).
+        summ_stats (list of 2 lists): Summary statistics [list1, list2].
+        params (np.ndarray): Parameter matrix.
+        model (str): Model identifier.
 
-def cleaning_summaries(data, summ_stats, params, model):
-    # Cleaning params and simulations to remove malformed simulations
+    Returns:
+        summ_stats_filtered (list of 2 lists): Cleaned summary statistics.
+        params (np.ndarray): Filtered params.
+        malformed_files (list of str): Indices removed with reason.
+    """
     mask = []
-    summ_stats_filtered = []
+    summ_stats_filtered = [[], []]
     malformed_files = []
-    for i, j in enumerate(summ_stats):
-        if j is None:
+    for i, (x, y) in enumerate(zip(summ_stats[0], summ_stats[1])):
+        if x is None or y is None:
             mask.append(i)
-            malformed_files.append(
-                "File " + data + "/" + model + "_" + str(i) + ".ms.gz is malformed."
-            )
+            malformed_files.append(f"Model {model}, index {i} is malformed.")
         else:
-            summ_stats_filtered.append(j)
+            summ_stats_filtered[0].append(x)
+            summ_stats_filtered[1].append(y)
 
-    if len(mask) != 0:
+    if mask:
         params = np.delete(params, mask, axis=0)
 
     return summ_stats_filtered, params, malformed_files
 
 
-def genome_reader(hap_data, recombination_map=None, region=None, samples=None, _iter=1):
+def genome_reader(hap_data, recombination_map=None, region=None, samples=None):
+    """
+    Read a VCF/BCF region and return haplotypes, recombination map, allel count array, biallelic masking, physical and genetic positions arrays.
+
+    Args:
+        hap_data (str): Path to VCF/BCF file.
+        recombination_map (str | None, default=None):
+            Optional TSV map with columns: chr, start, end, cm_mb, cm.
+        region (str | None, default=None): Region string 'CHR:START-END' for subsetting.
+        samples (list[str] | np.ndarray | None, default=None): Optional sample subset.
+
+    Returns:
+        dict[str, tuple]:
+            {region: (hap_int, rec_map, ac.values, biallelic_filter, position_masked, genetic_position_masked)}
+            or {region: None} if no biallelic sites are present.
+
+        Where:
+            - hap_int: (S x N) np.int8 haplotypes.
+            - rec_map: array with columns [chrom, idx, pos, cm].
+            - ac.values: allele counts (scikit-allel).
+            - biallelic_filter: boolean mask on original sites.
+            - position_masked: np.int64 physical positions after biallelic filtering.
+            - genetic_position_masked: last column of rec_map.
+
+    Notes:
+        - If `recombination_map` is None, genetic distance defaults to physical positions.
+    """
     filterwarnings("ignore", message="invalid INFO header", module="allel.io.vcf_read")
 
     raw_data = read_vcf(hap_data, region=region, samples=samples)
@@ -434,23 +351,27 @@ def genome_reader(hap_data, recombination_map=None, region=None, samples=None, _
     # Filtering monomorphic just in case
     biallelic_filter = ac.is_biallelic_01()
 
-    hap = gt.to_haplotypes()
-    hap = hap.values[biallelic_filter]
-    pos = pos[biallelic_filter]
+    hap_int = gt.to_haplotypes().values[biallelic_filter].astype(np.int8)
+    position_masked = pos[biallelic_filter].astype(np.int64)
     np_chrom = np_chrom[biallelic_filter]
 
-    if hap.shape[0] == 0:
+    if hap_int.shape[0] == 0:
         return {region: None}
 
     if region is None:
-        d_pos = dict(zip(np.arange(pos.size + 1), pos))
+        d_pos = dict(zip(np.arange(position_masked.size + 1), position_masked))
     else:
         tmp = list(map(int, region.split(":")[-1].split("-")))
         d_pos = dict(zip(np.arange(tmp[0], tmp[1] + 1), np.arange(int(1.2e6)) + 1))
 
     if recombination_map is None:
         rec_map = pl.DataFrame(
-            {"chrom": np_chrom, "idx": np.arange(pos.size), "pos": pos, "cm": pos}
+            {
+                "chrom": np_chrom,
+                "idx": np.arange(position_masked.size),
+                "pos": position_masked,
+                "cm": position_masked,
+            }
         ).to_numpy()
     else:
         df_recombination_map = (
@@ -471,24 +392,47 @@ def genome_reader(hap_data, recombination_map=None, region=None, samples=None, _
             .filter(pl.col("chr") == "chr" + str(np_chrom[0]))
             .sort("start")
         )
-        genetic_distance = get_cm(df_recombination_map, pos)
+        genetic_distance = get_cm(df_recombination_map, position_masked)
 
         rec_map = pl.DataFrame(
-            [np_chrom, np.arange(pos.size), pos, genetic_distance]
+            [
+                np_chrom,
+                np.arange(position_masked.size),
+                position_masked,
+                genetic_distance,
+            ]
         ).to_numpy()
 
         if np.all(rec_map[:, -1] == 0):
             rec_map[:, -1] = rec_map[:, -2]
 
-    # for r in rec_map:
-    #     r[-1] = d_pos[r[-1]]
-    #     r[-2] = d_pos[r[-2]]
+    genetic_position_masked = rec_map[:, -1]
 
-    return (hap, rec_map[:, [0, 1, -1, 2]], np.zeros(4))
+    return (
+        hap_int,
+        rec_map,
+        ac.values,
+        biallelic_filter,
+        position_masked,
+        genetic_position_masked,
+    )
 
 
 def get_cm(df_rec_map, positions):
-    # Create the interpolating function
+    """
+    Interpolate cumulative genetic distance (cM) at given physical positions.
+
+    Args:
+        df_rec_map (polars.DataFrame): Map where column 1 is physical position (bp),
+            and last column is cumulative cM (monotonic expected).
+        positions (np.ndarray): 1D array of physical positions (bp) to interpolate.
+
+    Returns:
+        np.ndarray: Interpolated cumulative cM (negative values clamped to 0).
+
+    Notes:
+        - Uses linear interpolation with extrapolation at ends.
+    """
     interp_func = interp1d(
         df_rec_map.select(df_rec_map.columns[1]).to_numpy().flatten(),
         df_rec_map.select(df_rec_map.columns[-1]).to_numpy().flatten(),
@@ -507,6 +451,20 @@ def get_cm(df_rec_map, positions):
 
 
 def get_cm_mb(df_rec_map):
+    """
+    Compute per-interval recombination rate (cM/Mb) from cumulative cM.
+
+    Args:
+        df_rec_map (polars.DataFrame): Must contain columns 'cm' (cumulative cM) and 'pos' (bp).
+
+    Returns:
+        polars.DataFrame: Input dataframe with an additional 'cm_mb' column:
+            (cm.shift(-1) - cm) / (pos.shift(-1) - pos) * 1e6
+
+    Notes:
+        - The last row will have cm_mb = null due to shift(-1).
+        - Assumes positions are sorted ascending and cm is monotonic.
+    """
     return df_rec_map.with_columns(
         (
             (pl.col("cm").shift(-1) - pl.col("cm"))
@@ -517,11 +475,24 @@ def get_cm_mb(df_rec_map):
 
 
 def center_window_cols(df, _iter=1):
+    """
+    Add iter to statistic dataframe to ensure proper stats/replica combination.
+
+    Args:
+        df (polars.DataFrame): Input feature rows for a single window/region.
+        _iter (int, default=1): Iteration identifier to add as an 'iter' column.
+
+    Returns:
+        polars.DataFrame:
+            - If `df` is empty: returns a single-row DF with just 'iter' plus `df` columns (empty).
+            - Otherwise: returns `df` with an added 'iter' column (Int64) and with columns ordered as:
+                ['iter', 'positions', <all other columns excluding 'iter' and 'positions'>]
+
+    """
     if df.is_empty():
         # Return a dataframe with one row of the specified default values
         return pl.concat(
             [pl.DataFrame({"iter": _iter}), df],
-            # [pl.DataFrame({"iter": _iter, "center": center, "window": window}), df],
             how="horizontal",
         )
 
@@ -529,16 +500,12 @@ def center_window_cols(df, _iter=1):
         df.with_columns(
             [
                 pl.lit(_iter).alias("iter"),
-                # pl.lit(center).alias("center"),
-                # pl.lit(window).alias("window"),
             ]
-        ).with_columns(pl.col(["iter"]).cast(pl.Int64))
-        # .with_columns(pl.col(["iter", "center", "window"]).cast(pl.Int64))
+        )
+        .with_columns(pl.col(["iter"]).cast(pl.Int64))
         .select(
             pl.col(["iter", "positions"]),
             pl.all().exclude(["iter", "positions"]),
-            # pl.col(["iter", "center", "window", "positions"]),
-            # pl.all().exclude(["iter", "center", "window", "positions"]),
         )
     )
     return df
@@ -549,19 +516,17 @@ def pivot_feature_vectors(df_fv, vcf=False):
     Categorizes genomic sweep data into different models based on timing and fixation status,
     then pivots the data for analysis.
 
-    Parameters
-    ----------
-    df_fv : polars.DataFrame
-        DataFrame containing sweep data with columns including 't', 'f_t', 'f_i', 's', 'iter',
-        'window', and 'center'.
 
-    Returns
-    -------
-    polars.DataFrame
-        Pivoted DataFrame with categorized sweep models.
+    Args:
+        df_fv (polars.DataFrame): Feature vectors with columns including
+            't', 'f_t', 'f_i', 's', 'iter', 'window', 'center', and metrics.
+        vcf (bool, default=False): Whether the input comes from VCF processing (special handling).
+
+    Returns:
+        polars.DataFrame: Wide/pivoted feature table with cleaned column names.
+    Notes:
+        - When `vcf=True`, constructs 'iter' from 'nchr' and ±600kb window around center.
     """
-    # Remove delta_ihh column if present
-    # df_fv = df_fv.select(pl.exclude("delta_ihh"))
 
     # Categorize sweeps based on age and completeness
     df_fv = df_fv.with_columns(
@@ -596,26 +561,29 @@ def pivot_feature_vectors(df_fv, vcf=False):
     ]  # Assuming columns 7 to end-1 are the values to pivot
 
     if vcf:
-        # remove nchr
-        value_columns = value_columns[:-1]
-        fv_center = np.linspace(6e5 - 1e5, 6e5 + 1e5, 21).astype(int)
-        rows_per_center = df_fv["window"].unique().len()
-        n_rows = df_fv.height
-        full_center = np.tile(
-            np.repeat(fv_center, rows_per_center),
-            n_rows // (len(fv_center) * rows_per_center) + 1,
-        )[:n_rows]
+        if df_fv["iter"].dtype == pl.Int64:
+            # remove nchr
+            value_columns = value_columns[:-1]
 
-        df_fv = df_fv.with_columns(
-            (
-                pl.col("nchr").cast(pl.String)
-                + ":"
-                + (pl.col("iter").cast(pl.Int64) - int(6e5)).cast(pl.String)
-                + "-"
-                + (pl.col("iter").cast(pl.Int64) + int(6e5)).cast(pl.String)
-            ).alias("iter"),
-            pl.lit(full_center).alias("center"),
-        ).select(pl.exclude("nchr"))
+            fv_center = np.linspace(6e5 - 1e5, 6e5 + 1e5, 21).astype(int)
+            fv_center = df_fv["center"].unique().to_numpy()
+            rows_per_center = df_fv["window"].unique().len()
+            n_rows = df_fv.height
+            full_center = np.tile(
+                np.repeat(fv_center, rows_per_center),
+                n_rows // (len(fv_center) * rows_per_center) + 1,
+            )[:n_rows]
+
+            df_fv = df_fv.with_columns(
+                (
+                    pl.col("nchr").cast(pl.String)
+                    + ":"
+                    + (pl.col("iter").cast(pl.Int64) - int(6e5)).cast(pl.String)
+                    + "-"
+                    + (pl.col("iter").cast(pl.Int64) + int(6e5)).cast(pl.String)
+                ).alias("iter"),
+                pl.lit(full_center).alias("center"),
+            ).select(pl.exclude("nchr"))
 
     df_fv_w = df_fv.pivot(
         values=value_columns,
@@ -638,13 +606,19 @@ def get_closest_snps(position_array, center, N):
     """
     Given a list of SNP positions and a center position, return the indices of the N closest SNPs.
 
-    Parameters:
-        position_array (np.ndarray): 1D array of SNP positions (e.g., [100, 500, 1000, ...]).
-        center (int or float): The central genomic coordinate to anchor the window around.
-        N (int): Number of SNPs to retrieve (must be ≤ len(position_array)).
+    Args:
+        position_array (np.ndarray): 1D array of SNP positions (bp).
+        center (int | float): Central genomic coordinate.
+        N (int): Number of SNPs to select. Must be <= len(position_array).
 
     Returns:
-        np.ndarray: Indices of the N closest SNPs to the center.
+        np.ndarray: Indices of the N closest SNPs (sorted by increasing distance, then by position).
+
+    Raises:
+        AssertionError: If `position_array` is not 1D or if `N` exceeds array length.
+
+    Notes:
+        - Ties are resolved by `np.argsort` stability on the distance array; if exact distances tie,relative order follows input order.
     """
     position_array = np.asarray(position_array)
     assert position_array.ndim == 1, "position_array must be a 1D array"
@@ -658,7 +632,9 @@ def get_closest_snps(position_array, center, N):
 ################## Summaries
 
 
-def _process_vcf(data_dir, nthreads, center, windows, step, recombination_map):
+def _process_vcf(
+    data_dir, nthreads, center, windows, step, recombination_map, population
+):
     """
     Handle vcf=True: read all VCFs in data_dir/vcfs, compute and normalize stats,
     write out per‐VCF parquet files, and return concatenated DataFrames.
@@ -670,7 +646,7 @@ def _process_vcf(data_dir, nthreads, center, windows, step, recombination_map):
     regions = {}
     df_params = []
 
-    vcf_glob = os.path.join(data_dir, "vcfs", "*vcf.gz")
+    vcf_glob = os.path.join(data_dir, "*vcf.gz")
     for vcf_path in sorted(glob.glob(vcf_glob)):
         basename = os.path.basename(vcf_path)
         key = basename.replace(".vcf", "").replace(".bcf", "").replace(".gz", "")
@@ -706,60 +682,56 @@ def _process_vcf(data_dir, nthreads, center, windows, step, recombination_map):
     malformed_files = {}
 
     for k, vcf_file in sims.items():
-        with Parallel(n_jobs=nthreads, backend="loky", verbose=1) as parallel:
-            print(k)
-            params = df_params.filter(pl.col("model") == k)[:, 1:].to_numpy()
+        print(k)
+        params = df_params.filter(pl.col("model") == k)[:, 1:].to_numpy()
 
-            # compute center from region strings "chr: start-end"
-            center_coords = [
-                tuple(map(int, r.split(":")[-1].split("-"))) for r in regions[k]
-            ]
-            d_centers[k] = np.array([(a + b) // 2 for a, b in center_coords])
+        # compute center from region strings "chr: start-end"
+        center_coords = [
+            tuple(map(int, r.split(":")[-1].split("-"))) for r in regions[k]
+        ]
+        d_centers[k] = np.array([(a + b) // 2 for a, b in center_coords])
 
-            # Open a joblib process by VCF, so not same pool slower but solve RAM issues
-            stats = calculate_stats_vcf(
-                vcf_file,
-                region=regions[k],
-                # center=center,
-                # step=step,
-                recombination_map=recombination_map,
-                nthreads=nthreads,
-                parallel_manager=parallel,
-            )
+        # Open a joblib process by VCF, so not same pool slower but solve RAM issues
+        _tmp_stats = calculate_stats_vcf(
+            vcf_file,
+            region=regions[k],
+            recombination_map=recombination_map,
+            nthreads=nthreads,
+        )
 
-            stats, params, malformed = cleaning_summaries(data_dir, stats, params, key)
-            malformed_files[k] = malformed
+        raw_stats, norm_stats = _tmp_stats
+        tmp_bins.append(norm_stats)
 
-            raw_stats, norm_stats = stats
-            tmp_bins.append(norm_stats)
-
-            if not np.all(params[:, 3] == 0):
-                params[:, 0] = -np.log(params[:, 0])
-            results[k] = summaries(raw_stats, params)
+        if not np.all(params[:, 3] == 0):
+            params[:, 0] = -np.log(params[:, 0])
+        results[k] = summaries(raw_stats, params)
 
     empirical_bins = binned_stats(*normalize_neutral(tmp_bins))
     df_fv_cnn = {}
     df_fv_cnn_raw = {}
 
     # for k, stats_values in tqdm(results.items()):
-    with Parallel(n_jobs=nthreads, backend="loky", verbose=0) as parallel:
-        for k, stats_values in results.items():
-            print(k)
-            df_w, df_w_raw = normalize_stats(
-                stats_values,
-                empirical_bins,
-                center=d_centers[k],
-                windows=windows,
-                vcf=True,
-                parallel_manager=parallel,
-            )
-            df_w.write_parquet(fvs_file[k])
-            df_w_raw.write_parquet(fvs_file[k].replace(".parquet", "_raw.parquet"))
-            df_fv_cnn[k] = df_w
-            df_fv_cnn_raw[k] = df_w_raw
+    # with Parallel(n_jobs=nthreads, backend="loky", verbose=0) as parallel:
+    for k, stats_values in results.items():
+        print(k)
+        df_w, df_w_raw = normalize_stats(
+            stats_values,
+            empirical_bins,
+            region=regions[k],
+            center=center,
+            windows=windows,
+            step=step,
+            nthreads=nthreads,
+            vcf=True,
+        )
+        df_fv_cnn[k] = df_w
+        df_fv_cnn_raw[k] = df_w_raw
 
     df_train = pl.concat(df_fv_cnn.values(), how="vertical")
     df_train_raw = pl.concat(df_fv_cnn_raw.values(), how="vertical")
+
+    df_train.write_parquet(f"{data_dir}/fvs_{population}.parquet")
+    df_train_raw.write_parquet(f"{data_dir}/fvs_raw_{population}.parquet")
 
     with open(os.path.join(data_dir, "empirical_bins.pickle"), "wb") as f:
         pickle.dump(empirical_bins, f)
@@ -767,117 +739,180 @@ def _process_vcf(data_dir, nthreads, center, windows, step, recombination_map):
     return df_train, df_train_raw
 
 
-def _process_sims_full(data_dir, nthreads, center, windows, step, recombination_map):
+def _process_vcf_custom(
+    data_dir, nthreads, center, windows, step, recombination_map, population, func
+):
     """
-    Handle vcf=False: read sweep/neutral sims under data_dir,
-    compute stats in a single Parallel pool, normalize sweep vs neutral,
-    write out parquet and pickle, and return concatenated DataFrames.
+    Process VCF/BCF inputs to compute and normalize summary statistics and
+    assemble CNN feature vectors.
+
+    This routine searches for bgzipped VCFs matching ``data_dir/*vcf.gz``, computes
+    per-window statistics, normalizes them using empirical bins estimated from the
+    data, and returns concatenated feature tables.
+
+    :param str data_dir:
+        Input directory containing VCF/BCF files. Files are discovered using the
+        glob pattern ``data_dir/*vcf.gz``. Output feature vectors are written under
+        ``data_dir/vcfs``.
+    :param int nthreads:
+        Number of parallel workers (joblib). This controls parallel VCF processing
+        and windowed statistics.
+    :param list center:
+        Two integers controlling where centers are placed for normalization steps.
+        Interpretation may be adjusted downstream. This parameter is currently
+        not directly used in this function but may be used in normalization helpers.
+    :param list windows:
+        List of window sizes (in base pairs) used by downstream normalization.
+    :param int step:
+        Window step size (in base pairs) used by downstream normalization.
+    :param str recombination_map:
+        Optional path to a recombination map used during VCF processing. If it is
+        ``None``, genetic distance is treated as proportional to physical distance
+        by downstream code.
+    :param str population:
+        Label used to name the output Parquet files.
+
+    :returns:
+        A pair of Polars DataFrames. The first is the normalized feature table,
+        and the second is the corresponding raw feature table before final scaling.
+    :rtype: tuple[polars.DataFrame, polars.DataFrame]
+
+    :raises FileNotFoundError:
+        Propagated from downstream I/O if inputs are missing.
+    :raises ValueError:
+        Propagated from downstream parsing if inputs are malformed.
+
+    .. note::
+       Side effects include writing the following files:
+       ``{data_dir}/vcfs/fvs_{population}.parquet``,
+       ``{data_dir}/vcfs/fvs_raw_{population}.parquet``, and
+       ``{data_dir}/empirical_bins.pickle``.
     """
 
-    for folder in ("neutral", "sweep"):
-        path = os.path.join(data_dir, folder)
-        if not os.path.isdir(path):
-            raise ValueError(f"Missing folder: {path}")
-        if not glob.glob(os.path.join(path, "*")):
-            raise ValueError(f"No files in folder: {path}")
+    # Paths and containers
+    fvs_file = {}
+    sims = {}
+    regions = {}
+    df_params = []
 
-    fs_data = Data(data_dir)
-    sims, df_params = fs_data.read_simulations()
+    vcf_glob = os.path.join(data_dir, "*vcf.gz")
+    for vcf_path in sorted(glob.glob(vcf_glob)):
+        basename = os.path.basename(vcf_path)
+        key = basename.replace(".vcf", "").replace(".bcf", "").replace(".gz", "")
+        key = key.replace(".", "_").lower()
+
+        fs_data = Data(vcf_path, nthreads=nthreads)
+        sim_dict = fs_data.read_vcf()
+        # returns {"sweep": [...], "region": [...]}
+
+        # build parameter DataFrame
+        n = len(sim_dict["sweep"])
+        df_params.append(
+            pl.DataFrame(
+                {
+                    "model": np.repeat(key, n),
+                    "s": np.zeros(n),
+                    "t": np.zeros(n),
+                    "saf": np.zeros(n),
+                    "eaf": np.zeros(n),
+                }
+            )
+        )
+
+        sims[key] = sim_dict["sweep"]
+        regions[key] = sim_dict["region"]
+        fvs_file[key] = os.path.join(data_dir, "vcfs", f"fvs_{key}.parquet")
+
+    df_params = pl.concat(df_params)
 
     results = {}
-    malformed_files = {}
+    tmp_bins = []
     d_centers = {}
-    binned_data = {}
-    hap_matrices = {}
-    t_m_l = []
-    k_neutral = {"neutral": None, "sweep": None}
+    malformed_files = {}
 
-    with Parallel(n_jobs=nthreads, backend="loky", verbose=2) as parallel:
-        for sim_type, sim_list in sims.items():
-            print(sim_type)
-            mask = np.random.choice(np.arange(0, 100000), 12500)
-            params = df_params.filter(pl.col("model") == sim_type)[:, 1:].to_numpy()
-            d_centers[sim_type] = center
+    for k, vcf_file in sims.items():
+        print(k)
+        params = df_params.filter(pl.col("model") == k)[:, 1:].to_numpy()
 
-            # map each sim to calculate_stats
-            _tmp_stats = tuple(
-                zip(
-                    *parallel(
-                        delayed(calculate_stats_simplify_full)(
-                            hap_data,
-                            i,
-                            center=center,
-                            windows=windows,
-                            step=step,
-                            region=None,
-                        )
-                        for i, hap_data in enumerate(sim_list[:], 1)
-                    )
-                )
-            )
-            stats, params, malformed = cleaning_summaries(
-                data_dir, _tmp_stats, params, sim_type
-            )
-            malformed_files[sim_type] = malformed
+        # compute center from region strings "chr: start-end"
+        center_coords = [
+            tuple(map(int, r.split(":")[-1].split("-"))) for r in regions[k]
+        ]
+        d_centers[k] = np.array([(a + b) // 2 for a, b in center_coords])
 
-            if sim_type == "neutral":
-                raw_stats, norm_stats = stats
-                binned_data["neutral"] = binned_stats(
-                    *normalize_neutral_full(norm_stats)
-                )
-            else:
-                raw_stats, norm_stats = stats
+        # Open a joblib process by VCF, so not same pool slower but solve RAM issues
+        _tmp_stats = func(
+            vcf_file,
+            regions[k],
+            center=center,
+            windows=windows,
+            step=step,
+            recombination_map=recombination_map,
+            nthreads=nthreads,
+        )
+        raw_stats, norm_stats = _tmp_stats
+        tmp_bins.append(norm_stats)
 
-            if not np.all(params[:, 3] == 0):
-                params[:, 0] = -np.log(params[:, 0])
-            results[sim_type] = summaries(raw_stats, params)
+        if not np.all(params[:, 3] == 0):
+            params[:, 0] = -np.log(params[:, 0])
+        results[k] = summaries(raw_stats, params)
 
-        # df_t_m = pl.concat(t_m_l)
-        df_fv_cnn = {}
-        df_fv_cnn_raw = {}
+    empirical_bins = binned_stats(*normalize_neutral_custom(tmp_bins))
+    df_fv_cnn = {}
+    df_fv_cnn_raw = {}
 
-    with Parallel(n_jobs=nthreads, backend="loky", verbose=2) as parallel:
-        for sim_type, stats_values in results.items():
-            df_w, df_w_raw = normalize_stats_full(
-                stats_values,
-                binned_data["neutral"],
-                center=d_centers[sim_type],
-                windows=windows,
-                parallel_manager=parallel,
-                nthreads=nthreads,
-                vcf=False,
-            )
-            df_fv_cnn[sim_type] = df_w
-            df_fv_cnn_raw[sim_type] = df_w_raw
-
-    with open(os.path.join(data_dir, "neutral_bins.pickle"), "wb") as f:
-        pickle.dump(binned_data["neutral"], f)
+    for k, stats_values in results.items():
+        print(k)
+        df_w, df_w_raw = normalize_stats_custom(
+            stats_values,
+            empirical_bins,
+            region=regions[k],
+            center=center,
+            windows=windows,
+            step=step,
+            nthreads=nthreads,
+            vcf=True,
+        )
+        df_fv_cnn[k] = df_w
+        df_fv_cnn_raw[k] = df_w_raw
 
     df_train = pl.concat(df_fv_cnn.values(), how="vertical")
-    # df_train = df_train.join(
-    #     df_t_m.select(pl.exclude("s", "t", "f_t", "f_i")), on=["iter", "model"]
-    # )
     df_train_raw = pl.concat(df_fv_cnn_raw.values(), how="vertical")
 
-    out_base = os.path.join(data_dir, "fvs.parquet")
-    df_train.write_parquet(out_base)
-    df_train_raw.write_parquet(out_base.replace(".parquet", "_raw.parquet"))
+    df_train.write_parquet(f"{data_dir}/fvs_{population}_custom.parquet")
+    df_train_raw.write_parquet(f"{data_dir}/fvs_raw_{population}_custom.parquet")
 
-    # np.savez_compressed(
-    #     f"{data_dir}/haplotype_matrices.npz",
-    #     neutral=hap_matrices["neutral"],
-    #     sweep=hap_matrices["sweep"],
-    # )
+    with open(os.path.join(data_dir, "empirical_bins.pickle"), "wb") as f:
+        pickle.dump(empirical_bins, f)
 
-    # return df_train, df_train_raw, hap_matrices
     return df_train, df_train_raw
 
 
 def _process_sims(data_dir, nthreads, center, windows, step, recombination_map):
     """
-    Handle vcf=False: read sweep/neutral sims under data_dir,
-    compute stats in a single Parallel pool, normalize sweep vs neutral,
-    write out parquet and pickle, and return concatenated DataFrames.
+    Process ms/discoal simulations to compute and normalize summary statistics
+    and assemble CNN feature vectors.
+
+    This routine expects two subdirectories named ``neutral`` and ``sweep`` with
+    simulation outputs, plus a ``params.txt.gz`` file in ``data_dir``. It computes
+    per-window statistics, derives neutral bins for normalization, and returns
+    concatenated feature tables.
+
+    :param str data_dir: Root directory containing simulation outputs and the
+        parameter file. Subdirectories ``neutral`` and ``sweep`` must exist and
+        be non-empty.
+    :param int nthreads: Number of parallel workers (joblib).
+    :param list center: Two integers controlling where centers are placed for
+        normalization steps; passed to downstream helpers.
+    :param list windows: Window sizes in base pairs used by downstream normalization.
+    :param int step: Window step size in base pairs used by downstream normalization.
+    :param recombination_map: Unused in this function; present for API symmetry.
+
+    :returns: A pair of DataFrames: the normalized feature table and the raw
+        feature table before final scaling.
+    :rtype: tuple[polars.DataFrame, polars.DataFrame]
+
+    :raises ValueError: If the ``neutral`` or ``sweep`` folders are missing or empty.
     """
 
     for folder in ("neutral", "sweep"):
@@ -895,13 +930,11 @@ def _process_sims(data_dir, nthreads, center, windows, step, recombination_map):
     d_centers = {}
     binned_data = {}
     hap_matrices = {}
-    t_m_l = []
-    k_neutral = {"neutral": None, "sweep": None}
 
     with Parallel(n_jobs=nthreads, backend="loky", verbose=2) as parallel:
         for sim_type, sim_list in sims.items():
             print(sim_type)
-            mask = np.random.choice(np.arange(0, 100000), 12500)
+            # mask = np.random.choice(np.arange(0, 100000), 12500)
             params = df_params.filter(pl.col("model") == sim_type)[:, 1:].to_numpy()
             d_centers[sim_type] = center
 
@@ -920,22 +953,8 @@ def _process_sims(data_dir, nthreads, center, windows, step, recombination_map):
                     )
                 )
             )
-            # stats = (_tmp_stats[0], _tmp_stats[1])
-            # hap_matrices[sim_type] = _tmp_stats[-1]
-            # lassi need to estimate K_neutral and t/m through each K_counts by simulation
-            # _df_t_m, K_neutral = compute_t_m(
-            #     sim_list[mask],
-            #     K_neutral=k_neutral["neutral"],
-            #     params=params,
-            #     parallel_manager=parallel,
-            # )
-            # t_m_l.append(_df_t_m)
-            # df_params.filter(pl.col("model") == sim_type)[:1000, :].join(df_t_m)
-            # k_neutral[sim_type] = K_neutral
 
-            stats, params, malformed = cleaning_summaries(
-                data_dir, _tmp_stats, params, sim_type
-            )
+            stats, params, malformed = cleaning_summaries(_tmp_stats, params, sim_type)
             malformed_files[sim_type] = malformed
 
             if sim_type == "neutral":
@@ -958,6 +977,7 @@ def _process_sims(data_dir, nthreads, center, windows, step, recombination_map):
                 binned_data["neutral"],
                 center=d_centers[sim_type],
                 windows=windows,
+                step=step,
                 parallel_manager=parallel,
                 nthreads=nthreads,
                 vcf=False,
@@ -988,6 +1008,100 @@ def _process_sims(data_dir, nthreads, center, windows, step, recombination_map):
     return df_train, df_train_raw
 
 
+def _process_sims_custom(
+    data_dir, nthreads, center, windows, step, recombination_map, func
+):
+    """
+    Handle vcf=False: read sweep/neutral sims under data_dir,
+    compute stats in a single Parallel pool, normalize sweep vs neutral,
+    write out parquet and pickle, and return concatenated DataFrames.
+    """
+
+    for folder in ("neutral", "sweep"):
+        path = os.path.join(data_dir, folder)
+        if not os.path.isdir(path):
+            raise ValueError(f"Missing folder: {path}")
+        if not glob.glob(os.path.join(path, "*")):
+            raise ValueError(f"No files in folder: {path}")
+
+    fs_data = Data(data_dir)
+    sims, df_params = fs_data.read_simulations()
+
+    results = {}
+    malformed_files = {}
+    d_centers = {}
+    binned_data = {}
+
+    with Parallel(n_jobs=nthreads, backend="loky", verbose=2) as parallel:
+        for sim_type, sim_list in sims.items():
+            print(sim_type)
+            mask = np.random.choice(np.arange(0, 10000), 1000)
+            params = df_params.filter(pl.col("model") == sim_type)[:, 1:].to_numpy()
+            d_centers[sim_type] = np.array(center).astype(int)
+
+            # map each sim to calculate_stats
+            _tmp_stats = tuple(
+                zip(
+                    *parallel(
+                        delayed(func)(
+                            hap_data,
+                            i,
+                            center=center,
+                            windows=windows,
+                            step=step,
+                        )
+                        for i, hap_data in enumerate(sim_list[:], 1)
+                    )
+                )
+            )
+            stats, params, malformed = cleaning_summaries(_tmp_stats, params, sim_type)
+            malformed_files[sim_type] = malformed
+
+            if sim_type == "neutral":
+                raw_stats, norm_stats = stats
+                binned_data["neutral"] = binned_stats(
+                    *normalize_neutral_custom(norm_stats)
+                )
+            else:
+                raw_stats, norm_stats = stats
+
+            if not np.all(params[:, 3] == 0):
+                params[:, 0] = -np.log(params[:, 0])
+            results[sim_type] = summaries(raw_stats, params)
+
+        # df_t_m = pl.concat(t_m_l)
+        df_fv_cnn = {}
+        df_fv_cnn_raw = {}
+
+    with Parallel(n_jobs=nthreads, backend="loky", verbose=2) as parallel:
+        for sim_type, stats_values in results.items():
+            df_w, df_w_raw = normalize_stats_custom(
+                stats_values,
+                binned_data["neutral"],
+                center=d_centers[sim_type],
+                windows=windows,
+                step=step,
+                parallel_manager=parallel,
+                nthreads=nthreads,
+                vcf=False,
+            )
+            df_fv_cnn[sim_type] = df_w
+            df_fv_cnn_raw[sim_type] = df_w_raw
+
+    with open(os.path.join(data_dir, "neutral_bins.pickle"), "wb") as f:
+        pickle.dump(binned_data["neutral"], f)
+
+    df_train = pl.concat(df_fv_cnn.values(), how="vertical")
+
+    df_train_raw = pl.concat(df_fv_cnn_raw.values(), how="vertical")
+
+    out_base = os.path.join(data_dir, "fvs_custom.parquet")
+    df_train.write_parquet(out_base)
+    df_train_raw.write_parquet(out_base.replace(".parquet", "_raw.parquet"))
+
+    return df_train, df_train_raw
+
+
 def summary_statistics(
     data_dir,
     vcf=False,
@@ -996,19 +1110,106 @@ def summary_statistics(
     windows=[50000, 100000, 200000, 500000, 1000000],
     step=10000,
     recombination_map=None,
-    full=False,
+    func=None,
+    population=None,
 ):
     """
-    Wrapper: dispatch to VCF or simulation pipeline.
+    Compute summary statistics and assemble CNN feature vectors, dispatching to
+    either the VCF pipeline or the simulation pipeline.
+
+    :param str data_dir:
+        Input location. If ``vcf`` is ``False``, this is the root directory of
+        ms/discoal simulations produced by the simulator (e.g., contains
+        ``neutral/``, ``sweep/``, and ``params.txt.gz``). If ``vcf`` is
+        ``True``, this is a directory containing VCF/BCF data (see the VCF
+        pipeline for expected layout).
+
+    :param bool vcf:
+        Whether to use the VCF/BCF pipeline (``True``) or the simulation
+        pipeline (``False``). **Default:** ``False``.
+
+    :param int nthreads:
+        Number of parallel workers (joblib). **Default:** ``1``.
+
+    :param list center:
+        Two-element list ``[start, end]`` (bp) defining the range of window
+        centers to evaluate around the locus/region center. Interpretation may
+        vary slightly between the VCF and simulation pipelines. **Default:**
+        ``[500000, 700000]``.
+
+    :param list windows:
+        List of window widths (bp) over which to aggregate statistics.
+        **Default:** ``[50000, 100000, 200000, 500000, 1000000]``.
+
+    :param int step:
+        Step size (bp) between adjacent windows (sliding window stride).
+        **Default:** ``10000``.
+
+    :param str recombination_map:
+        Optional path to a recombination map. CSV maps commonly use columns
+        like ``Chr, Begin, End, cMperMb, cM``; TSV maps may use
+        ``chr, start, end, cm_mb, cm``. If ``None``, downstream code may treat
+        genetic distance as proportional to physical distance. **Default:**
+        ``None``.
+
+    :param bool full:
+        If ``True`` and ``vcf`` is ``False``, run the extended simulation workflow
+        (``_process_sims_custom``) that may compute additional or expanded features.
+        If ``False``, use the standard workflow (``_process_sims``). Ignored when
+        ``vcf`` is ``True``. **Default:** ``False``.
+
+    :param population:
+        Optional sample subset for VCF processing (e.g., population label or a
+        collection of sample IDs). Interpretation is handled downstream by the
+        VCF reader. **Default:** ``None``.
+
+    :returns:
+        Feature-vector table of summary statistics. Additional artifacts (e.g.,
+        Parquet/normalization files) may be written by downstream routines
+        depending on the chosen pipeline.
+    :rtype: polars.DataFrame
+
+    :raises FileNotFoundError:
+        Propagated from downstream routines if input files or directories are missing.
+    :raises ValueError:
+        Propagated from downstream routines on malformed inputs.
+
+    .. note::
+       This is a thin wrapper that dispatches to :func:`_process_vcf`,
+       :func:`_process_sims`, or :func:`_process_sims_custom` based on the
+       ``vcf`` and ``full`` flags.
+
+    **Examples**
+
+    .. code-block:: python
+
+       # From ms/discoal simulations
+       df = summary_statistics("./sims", nthreads=4)
+
+       # From VCFs with a recombination map
+       df = summary_statistics("./vcf_data", vcf=True, nthreads=8,
+                               recombination_map="recomb_map.csv")
     """
     if vcf:
-        return _process_vcf(
-            data_dir, nthreads, center, windows, step, recombination_map
-        )
+        if func is not None:
+            return _process_vcf_custom(
+                data_dir,
+                nthreads,
+                center,
+                windows,
+                step,
+                recombination_map,
+                population,
+                func,
+            )
+        else:
+            return _process_vcf(
+                data_dir, nthreads, center, windows, step, recombination_map, population
+            )
     else:
-        if full:
-            return _process_sims_full(
-                data_dir, nthreads, center, windows, step, recombination_map
+        if func is not None:
+            return _process_sims_custom(
+                data_dir, nthreads, center, windows, step, recombination_map, func
             )
         else:
             return _process_sims(
@@ -1023,12 +1224,52 @@ def calculate_stats_vcf(
     vcf_file,
     region,
     _iter=1,
-    # center=[500000, 700000],
-    # step=1e4,
     recombination_map=None,
     parallel_manager=None,
     nthreads=1,
 ):
+    """
+    Compute summary statistics directly from VCF/BCF input for a list of regions.
+
+    The function reads haplotypes and positions from a VCF/BCF file, applies
+    biallelic filtering, computes per-site and windowed statistics (including
+    iHS, nSL, iSAFE, and frequency-spectrum summaries), and returns both the
+    per-metric tables and a joined DataFrame.
+
+    :param vcf_file:
+        Either a path to a VCF/BCF file or a preloaded tuple/list of arrays that
+        the downstream code expects as if produced by the VCF reader.
+    :param list region:
+        List of region strings in the form ``"CHR:START-END"``.
+    :param int _iter:
+        Iteration identifier used when adding standard columns to result tables.
+        Default is ``1``.
+    :param str recombination_map:
+        Optional path to a recombination map. If ``None``, genetic positions may
+        be treated as proportional to physical positions by downstream code.
+    :param parallel_manager:
+        Optional joblib.Parallel object to reuse a pool created by the caller.
+        If ``None``, this function may create its own pool where needed.
+    :param int nthreads:
+        Number of threads used for any internal parallel blocks when a manager is
+        not provided. Default is ``1``.
+
+    :returns:
+        A pair where the first element is a dictionary of Polars DataFrames by
+        metric name, and the second element is a joined Polars DataFrame
+        containing the normalized columns across metrics.
+    :rtype: tuple[dict, polars.DataFrame]
+
+    :raises FileNotFoundError:
+        If the VCF/BCF path cannot be read.
+    :raises ValueError:
+        Propagated from downstream parsing if inputs are malformed.
+
+    .. note::
+       When ``recombination_map`` is ``None``, genetic positions are set to
+       ``None`` for iHS and related metrics, which will then operate on
+       physical positions.
+    """
     filterwarnings(
         "ignore",
         category=RuntimeWarning,
@@ -1040,24 +1281,23 @@ def calculate_stats_vcf(
         hap, rec_map, p = vcf_file
     elif isinstance(vcf_file, str):
         try:
-            hap, rec_map, p = genome_reader(
+            # Biallelic filter inside
+            # hap, rec_map, p = genome_reader(
+            (
+                hap_int,
+                rec_map_01,
+                ac,
+                biallelic_mask,
+                position_masked,
+                genetic_position_masked,
+            ) = genome_reader(
                 vcf_file, recombination_map=recombination_map, region=None
             )
+            freqs = ac[:, 1] / ac.sum(axis=1)
         except:
             return None
     else:
         return None
-
-    # Open and filtering data
-    (
-        hap_int,
-        rec_map_01,
-        ac,
-        biallelic_mask,
-        position_masked,
-        genetic_position_masked,
-    ) = filter_gt(hap, rec_map, region=None)
-    freqs = ac[:, 1] / ac.sum(axis=1)
 
     # If recombination is not provided, then genetic_pos == pos
     if recombination_map is None:
@@ -1071,7 +1311,7 @@ def calculate_stats_vcf(
 
     # Estimate fs stats
     df_dind_high_low, df_s_ratio, df_hapdaf_s, df_hapdaf_o = run_fs_stats(
-        hap_int[:, :], ac[:, :], rec_map_01[:, :]
+        hap_int, ac, rec_map_01
     )
 
     df_dind_high_low = center_window_cols(df_dind_high_low, _iter=_iter)
@@ -1191,59 +1431,226 @@ def calculate_stats_vcf(
         .collect()
     )
 
-    # df_snps_norm = reduce(
-    #     lambda left, right: left.join(
-    #         right,
-    #         on=["iter", "positions", "daf"],
-    #         # on=["iter", "center", "window", "positions", "daf"],
-    #         how="full",
-    #         coalesce=True,
-    #     ),
-    #     [df_nsl, df_ihs, df_isafe],
-    #     # ).sort(["iter", "center", "window", "positions"])
-    # ).sort(["iter", "positions"])
+    if region is not None:
+        df_stats_norm = df_stats_norm.with_columns(
+            [pl.lit(nchr).cast(pl.Utf8).alias("iter")]
+        )
 
-    # df_stats = reduce(
-    #     lambda left, right: left.join(
-    #         right,
-    #         # on=["iter", "center", "window", "positions", "daf"],
-    #         on=["iter", "positions", "daf"],
-    #         how="full",
-    #         coalesce=True,
-    #     ),
-    #     [df_dind_high_low, df_s_ratio, df_hapdaf_o, df_hapdaf_s, df_window],
-    # ).sort(["iter", "positions"])
-    # # ).sort(["iter", "center", "window", "positions"])
+    return d_stats, df_stats_norm
 
-    # df_stats_norm = df_snps_norm.join(
-    #     df_stats.select(
-    #         pl.all().exclude(
-    #             ["iter", "delta_ihh", "ihs", "isafe", "nsl"]
-    #             # ["iter", "center", "window", "delta_ihh", "ihs", "isafe", "nsl"]
-    #         )
-    #     ),
-    #     on=["positions", "daf"],
-    #     how="full",
-    #     coalesce=True,
-    # ).sort(["positions"])
 
-    # df_stats_norm = (
-    #     df_stats_norm.with_columns(
-    #         [
-    #             pl.lit(_iter).alias("iter"),
-    #             # pl.lit(600000).alias("center"),
-    #             # pl.lit(1200000).alias("window"),
-    #             pl.col("positions").cast(pl.Int64),
-    #         ]
-    #     ).select(
-    #         pl.col(["iter", "positions"]),
-    #         pl.all().exclude(["iter", "positions"]),
-    #         # pl.col(["iter", "center", "window", "positions"]),
-    #         # pl.all().exclude(["iter", "center", "window", "positions"]),
-    #     )
-    #     # .sort(["iter", "center", "window", "positions"])
-    #     .sort(["iter", "positions"])
-    # )
+def calculate_stats_vcf_custom(
+    vcf_file,
+    region,
+    _iter=1,
+    center=[5e5, 7e5],
+    windows=[50000, 100000, 200000, 500000, 1000000],
+    step=1e4,
+    recombination_map=None,
+    parallel_manager=None,
+    nthreads=1,
+):
+    """
+    Compute summary statistics directly from VCF/BCF input for a list of regions.
+
+    The function reads haplotypes and positions from a VCF/BCF file, applies
+    biallelic filtering, computes per-site and windowed statistics (including
+    iHS, nSL, iSAFE, and frequency-spectrum summaries), and returns both the
+    per-metric tables and a joined DataFrame.
+
+    :param vcf_file:
+        Either a path to a VCF/BCF file or a preloaded tuple/list of arrays that
+        the downstream code expects as if produced by the VCF reader.
+    :param list region:
+        List of region strings in the form ``"CHR:START-END"``.
+    :param int _iter:
+        Iteration identifier used when adding standard columns to result tables.
+        Default is ``1``.
+    :param str recombination_map:
+        Optional path to a recombination map. If ``None``, genetic positions may
+        be treated as proportional to physical positions by downstream code.
+    :param parallel_manager:
+        Optional joblib.Parallel object to reuse a pool created by the caller.
+        If ``None``, this function may create its own pool where needed.
+    :param int nthreads:
+        Number of threads used for any internal parallel blocks when a manager is
+        not provided. Default is ``1``.
+
+    :returns:
+        A pair where the first element is a dictionary of Polars DataFrames by
+        metric name, and the second element is a joined Polars DataFrame
+        containing the normalized columns across metrics.
+    :rtype: tuple[dict, polars.DataFrame]
+
+    :raises FileNotFoundError:
+        If the VCF/BCF path cannot be read.
+    :raises ValueError:
+        Propagated from downstream parsing if inputs are malformed.
+
+    .. note::
+       When ``recombination_map`` is ``None``, genetic positions are set to
+       ``None`` for iHS and related metrics, which will then operate on
+       physical positions.
+    """
+    filterwarnings(
+        "ignore",
+        category=RuntimeWarning,
+        message="invalid value encountered in scalar divide",
+    )
+    np.seterr(divide="ignore", invalid="ignore")
+
+    if isinstance(vcf_file, list) or isinstance(vcf_file, tuple):
+        hap, rec_map, p = vcf_file
+    elif isinstance(vcf_file, str):
+        try:
+            # Biallelic filter inside
+            (
+                hap_int,
+                rec_map_01,
+                ac,
+                biallelic_mask,
+                position_masked,
+                genetic_position_masked,
+            ) = genome_reader(
+                vcf_file, recombination_map=recombination_map, region=None
+            )
+            freqs = ac[:, 1] / ac.sum(axis=1)
+        except:
+            return None
+    else:
+        return None
+
+    # If recombination is not provided, then genetic_pos == pos
+    if recombination_map is None:
+        genetic_position_masked = None
+
+    # Define variables
+    windows = [tuple(map(int, r.split(":")[-1].split("-"))) for r in region]
+
+    nchr = region[0].split(":")[0]
+    d_stats = defaultdict(dict)
+
+    # Estimate fs stats
+    df_dind_high_low, df_s_ratio, df_hapdaf_s, df_hapdaf_o = run_fs_stats(
+        hap_int, ac, rec_map_01
+    )
+
+    df_dind_high_low = center_window_cols(df_dind_high_low, _iter=_iter)
+    df_s_ratio = center_window_cols(df_s_ratio, _iter=_iter)
+    df_hapdaf_o = center_window_cols(df_hapdaf_o, _iter=_iter)
+    df_hapdaf_s = center_window_cols(df_hapdaf_s, _iter=_iter)
+
+    # Estimate iHS and nSL
+    df_ihs = ihs_ihh(
+        hap_int,
+        position_masked,
+        map_pos=genetic_position_masked,
+        min_ehh=0.05,
+        min_maf=0.05,
+        include_edges=False,
+        use_threads=True,
+    )
+    df_ihs = center_window_cols(df_ihs, _iter=_iter)
+
+    nsl_v = nsl(hap_int[freqs >= 0.05], use_threads=True)
+    df_nsl = pl.DataFrame(
+        {
+            "positions": position_masked[freqs >= 0.05],
+            "daf": freqs[freqs >= 0.05],
+            "nsl": nsl_v,
+        }
+    ).fill_nan(None)
+
+    df_ihs = center_window_cols(df_ihs, _iter=_iter)
+    df_nsl = center_window_cols(df_nsl, _iter=_iter)
+
+    # Estimate windowed (h12,haf,isafe) stats
+    if parallel_manager is None:
+        with Parallel(n_jobs=nthreads, backend="loky", verbose=5) as parallel:
+            out_h12_haf, out_isafe = zip(
+                *parallel(
+                    delayed(run_windowed_stats)(
+                        hap_int[
+                            (position_masked >= window[0])
+                            & (position_masked <= window[1])
+                        ],
+                        position_masked[
+                            (position_masked >= window[0])
+                            & (position_masked <= window[1])
+                        ],
+                        window,
+                    )
+                    for _iter, (window) in enumerate(windows[:], 1)
+                )
+            )
+    else:
+        out_h12_haf, out_isafe = zip(
+            *parallel_manager(
+                delayed(run_windowed_stats)(
+                    hap_int[
+                        (position_masked >= window[0]) & (position_masked <= window[1])
+                    ],
+                    position_masked[
+                        (position_masked >= window[0]) & (position_masked <= window[1])
+                    ],
+                    window,
+                )
+                for _iter, window in enumerate(windows[:], 1)
+            )
+        )
+
+    df_window = pl.concat(out_h12_haf, how="vertical")
+
+    # Because of random shuffle in iSAFE it will output different values for same snps
+    # in contigous windows, get the max value or the mean
+    # df_isafe = pl.concat(out_isafe, how="vertical")
+    df_isafe = (
+        pl.concat(out_isafe, how="vertical")
+        .group_by(["iter", "positions", "daf"], maintain_order=True)
+        # .group_by(["iter", "center", "window", "positions", "daf"], maintain_order=True)
+        .agg(pl.col("isafe").mean().alias("isafe"))
+        .sort("positions")
+    )
+
+    # Save estimations in dict
+    d_stats["dind_high_low"] = df_dind_high_low
+    d_stats["s_ratio"] = df_s_ratio
+    d_stats["hapdaf_o"] = df_hapdaf_o
+    d_stats["hapdaf_s"] = df_hapdaf_s
+    d_stats["ihs"] = df_ihs
+    d_stats["nsl"] = df_nsl
+    d_stats["isafe"] = df_isafe
+    d_stats["h12_haf"] = df_window
+
+    if region is not None:
+        for k, df in d_stats.items():
+            d_stats[k] = df.with_columns([pl.lit(nchr).cast(pl.Utf8).alias("iter")])
+
+    ####### if neutral:
+
+    df_stats_norm = (
+        reduce(
+            lambda left, right: left.join(
+                right,
+                # on=["iter", "center", "window", "positions", "daf"],
+                on=["iter", "positions", "daf"],
+                how="full",
+                coalesce=True,
+            ),
+            [
+                df_nsl.lazy(),
+                df_ihs.lazy(),
+                df_isafe.lazy(),
+                df_dind_high_low.lazy(),
+                df_s_ratio.lazy(),
+                df_hapdaf_o.lazy(),
+                df_hapdaf_s.lazy(),
+                df_window.lazy(),
+            ],
+        )
+        .sort("positions")
+        .collect()
+    )
 
     if region is not None:
         df_stats_norm = df_stats_norm.with_columns(
@@ -1261,6 +1668,47 @@ def calculate_stats_simplify(
     step=1e4,
     region=None,
 ):
+    """
+    Compute summary statistics from ms/discoal outputs or pre-parsed haplotypes.
+
+    This function parses or consumes haplotypes and positions, filters to
+    biallelic sites, computes per-site and windowed statistics (including iHS,
+    nSL, iSAFE, H12/H2/H1, HAF), and returns both the per-metric tables and a
+    joined DataFrame.
+
+    :param hap_data:
+        Either a path to an ms/discoal gzipped output file (``.ms``, ``.ms.gz``,
+        ``.out``, ``.out.gz``) or a preloaded tuple/list of arrays compatible with
+        downstream helpers.
+    :param int _iter:
+        Iteration identifier used when adding standard columns to result tables.
+        Default is ``1``.
+    :param list center:
+        Two integers controlling where centers are placed for normalization steps.
+        Default is ``[5e5, 7e5]``.
+    :param list windows:
+        List of window sizes (in base pairs) used by downstream normalization.
+        Default is ``[50000, 100000, 200000, 500000, 1000000]``.
+    :param float step:
+        Window step size (in base pairs) used by downstream normalization.
+        Default is ``1e4``.
+    :param region:
+        Optional region string used when some helpers attach region labels to outputs.
+
+    :returns:
+        A pair where the first element is a dictionary of Polars DataFrames by
+        metric name, and the second element is a joined Polars DataFrame
+        containing the normalized columns across metrics.
+    :rtype: tuple[dict, polars.DataFrame]
+
+    :raises FileNotFoundError:
+        If an input file path cannot be read.
+    :raises ValueError:
+        Propagated from downstream parsing if inputs are malformed.
+
+    .. note::
+       Large intermediates are explicitly released before return (``gc.collect()``).
+    """
     filterwarnings(
         "ignore",
         category=RuntimeWarning,
@@ -1273,27 +1721,37 @@ def calculate_stats_simplify(
     elif isinstance(hap_data, str):
         try:
             # hap, rec_map, p = ms_parser(hap_data)
-            hap, rec_map, p = ms_parser_np(hap_data)
-            if hap.shape[0] != rec_map.shape[0]:
-                return None, None, None
+            # hap, rec_map, p = ms_parser_np(hap_data)
+            (
+                hap_int,
+                rec_map_01,
+                ac,
+                biallelic_mask,
+                position_masked,
+                genetic_position_masked,
+            ) = parse_and_filter_ms(hap_data)
+            freqs = ac[:, 1] / ac.sum(axis=1)
+
+            if hap_int.shape[0] != rec_map_01.shape[0]:
+                return None, None
         except:
             try:
                 hap, rec_map, p = genome_reader(hap_data, region)
             except:
-                return None, None, None
+                return None, None
     else:
-        return None, None, None
+        return None, None
 
     # Open and filtering data
-    (
-        hap_int,
-        rec_map_01,
-        ac,
-        biallelic_mask,
-        position_masked,
-        genetic_position_masked,
-    ) = filter_gt(hap, rec_map, region=region)
-    freqs = ac[:, 1] / ac.sum(axis=1)
+    # (
+    #     hap_int,
+    #     rec_map_01,
+    #     ac,
+    #     biallelic_mask,
+    #     position_masked,
+    #     genetic_position_masked,
+    # ) = filter_gt(hap, rec_map, region=region)
+    # freqs = ac[:, 1] / ac.sum(axis=1)
 
     # if len(center) == 1:
     #     centers = np.arange(center[0], center[0] + step, step).astype(int)
@@ -1343,7 +1801,7 @@ def calculate_stats_simplify(
         #     position_masked,
         #     window_size=int(1e5),
         # )
-        h12_v, h2_h1, h2_v = h12_enard_numba(
+        h12_v, h2_h1, h2_v = h12_enard(
             hap_int,
             position_masked
             # , window_size=int(1e5)
@@ -1409,70 +1867,17 @@ def calculate_stats_simplify(
                 df_hapdaf_s.lazy(),
                 df_window.lazy(),
             ],
-            # [df_nsl, df_ihs_n, df_isafe],
         )
         .sort("positions")
         .collect()
     )
 
-    # df_snps_norm = reduce(
-    #     lambda left, right: left.join(
-    #         right,
-    #         # on=["iter", "center", "window", "positions", "daf"],
-    #         on=["iter", "positions", "daf"],
-    #         how="full",
-    #         coalesce=True,
-    #     ),
-    #     [df_nsl, df_ihs, df_isafe],
-    #     # [df_nsl, df_ihs_n, df_isafe],
-    # )
-
-    # df_stats = reduce(
-    #     lambda left, right: left.join(
-    #         right,
-    #         on=["iter", "positions", "daf"],
-    #         how="full",
-    #         coalesce=True,
-    #     ),
-    #     [df_dind_high_low, df_s_ratio, df_hapdaf_o, df_hapdaf_s, df_window],
-    # ).sort(["iter", "positions"])
-    # df_stats_norm = df_snps_norm.join(
-    #     df_stats.select(pl.all().exclude(["iter", "delta_ihh", "ihs", "isafe", "nsl"])),
-    #     on=["positions", "daf"],
-    #     how="full",
-    #     coalesce=True,
-    # ).sort(["positions"])
-
-    # df_stats_norm = (
-    #     df_stats_norm.with_columns(
-    #         [
-    #             pl.lit(_iter).alias("iter"),
-    #             # pl.lit(600000).alias("center"),
-    #             # pl.lit(1200000).alias("window"),
-    #             pl.col("positions").cast(pl.Int64),
-    #         ]
-    #     )
-    #     .select(
-    #         pl.col(["iter", "positions"]),
-    #         pl.all().exclude(["iter", "positions"]),
-    #         # pl.col(["iter", "center", "window", "positions"]),
-    #         # pl.all().exclude(["iter", "center", "window", "positions"]),
-    #     )
-    #     .sort(["iter", "positions"])
-    #     # .sort(["iter", "center", "window", "positions"])
-    # )
-
     if region is not None:
         df_stats_norm = df_stats_norm.with_columns(pl.lit(region).alias("iter"))
-
-    # sorting 500 SNP
-    # mask = get_closest_snps(position_masked, 6e5, 500)
-    # hap_sorted_corr_daf = daf_sorting(corr_sorting(hap_int[mask].T))
-
-    del hap, hap_int, rec_map, rec_map_01, ac, biallelic_mask
+    del hap_int, rec_map_01, ac, biallelic_mask
     del position_masked, genetic_position_masked, freqs
     del df_dind_high_low, df_s_ratio, df_hapdaf_o, df_hapdaf_s
-    del df_isafe, df_ihs, df_nsl, df_window, df_stats, df_snps_norm
+    del df_isafe, df_ihs, df_nsl, df_window
     gc.collect()
     # sys.stdout.flush()
 
@@ -1480,7 +1885,7 @@ def calculate_stats_simplify(
     return d_stats, df_stats_norm
 
 
-def calculate_stats_simplify_full(
+def calculate_stats_simplify_custom(
     hap_data,
     _iter=1,
     center=[5e5, 7e5],
@@ -1495,31 +1900,20 @@ def calculate_stats_simplify_full(
     )
     np.seterr(divide="ignore", invalid="ignore")
 
-    if isinstance(hap_data, list) or isinstance(hap_data, tuple):
-        hap, rec_map, p = hap_data
-    elif isinstance(hap_data, str):
-        try:
-            hap, rec_map, p = ms_parser(hap_data)
-            if hap.shape[0] != rec_map.shape[0]:
-                return None, None, None
-        except:
-            try:
-                hap, rec_map, p = genome_reader(hap_data, region)
-            except:
-                return None, None, None
-    else:
+    try:
+        (
+            hap_int,
+            rec_map_01,
+            ac,
+            biallelic_mask,
+            position_masked,
+            genetic_position_masked,
+        ) = parse_and_filter_ms(hap_data)
+        freqs = ac[:, 1] / ac.sum(axis=1)
+        if hap_int.shape[0] != rec_map_01.shape[0]:
+            return None, None, None
+    except:
         return None, None, None
-
-    # Open and filtering data
-    (
-        hap_int,
-        rec_map_01,
-        ac,
-        biallelic_mask,
-        position_masked,
-        genetic_position_masked,
-    ) = filter_gt(hap, rec_map, region=region)
-    freqs = ac[:, 1] / ac.sum(axis=1)
 
     if len(center) == 1:
         centers = np.arange(center[0], center[0] + step, step).astype(int)
@@ -1607,7 +2001,7 @@ def calculate_stats_simplify_full(
                 #         hap_int[mask], position_masked[mask], window_size=int(5e5)
                 #     )
 
-                h12_v, h2_h1, h2_v = h12_enard_numba(
+                h12_v, h2_h1, h2_v = h12_enard(
                     _tmp_hap,
                     _tmp_pos
                     # , window_size=int(5e5)
@@ -1738,7 +2132,6 @@ def calculate_stats_simplify_full(
     return d_stats, {"snps": df_stats_norm, "windows": df_window_new}
 
 
-# def relative_position(positions, window, mask):
 @njit
 def relative_position(positions, window):
     window_start = window[0]
@@ -1751,7 +2144,6 @@ def relative_position(positions, window):
     return positions_relative
 
 
-# def run_windowed_stats(hap, positions, window):
 def run_windowed_stats(hap, positions, window):
     # mask = (positions >= window[0]) & (positions <= window[1])
 
@@ -1770,7 +2162,7 @@ def run_windowed_stats(hap, positions, window):
 
         try:
             # h12_v, h2_h1 = h12_enard(hap[mask, :],positions_relative,window_size=int(5e5))
-            h12_v, h2_h1, h2_v = h12_enard_numba(
+            h12_v, h2_h1, h2_v = h12_enard(
                 hap,
                 positions_relative,
                 # window_size=int(1e5)
@@ -1836,8 +2228,9 @@ def normalize_stats(
     stats_values,
     bins,
     center=[5e5, 7e5],
-    # windows=[10000, 25000, 50000, 100000, 200000],
     windows=[50000, 100000, 200000, 500000, 1000000],
+    step=1e4,
+    region=None,
     parallel_manager=None,
     nthreads=1,
     vcf=False,
@@ -1847,7 +2240,9 @@ def normalize_stats(
         bins,
         center=center,
         windows=windows,
-        parallel_manager=parallel_manager,
+        step=step,
+        region=region,
+        parallel_manager=None,
         nthreads=nthreads,
         vcf=vcf,
     )
@@ -1888,8 +2283,9 @@ def normalization_raw(
     stats_values,
     bins,
     center=[5e5, 7e5],
-    # windows=[10000, 25000, 50000, 100000, 200000],
     windows=[50000, 100000, 200000, 500000, 1000000],
+    step=1e4,
+    region=None,
     vcf=False,
     nthreads=1,
     parallel_manager=None,
@@ -1938,25 +2334,27 @@ def normalization_raw(
     df_stats, params = deepcopy(stats_values)
 
     if vcf:
+        nchr = region[0].split(":")[0]
+        center_coords = [tuple(map(int, r.split(":")[-1].split("-"))) for r in region]
+        center_g = np.array([(a + b) // 2 for a, b in center_coords])
+        centers = np.arange(center[0], center[1] + step, step).astype(int)
+
         df_h12_haf = df_stats.pop("h12_haf")
         snps_genome = reduce(
             lambda left, right: left.join(
                 right,
-                # on=["iter", "center", "window", "positions", "daf"],
                 on=["iter", "positions", "daf"],
                 how="full",
                 coalesce=True,
             ),
             list(df_stats.values()),
         ).sort(["iter", "positions"])
-        # ).sort(["iter", "center", "window", "positions"])
+
         nchr = snps_genome["iter"].unique().first()
 
         # Overwrite snps_values
-        # snps_genome = snps_genome.select(pl.exclude(["h12", "haf"]))
         snps_values = snps_genome.select(pl.exclude(["h12", "haf"]))
 
-        # stats_names = snps_values.select(snps_values.columns[5:]).columns
         stats_names = snps_values.select(snps_values.columns[3:]).columns
 
         binned_values = bin_values(snps_values)
@@ -1965,13 +2363,11 @@ def normalization_raw(
             binned_values, bins, stats_names
         ).sort("positions")
 
-        # tmp_normalized = [normalized_df.filter((pl.col('positions') >= (w-6e5)) & (pl.col('positions') <= (w+6e5))) for w in center]
-        # tmp_raw = [binned_values.filter((pl.col('positions') >= (w-6e5)) & (pl.col('positions') <= (w+6e5))) for w in center]
         left_idxs = np.searchsorted(
-            normalized_df["positions"].to_numpy(), center - 6e5, side="left"
+            normalized_df["positions"].to_numpy(), center_g - 6e5, side="left"
         )
         right_idxs = np.searchsorted(
-            normalized_df["positions"].to_numpy(), center + 6e5, side="right"
+            normalized_df["positions"].to_numpy(), center_g + 6e5, side="right"
         )
         tmp_normalized = [
             normalized_df.slice(start, end - start)
@@ -1984,31 +2380,31 @@ def normalization_raw(
 
         if parallel_manager is None:
             df_fv_n = pl.concat(
-                Parallel(n_jobs=nthreads, verbose=0)(
+                Parallel(n_jobs=nthreads, verbose=1)(
                     delayed(cut_snps)(
                         df,
-                        None,
+                        centers,
                         windows,
                         stats_names,
                         fixed_center=coord,
                         iter_value=coord,
                         # vcf=True,
                     )
-                    for df, coord in zip(tmp_normalized, center)
+                    for df, coord in zip(tmp_normalized, center_g)
                 )
             )
             df_fv_n_raw = pl.concat(
                 Parallel(n_jobs=nthreads, verbose=1)(
                     delayed(cut_snps)(
                         df,
-                        None,
+                        centers,
                         windows,
                         stats_names,
                         fixed_center=coord,
                         iter_value=coord,
                         # vcf=True,
                     )
-                    for df, coord in zip(tmp_raw, center)
+                    for df, coord in zip(tmp_raw, center_g)
                 )
             )
         else:
@@ -2076,7 +2472,11 @@ def normalization_raw(
             df_fv_n_l, df_fv_n_l_raw = zip(
                 *Parallel(n_jobs=nthreads, verbose=1)(
                     delayed(normalize_cut_raw)(
-                        snps_values, bins, center=center, windows=windows
+                        snps_values,
+                        bins,
+                        center=center,
+                        windows=windows,
+                        step=step,
                     )
                     for _iter, snps_values in enumerate(df_stats, 1)
                 )
@@ -2085,7 +2485,11 @@ def normalization_raw(
             df_fv_n_l, df_fv_n_l_raw = zip(
                 *parallel_manager(
                     delayed(normalize_cut_raw)(
-                        snps_values, bins, center=center, windows=windows
+                        snps_values,
+                        bins,
+                        center=center,
+                        windows=windows,
+                        step=step,
                     )
                     for _iter, snps_values in enumerate(df_stats, 1)
                 )
@@ -2134,412 +2538,6 @@ def normalization_raw(
     df_fv_n_raw = df_fv_n_raw.select(force_order)
 
     return df_fv_n, df_fv_n_raw
-
-
-def normalize_stats_full(
-    stats_values,
-    bins,
-    center=[5e5, 7e5],
-    # windows=[10000, 25000, 50000, 100000, 200000],
-    windows=[50000, 100000, 200000, 500000, 1000000],
-    parallel_manager=None,
-    nthreads=1,
-    vcf=False,
-):
-    df_fv, df_fv_raw = normalization_raw_full(
-        deepcopy(stats_values),
-        bins,
-        center=center,
-        windows=windows,
-        parallel_manager=parallel_manager,
-        nthreads=nthreads,
-        vcf=vcf,
-    )
-
-    df_fv_w = pivot_feature_vectors(df_fv, vcf=vcf)
-    df_fv_w_raw = pivot_feature_vectors(df_fv_raw, vcf=vcf)
-
-    # dump fvs with more than 10% nans
-    df_fv_w = df_fv_w.fill_nan(None)
-    num_nans = (
-        df_fv_w.select(
-            pl.exclude(["iter", "s", "t", "f_i", "f_t", "model", "^.*flip.*$"])
-        )
-        .transpose()
-        .null_count()
-        .to_numpy()
-        .flatten()
-    )
-    df_fv_w = df_fv_w.filter(
-        num_nans
-        < int(
-            df_fv_w.select(
-                pl.exclude(["iter", "s", "t", "f_i", "f_t", "model", "^.*flip.*$"])
-            ).shape[1]
-            * 0.1
-        )
-    ).fill_null(0)
-
-    if not vcf:
-        df_fv_w.sort(["iter", "model"])
-
-    df_fv_w_raw = df_fv_w_raw.fill_nan(None)
-
-    return df_fv_w, df_fv_w_raw
-
-
-def normalization_raw_full(
-    stats_values,
-    bins,
-    center=[5e5, 7e5],
-    # windows=[10000, 25000, 50000, 100000, 200000],
-    windows=[50000, 100000, 200000, 500000, 1000000],
-    vcf=False,
-    nthreads=1,
-    parallel_manager=None,
-):
-    """
-    Normalizes sweep statistics using neutral expectations or optionally using precomputed neutral normalized values.
-    The function applies normalization across different genomic windows and supports multi-threading.
-
-    Parameters
-    ----------
-    sweeps_stats : namedtuple
-        A Namedtuple containing the statistics for genomic sweeps and sweep parameters across
-        different genomic windows.
-
-    neutral_stats_norm : namedtuple
-        A Namedtuple containing the statistics for neutral region and neutral parameters across
-        different genomic windows, used as the baselinefor normalizing the sweep statistics.
-        This allows comparison of sweeps against neutral expectations.
-
-    norm_values : dict or None, optional (default=None)
-        A dictionary of precomputed neutral normalizated values. If provided, these values are
-        used to directly normalize the statistics. If None, the function computes
-        normalization values from the neutral statistics.
-
-    center : list of float, optional (default=[5e5, 7e5])
-        A list specifying the center positions (in base pairs) for the analysis windows.
-        If a single center value is provided, normalization is centered around that value.
-        Otherwise, it will calculate normalization for a range of positions between the two provided centers.
-
-    windows : list of int, optional (default=[50000, 100000, 200000, 500000, 1000000])
-        A list of window sizes (in base pairs) for which the normalization will be applied.
-        The function performs normalization for each of the specified window sizes.
-
-    nthreads : int, optional (default=1)
-        The number of threads to use for parallel processing. If set to 1, the function
-        runs in single-threaded mode. Higher values enable multi-threaded execution for
-        faster computation.
-
-    Returns
-    -------
-    normalized_stats : pandas.DataFrame
-        A DataFrame containing the normalized sweep statistics across the specified
-        windows and genomic regions. The sweep statistics are scaled relative to
-        neutral expectations.
-    """
-    df_stats, params = deepcopy(stats_values)
-
-    if vcf:
-        df_h12_haf = df_stats.pop("h12_haf")
-        snps_genome = reduce(
-            lambda left, right: left.join(
-                right,
-                on=["iter", "center", "window", "positions", "daf"],
-                how="full",
-                coalesce=True,
-            ),
-            list(df_stats.values()),
-        ).sort(["iter", "center", "window", "positions"])
-        nchr = snps_genome["iter"].unique().first()
-
-        # Overwrite snps_values
-        # snps_genome = snps_genome.select(pl.exclude(["h12", "haf"]))
-        snps_values = snps_genome.select(pl.exclude(["h12", "haf"]))
-
-        stats_names = snps_values.select(snps_values.columns[5:]).columns
-
-        binned_values = bin_values(snps_values)
-
-        normalized_df = normalize_snps_statistics(
-            binned_values, bins, stats_names
-        ).sort("positions")
-
-        # tmp_normalized = [normalized_df.filter((pl.col('positions') >= (w-6e5)) & (pl.col('positions') <= (w+6e5))) for w in center]
-        # tmp_raw = [binned_values.filter((pl.col('positions') >= (w-6e5)) & (pl.col('positions') <= (w+6e5))) for w in center]
-        left_idxs = np.searchsorted(
-            normalized_df["positions"].to_numpy(), center - 6e5, side="left"
-        )
-        right_idxs = np.searchsorted(
-            normalized_df["positions"].to_numpy(), center + 6e5, side="right"
-        )
-        tmp_normalized = [
-            normalized_df.slice(start, end - start)
-            for start, end in zip(left_idxs, right_idxs)
-        ]
-        tmp_raw = [
-            binned_values.slice(start, end - start)
-            for start, end in zip(left_idxs, right_idxs)
-        ]
-
-        if parallel_manager is None:
-            df_fv_n = pl.concat(
-                Parallel(n_jobs=nthreads, verbose=1)(
-                    delayed(cut_snps)(
-                        df,
-                        None,
-                        windows,
-                        stats_names,
-                        fixed_center=coord,
-                        iter_value=coord,
-                        # vcf=True,
-                    )
-                    for df, coord in zip(tmp_normalized, center)
-                )
-            )
-            df_fv_n_raw = pl.concat(
-                Parallel(n_jobs=nthreads, verbose=1)(
-                    delayed(cut_snps)(
-                        df,
-                        None,
-                        windows,
-                        stats_names,
-                        fixed_center=coord,
-                        iter_value=coord,
-                        # vcf=True,
-                    )
-                    for df, coord in zip(tmp_raw, center)
-                )
-            )
-        else:
-            df_fv_n = pl.concat(
-                parallel_manager(
-                    delayed(cut_snps)(
-                        df,
-                        center,
-                        windows,
-                        stats_names,
-                        fixed_center=coord,
-                        iter_value=coord,
-                    )
-                    for df, coord in zip(tmp_normalized, center_coords)
-                )
-            )
-            df_fv_n_raw = pl.concat(
-                parallel_manager(
-                    delayed(cut_snps)(
-                        df,
-                        center,
-                        windows,
-                        stats_names,
-                        fixed_center=coord,
-                        iter_value=coord,
-                    )
-                    for df, coord in zip(tmp_raw, center_coords)
-                )
-            )
-        window_values = (
-            df_h12_haf.with_columns(pl.col("positions").alias("iter"))
-            .filter(pl.col("positions").is_in(df_fv_n["iter"].unique().to_numpy()))
-            .select(pl.exclude(["center", "window", "positions", "daf"]))
-        )
-        df_fv_n = df_fv_n.join(
-            window_values,
-            on=["iter"],
-            how="full",
-            coalesce=True,
-        )
-        df_fv_n_raw = df_fv_n_raw.join(
-            window_values,
-            on=["iter"],
-            how="full",
-            coalesce=True,
-        )
-
-        df_params_unpack = pl.DataFrame(
-            np.repeat(
-                np.zeros((1, 4)),
-                df_fv_n.shape[0],
-                axis=0,
-            ),
-            schema=["s", "t", "f_i", "f_t"],
-        )
-        df_fv_n = df_fv_n.with_columns(
-            pl.lit(snps_genome["iter"].unique().first()).alias("nchr")
-        )
-        df_fv_n_raw = df_fv_n_raw.with_columns(
-            pl.lit(snps_genome["iter"].unique().first()).alias("nchr")
-        )
-    else:
-        if parallel_manager is None:
-            df_fv_n_l, df_fv_n_l_raw = zip(
-                *Parallel(n_jobs=nthreads, verbose=1)(
-                    delayed(normalize_cut_raw_full)(
-                        snps_values, bins, center=center, windows=windows
-                    )
-                    for _iter, snps_values in enumerate(df_stats, 1)
-                )
-            )
-        else:
-            df_fv_n_l, df_fv_n_l_raw = zip(
-                *parallel_manager(
-                    delayed(normalize_cut_raw_full)(
-                        snps_values, bins, center=center, windows=windows
-                    )
-                    for _iter, snps_values in enumerate(df_stats, 1)
-                )
-            )
-
-        df_fv_n = pl.concat(df_fv_n_l).with_columns(
-            pl.col(["iter", "window", "center"]).cast(pl.Int64)
-        )
-        df_fv_n_raw = pl.concat(df_fv_n_l_raw).with_columns(
-            pl.col(["iter", "window", "center"]).cast(pl.Int64)
-        )
-
-        # params = params[:, [0, 1, 3, 4, ]]
-        df_params_unpack = pl.DataFrame(
-            np.repeat(
-                params,
-                df_fv_n.select(["center", "window"])
-                .unique()
-                .sort(["center", "window"])
-                .shape[0],
-                axis=0,
-            ),
-            schema=["s", "t", "f_i", "f_t"],
-        )
-
-    df_fv_n = pl.concat(
-        [df_params_unpack, df_fv_n],
-        how="horizontal",
-    )
-    df_fv_n_raw = pl.concat(
-        [df_params_unpack, df_fv_n_raw],
-        how="horizontal",
-    )
-
-    force_order = ["iter"] + [col for col in df_fv_n.columns if col != "iter"]
-    df_fv_n = df_fv_n.select(force_order)
-    df_fv_n_raw = df_fv_n_raw.select(force_order)
-
-    return df_fv_n, df_fv_n_raw
-
-
-def normalize_cut_raw_full(
-    snps_values,
-    bins,
-    center=[5e5, 7e5],
-    # windows=[10000, 25000, 50000, 100000, 200000],
-    windows=[50000, 100000, 200000, 500000, 1000000],
-    step=int(1e4),
-):
-    """
-    Normalizes SNP-level statistics by comparing them to neutral expectations, and aggregates
-    the statistics within sliding windows around specified genomic centers.
-
-    This function takes SNP statistics, normalizes them based on the expected mean and standard
-    deviation from neutral simulations, and computes the average values within windows
-    centered on specific genomic positions. It returns a DataFrame with the normalized values
-    for each window across the genome.
-
-    Parameters
-    ----------
-    _iter : int
-        The iteration or replicate number associated with the current set of SNP statistics.
-
-    snps_values : pandas.DataFrame
-        A DataFrame containing SNP-level statistics such as iHS, nSL, and iSAFE. The DataFrame
-        should contain derived allele frequencies ("daf") and other statistics to be normalized.
-
-    expected : pandas.DataFrame
-        A DataFrame containing the expected mean values of the SNP statistics for each frequency bin,
-        computed from neutral simulations.
-
-    stdev : pandas.DataFrame
-        A DataFrame containing the standard deviation of the SNP statistics for each frequency bin,
-        computed from neutral simulations.
-
-    center : list of float, optional (default=[5e5, 7e5])
-        A list specifying the center positions (in base pairs) for the analysis. Normalization is
-        performed around these genomic centers using the specified window sizes.
-
-    windows : list of int, optional (default=[50000, 100000, 200000, 500000, 1000000])
-        A list of window sizes (in base pairs) over which the SNP statistics will be aggregated
-        and normalized. The function performs normalization for each specified window size.
-
-    Returns
-    -------
-    out : pandas.DataFrame
-        A DataFrame containing the normalized SNP statistics for each genomic center and window.
-        The columns include the iteration number, center, window size, and the average values
-        of normalized statistics iSAFE within the window.
-
-    Notes
-    -----
-    - The function first bins the SNP statistics based on derived allele frequencies using the
-      `bin_values` function. The statistics are then normalized by subtracting the expected mean
-      and dividing by the standard deviation for each frequency bin.
-    - After normalization, SNPs are aggregated into windows centered on specified genomic positions.
-      The average values of the normalized statistics are calculated for each window.
-    - The window size determines how far upstream and downstream of the center position the SNPs
-      will be aggregated.
-
-    """
-    df_out = []
-    df_out_raw = []
-    _iter = np.unique([i.select("iter").unique() for i in snps_values.values()])
-
-    if len(center) == 2:
-        centers = np.arange(center[0], center[1] + step, step).astype(int)
-    else:
-        centers = center
-
-    df = reduce(
-        lambda left, right: left.join(
-            right,
-            on=["iter", "positions", "daf"],
-            # on=["iter", "center", "window", "positions", "daf"],
-            how="full",
-            coalesce=True,
-        ),
-        # [v for k, v in snps_values.items()],
-        [v for k, v in snps_values.items() if k != "h12_haf" and k != "neutral_stats"],
-    )
-    df_window = snps_values["h12_haf"].select(pl.exclude("positions"))
-    stats_names = df[:, 3:].columns
-    # stats_names = df[:, 5:].columns
-
-    binned_values = bin_values(df)
-    normalized_df, normalized_window = normalize_snps_statistics_full(
-        binned_values, df_window, bins, stats_names
-    )
-
-    df_out = cut_snps(
-        normalized_df,
-        centers,
-        windows,
-        stats_names,
-        fixed_center=None,
-        iter_value=_iter,
-    )
-    df_out_raw = cut_snps(
-        df,
-        centers,
-        windows,
-        stats_names,
-        fixed_center=None,
-        iter_value=_iter,
-    )
-    df_out = df_out.join(
-        normalized_window, on=["iter", "center", "window"], how="full", coalesce=True
-    )
-    df_out_raw = df_out_raw.join(
-        df_window, on=["iter", "center", "window"], how="full", coalesce=True
-    )
-
-    return df_out, df_out_raw
 
 
 def vectorized_cut_vcf(
@@ -2654,7 +2652,6 @@ def normalize_cut_raw(
     snps_values,
     bins,
     center=[5e5, 7e5],
-    # windows=[10000, 25000, 50000, 100000, 200000],
     windows=[50000, 100000, 200000, 500000, 1000000],
     step=int(1e4),
 ):
@@ -2925,72 +2922,6 @@ def normalize_snps_statistics(df_snps, bins, stats_names, norm_type=1):
     )
 
 
-def normalize_snps_statistics_full(df_snps, df_window, bins, stats_names):
-    """
-    Normalizes SNP-level statistics by comparing them to neutral expectations.
-
-    Parameters
-    ----------
-    df_snps : polars.DataFrame
-        DataFrame containing SNP-level statistics with binned frequency values.
-    binned_stats : dict or bins
-        Neutral and empirical statistics, either as a dictionary with 'neutral' and 'empirical'
-        keys (containing mean and std) or a bins object.
-    stats_names : list
-        List of statistical measure column names to normalize.
-
-    Returns
-    -------
-    polars.DataFrame
-        DataFrame with normalized statistics.
-    """
-    if not stats_names:
-        raise ValueError("stats_names cannot be empty")
-
-    neutral_means = bins.mean[0].select(["freq_bins"] + stats_names)
-    neutral_stds = bins.std[0].select(["freq_bins"] + stats_names)
-
-    normalized_df = (
-        df_snps.join(
-            neutral_means,
-            on="freq_bins",
-            how="left",
-            coalesce=True,
-            suffix="_mean_neutral",
-        )
-        .join(
-            neutral_stds,
-            on="freq_bins",
-            how="left",
-            coalesce=True,
-            suffix="_std_neutral",
-        )
-        .fill_nan(None)
-    )
-
-    # Normalize with empirical statistics (assumed provided elsewhere)
-    normalized_cols = [
-        ((pl.col(s) - pl.col(f"{s}_mean_neutral")) / pl.col(f"{s}_std_neutral")).alias(
-            s
-        )
-        for s in stats_names
-    ]
-    normalized_df = normalized_df.with_columns(normalized_cols).select(
-        ["positions"]
-        + stats_names
-        # ["positions", "center", "window"] + stats_names
-    )
-    df_window_normalized = pl.concat(
-        [
-            df_window[:, :3],
-            (df_window[:, 3:] - bins.mean[1][:, 2:]) / bins.std[1][:, 2:],
-        ],
-        how="horizontal",
-    )
-    # Perform normalization and return the final DataFrame
-    return (normalized_df, df_window_normalized)
-
-
 def cut_snps(df, centers, windows, stats_names, fixed_center=None, iter_value=1):
     """
     Processes data within windows across multiple centers and window sizes.
@@ -3026,6 +2957,8 @@ def cut_snps(df, centers, windows, stats_names, fixed_center=None, iter_value=1)
 
     if centers is None:
         centers = np.arange(5e5, 7e5 + 1e4, 1e4).astype(int)
+
+    centers = np.asarray(centers).astype(int)
 
     results = []
     for c, w in list(product(centers, windows)):
@@ -3198,189 +3131,6 @@ def normalize_neutral(df_stats_neutral, mask=False):
     return expected, stdev
 
 
-def normalize_neutral_full(d_stats_neutral, mask=False):
-    """
-    Calculates the expected mean and standard deviation of summary statistics
-    from neutral simulations, used for normalization in downstream analyses.
-
-    This function processes a DataFrame of neutral simulation statistics, bins the
-    values based on frequency, and computes the mean (expected) and standard deviation
-    for each bin. These statistics are used as a baseline to normalize sweep or neutral simulations
-
-    Parameters
-    ----------
-    df_stats_neutral : list or pandas.DataFrame
-        A list or concatenated pandas DataFrame containing the neutral simulation statistics.
-        The DataFrame should contain frequency data and various summary statistics,
-        including H12 and HAF, across multiple windows and bins.
-
-    Returns
-    -------
-    expected : pandas.DataFrame
-        A DataFrame containing the mean (expected) values of the summary statistics
-        for each frequency bin. The frequency bins are the index, and the columns
-        are the summary statistics.
-
-    stdev : pandas.DataFrame
-        A DataFrame containing the standard deviation of the summary statistics
-        for each frequency bin. The frequency bins are the index, and the columns
-        are the summary statistics.
-
-    Notes
-    -----
-    - The function first concatenates the neutral statistics, if provided as a list,
-      and bins the values by frequency using the `bin_values` function.
-    - It computes both the mean and standard deviation for each frequency bin, which
-      can later be used to normalize observed statistics (e.g., from sweeps).
-    - The summary statistics processed exclude window-specific statistics such as "h12" and "haf."
-
-    """
-    # df_snps, df_window = df_stats_neutral
-
-    if mask:
-        tmp = []
-        for df in df_stats:
-            centromeres = {
-                1: 125,
-                2: 93.3,
-                3: 91,
-                4: 50.4,
-                5: 48.4,
-                6: 61,
-                7: 59.9,
-                8: 45.6,
-                9: 49,
-                10: 40.2,
-                11: 53.7,
-                12: 35.8,
-                13: 17.9,
-                14: 17.6,
-                15: 19,
-                16: 36.6,
-                17: 24,
-                18: 17.2,
-                19: 26.5,
-                20: 27.5,
-                21: 13.2,
-                22: 14.7,
-            }
-            chr_l = {
-                1: 247.2,
-                2: 242.8,
-                3: 199.4,
-                4: 191.3,
-                5: 180.8,
-                6: 170.9,
-                7: 158.8,
-                8: 146.3,
-                9: 140.4,
-                10: 135.4,
-                11: 134.5,
-                12: 132.3,
-                13: 114.1,
-                14: 106.3,
-                15: 100.3,
-                16: 88.8,
-                17: 78.7,
-                18: 76.1,
-                19: 63.8,
-                20: 62.4,
-                21: 46.9,
-                22: 49.5,
-            }
-            nchr = df["iter"].unique().first()
-
-            centromer_window = (2.5e-6 - centromeres[nchr], centromeres[nchr] + 2.5e-6)
-            telomer_window = (2.5e-6, chr_l[nchr] - 2.5e-6)
-            pos = df["positions"].to_numpy()
-            centromer_mask = (pos < centromer_window[0]) & (pos > centromer_window[1])
-            telomer_mask = (pos > telomer_window[0]) & (pos < telomer_window[1])
-            mask = centromer_mask & telomer_mask
-
-            tmp.append(df.filter(mask))
-        tmp_neutral = pl.concat(tmp)
-    else:
-        snps_list, windows_list = zip(
-            *((d["snps"], d["windows"]) for d in d_stats_neutral)
-        )
-        tmp_neutral_snps = pl.concat(snps_list, how="vertical").fill_nan(None)
-        tmp_neutral_window = pl.concat(windows_list, how="vertical").fill_nan(None)
-
-    df_binned = bin_values(
-        tmp_neutral_snps.select(
-            pl.exclude(
-                [
-                    "h12",
-                    "haf",
-                    # "pi",
-                    "fay_wu_h",
-                    "omega_max",
-                    "zns",
-                    # "mu_var",
-                    # "mu_sfs",
-                    # "mu_ld",
-                    # "mu_total",
-                ]
-            )
-        )
-    )
-
-    df_window = tmp_neutral_window.select(
-        [
-            "center",
-            "window",
-            "h12",
-            "h2_h1",
-            "haf",
-            "pi",
-            "fay_wu_h",
-            "omega_max",
-            "zns",
-            "mu_var",
-            "mu_sfs",
-            "mu_ld",
-            "mu_total",
-            "tajima_d",
-            "achaz_y",
-            "zeng_e",
-            "fuli_d",
-            "fuli_f",
-        ]
-    ).drop_nulls()
-
-    df_window_mean = (
-        df_window.group_by("center", "window").mean().sort("center", "window")
-    )
-    df_window_std = (
-        df_window.group_by("center", "window").mean().sort("center", "window")
-    )
-    # get expected value (mean) and standard deviation
-    expected = (
-        df_binned.select(df_binned.columns[3:])
-        # df_binned.select(df_binned.columns[5:])
-        .group_by("freq_bins")
-        .mean()
-        .sort("freq_bins")
-        .fill_nan(None)
-    )
-    stdev = (
-        df_binned.select(df_binned.columns[3:])
-        # df_binned.select(df_binned.columns[5:])
-        .group_by("freq_bins")
-        .agg([pl.all().exclude("freq_bins").std()])
-        .sort("freq_bins")
-        .fill_nan(None)
-    )
-
-    # expected = expected.join(df_window_mean,on='freq_bins', how='full', coalesce=True)
-    # stdev = stdev.join(df_window_std,on='freq_bins', how='full', coalesce=True)
-
-    # expected.index = expected.index.astype(str)
-    # stdev.index = stdev.index.astype(str)
-
-    return ([expected, df_window_mean], [stdev, df_window_std])
-
-
 def bin_values(values, freq=0.02):
     """
     Bins allele frequency data into discrete frequency intervals (bins) for further analysis.
@@ -3427,6 +3177,639 @@ def bin_values(values, freq=0.02):
     )
 
     return values_copy.sort("iter", "positions")
+
+
+def normalize_stats_custom(
+    stats_values,
+    bins,
+    region=None,
+    center=[5e5, 7e5],
+    windows=[50000, 100000, 200000, 500000, 1000000],
+    step=1e4,
+    parallel_manager=None,
+    nthreads=1,
+    vcf=False,
+):
+    df_fv, df_fv_raw = normalization_raw_custom(
+        deepcopy(stats_values),
+        bins,
+        region=region,
+        center=center,
+        windows=windows,
+        step=step,
+        parallel_manager=parallel_manager,
+        nthreads=nthreads,
+        vcf=vcf,
+    )
+
+    df_fv_w = pivot_feature_vectors(df_fv, vcf=vcf)
+    df_fv_w_raw = pivot_feature_vectors(df_fv_raw, vcf=vcf)
+
+    # dump fvs with more than 10% nans
+    df_fv_w = df_fv_w.fill_nan(None)
+    num_nans = (
+        df_fv_w.select(
+            pl.exclude(["iter", "s", "t", "f_i", "f_t", "model", "^.*flip.*$"])
+        )
+        .transpose()
+        .null_count()
+        .to_numpy()
+        .flatten()
+    )
+    df_fv_w = df_fv_w.filter(
+        num_nans
+        < int(
+            df_fv_w.select(
+                pl.exclude(["iter", "s", "t", "f_i", "f_t", "model", "^.*flip.*$"])
+            ).shape[1]
+            * 0.1
+        )
+    ).fill_null(0)
+
+    if not vcf:
+        df_fv_w.sort(["iter", "model"])
+
+    df_fv_w_raw = df_fv_w_raw.fill_nan(None)
+
+    return df_fv_w, df_fv_w_raw
+
+
+def normalization_raw_custom(
+    stats_values,
+    bins,
+    region=None,
+    center=[5e5, 7e5],
+    step=1e4,
+    windows=[50000, 100000, 200000, 500000, 1000000],
+    vcf=False,
+    nthreads=1,
+    parallel_manager=None,
+):
+    """
+    Normalizes sweep statistics using neutral expectations or optionally using precomputed neutral normalized values.
+    The function applies normalization across different genomic windows and supports multi-threading.
+
+    Parameters
+    ----------
+    sweeps_stats : namedtuple
+        A Namedtuple containing the statistics for genomic sweeps and sweep parameters across
+        different genomic windows.
+
+    neutral_stats_norm : namedtuple
+        A Namedtuple containing the statistics for neutral region and neutral parameters across
+        different genomic windows, used as the baselinefor normalizing the sweep statistics.
+        This allows comparison of sweeps against neutral expectations.
+
+    norm_values : dict or None, optional (default=None)
+        A dictionary of precomputed neutral normalizated values. If provided, these values are
+        used to directly normalize the statistics. If None, the function computes
+        normalization values from the neutral statistics.
+
+    center : list of float, optional (default=[5e5, 7e5])
+        A list specifying the center positions (in base pairs) for the analysis windows.
+        If a single center value is provided, normalization is centered around that value.
+        Otherwise, it will calculate normalization for a range of positions between the two provided centers.
+
+    windows : list of int, optional (default=[50000, 100000, 200000, 500000, 1000000])
+        A list of window sizes (in base pairs) for which the normalization will be applied.
+        The function performs normalization for each of the specified window sizes.
+
+    nthreads : int, optional (default=1)
+        The number of threads to use for parallel processing. If set to 1, the function
+        runs in single-threaded mode. Higher values enable multi-threaded execution for
+        faster computation.
+
+    Returns
+    -------
+    normalized_stats : pandas.DataFrame
+        A DataFrame containing the normalized sweep statistics across the specified
+        windows and genomic regions. The sweep statistics are scaled relative to
+        neutral expectations.
+    """
+    df_stats, params = deepcopy(stats_values)
+
+    center = np.asarray(center).astype(int)
+    windows = np.asarray(windows).astype(int)
+    if vcf:
+        nchr = region[0].split(":")[0]
+        center_coords = [tuple(map(int, r.split(":")[-1].split("-"))) for r in region]
+        center_g = np.array([(a + b) // 2 for a, b in center_coords])
+
+        try:
+            df_window = df_stats.pop("window").fill_nan(None)
+        except:
+            df_window = None
+
+        try:
+            snps_genome = reduce(
+                lambda left, right: left.join(
+                    right,
+                    on=["iter", "positions", "daf"],
+                    how="full",
+                    coalesce=True,
+                ),
+                list(df_stats.values()),
+            ).sort(["iter", "positions"])
+
+            # Overwrite snps_values
+            # snps_genome = snps_genome.select(pl.exclude(["h12", "haf"]))
+            snps_values = snps_genome.select(pl.exclude(["h12", "haf"]))
+
+            stats_names = snps_values.select(snps_values.columns[3:]).columns
+
+            binned_values = bin_values(snps_values)
+
+        except:
+            stats_names = None
+            binned_values = None
+
+        normalized_df, normalized_window = normalize_snps_statistics_custom(
+            binned_values, df_window, bins, stats_names
+        )
+
+        try:
+            left_idxs = np.searchsorted(
+                normalized_df["positions"].to_numpy(), center_g - 6e5, side="left"
+            )
+            right_idxs = np.searchsorted(
+                normalized_df["positions"].to_numpy(), center_g + 6e5, side="right"
+            )
+            tmp_normalized = [
+                normalized_df.slice(start, end - start)
+                for start, end in zip(left_idxs, right_idxs)
+            ]
+            tmp_raw = [
+                binned_values.slice(start, end - start)
+                for start, end in zip(left_idxs, right_idxs)
+            ]
+
+            df_fv_n = pl.concat(
+                Parallel(n_jobs=nthreads, verbose=1)(
+                    delayed(cut_snps)(
+                        df,
+                        center,
+                        windows,
+                        stats_names,
+                        fixed_center=coord,
+                        iter_value=coord,
+                    )
+                    for df, coord in zip(tmp_normalized, center_g)
+                )
+            )
+            df_fv_n_raw = pl.concat(
+                Parallel(n_jobs=nthreads, verbose=1)(
+                    delayed(cut_snps)(
+                        df,
+                        center,
+                        windows,
+                        stats_names,
+                        fixed_center=coord,
+                        iter_value=coord,
+                    )
+                    for df, coord in zip(tmp_raw, center_g)
+                )
+            )
+
+            df_fv_n = df_fv_n.with_columns(
+                (
+                    f"{nchr}:"
+                    + (pl.col("iter") - 6e5 + 1).cast(int).cast(str)
+                    + "-"
+                    + (pl.col("iter") + 6e5).cast(int).cast(str)
+                ).alias("iter")
+            )
+            df_fv_n_raw = df_fv_n_raw.with_columns(
+                (
+                    f"{nchr}:"
+                    + (pl.col("iter") - 6e5 + 1).cast(int).cast(str)
+                    + "-"
+                    + (pl.col("iter") + 6e5).cast(int).cast(str)
+                ).alias("iter")
+            )
+        except:
+            df_fv_n = None
+            df_fv_n_raw = None
+
+        try:
+            df_fv_n = df_fv_n.join(
+                normalized_window,
+                on=["iter", "center", "window"],
+                how="full",
+                coalesce=True,
+            )
+            df_fv_n_raw = df_fv_n_raw.join(
+                df_window,
+                on=["iter", "center", "window"],
+                how="full",
+                coalesce=True,
+            )
+        except:
+            if df_fv_n is None:
+                df_fv_n = normalized_window
+                df_fv_n_raw = df_window
+            else:
+                next
+
+        df_params_unpack = pl.DataFrame(
+            np.repeat(
+                np.zeros((1, 4)),
+                df_fv_n.shape[0],
+                axis=0,
+            ),
+            schema=["s", "t", "f_i", "f_t"],
+        )
+
+    else:
+        if parallel_manager is None:
+            df_fv_n_l, df_fv_n_l_raw = zip(
+                *Parallel(n_jobs=nthreads, verbose=1)(
+                    delayed(normalize_cut_raw_custom)(
+                        snps_values, bins, center=center, windows=windows
+                    )
+                    for _iter, snps_values in enumerate(df_stats, 1)
+                )
+            )
+        else:
+            df_fv_n_l, df_fv_n_l_raw = zip(
+                *parallel_manager(
+                    delayed(normalize_cut_raw_custom)(
+                        snps_values, bins, center=center, windows=windows
+                    )
+                    for _iter, snps_values in enumerate(df_stats, 1)
+                )
+            )
+
+        df_fv_n = pl.concat(df_fv_n_l).with_columns(
+            pl.col(["iter", "window", "center"]).cast(pl.Int64)
+        )
+        df_fv_n_raw = pl.concat(df_fv_n_l_raw).with_columns(
+            pl.col(["iter", "window", "center"]).cast(pl.Int64)
+        )
+
+        # params = params[:, [0, 1, 3, 4, ]]
+        df_params_unpack = pl.DataFrame(
+            np.repeat(
+                params,
+                df_fv_n.select(["center", "window"])
+                .unique()
+                .sort(["center", "window"])
+                .shape[0],
+                axis=0,
+            ),
+            schema=["s", "t", "f_i", "f_t"],
+        )
+
+    df_fv_n = pl.concat(
+        [df_params_unpack, df_fv_n],
+        how="horizontal",
+    )
+    df_fv_n_raw = pl.concat(
+        [df_params_unpack, df_fv_n_raw],
+        how="horizontal",
+    )
+
+    force_order = ["iter"] + [col for col in df_fv_n.columns if col != "iter"]
+    df_fv_n = df_fv_n.select(force_order)
+    df_fv_n_raw = df_fv_n_raw.select(force_order)
+
+    return df_fv_n, df_fv_n_raw
+
+
+def normalize_cut_raw_custom(
+    snps_values,
+    bins,
+    center=[5e5, 7e5],
+    # windows=[10000, 25000, 50000, 100000, 200000],
+    windows=[50000, 100000, 200000, 500000, 1000000],
+    step=int(1e4),
+):
+    """
+    Normalizes SNP-level statistics by comparing them to neutral expectations, and aggregates
+    the statistics within sliding windows around specified genomic centers.
+
+    This function takes SNP statistics, normalizes them based on the expected mean and standard
+    deviation from neutral simulations, and computes the average values within windows
+    centered on specific genomic positions. It returns a DataFrame with the normalized values
+    for each window across the genome.
+
+    Parameters
+    ----------
+    _iter : int
+        The iteration or replicate number associated with the current set of SNP statistics.
+
+    snps_values : pandas.DataFrame
+        A DataFrame containing SNP-level statistics such as iHS, nSL, and iSAFE. The DataFrame
+        should contain derived allele frequencies ("daf") and other statistics to be normalized.
+
+    expected : pandas.DataFrame
+        A DataFrame containing the expected mean values of the SNP statistics for each frequency bin,
+        computed from neutral simulations.
+
+    stdev : pandas.DataFrame
+        A DataFrame containing the standard deviation of the SNP statistics for each frequency bin,
+        computed from neutral simulations.
+
+    center : list of float, optional (default=[5e5, 7e5])
+        A list specifying the center positions (in base pairs) for the analysis. Normalization is
+        performed around these genomic centers using the specified window sizes.
+
+    windows : list of int, optional (default=[50000, 100000, 200000, 500000, 1000000])
+        A list of window sizes (in base pairs) over which the SNP statistics will be aggregated
+        and normalized. The function performs normalization for each specified window size.
+
+    Returns
+    -------
+    out : pandas.DataFrame
+        A DataFrame containing the normalized SNP statistics for each genomic center and window.
+        The columns include the iteration number, center, window size, and the average values
+        of normalized statistics iSAFE within the window.
+
+    Notes
+    -----
+    - The function first bins the SNP statistics based on derived allele frequencies using the
+      `bin_values` function. The statistics are then normalized by subtracting the expected mean
+      and dividing by the standard deviation for each frequency bin.
+    - After normalization, SNPs are aggregated into windows centered on specified genomic positions.
+      The average values of the normalized statistics are calculated for each window.
+    - The window size determines how far upstream and downstream of the center position the SNPs
+      will be aggregated.
+
+    """
+    df_out = []
+    df_out_raw = []
+    _iter = np.unique([i.select("iter").unique() for i in snps_values.values()])
+
+    if len(center) == 2:
+        centers = np.arange(center[0], center[1] + step, step).astype(int)
+    else:
+        centers = center
+
+    try:
+        df = reduce(
+            lambda left, right: left.join(
+                right,
+                on=["iter", "positions", "daf"],
+                how="full",
+                coalesce=True,
+            ),
+            [v for k, v in snps_values.items() if k != "window"],
+        )
+        stats_names = df[:, 3:].columns
+        binned_values = bin_values(df)
+    except:
+        binned_values, stats_names = None, None
+
+    try:
+        df_window = snps_values["window"].select(pl.exclude("positions"))
+    except:
+        df_window = None
+
+    normalized_df, normalized_window = normalize_snps_statistics_custom(
+        binned_values, df_window, bins, stats_names
+    )
+
+    if normalized_df is not None and normalized_window is not None:
+        df_out = cut_snps(
+            normalized_df,
+            centers,
+            windows,
+            stats_names,
+            fixed_center=None,
+            iter_value=_iter,
+        )
+        df_out_raw = cut_snps(
+            df,
+            centers,
+            windows,
+            stats_names,
+            fixed_center=None,
+            iter_value=_iter,
+        )
+
+        df_out = df_out.join(
+            normalized_window,
+            on=["iter", "center", "window"],
+            how="full",
+            coalesce=True,
+        )
+        df_out_raw = df_out_raw.join(
+            df_window, on=["iter", "center", "window"], how="full", coalesce=True
+        )
+    elif normalized_df is not None and normalized_window is None:
+        df_out = cut_snps(
+            normalized_df,
+            centers,
+            windows,
+            stats_names,
+            fixed_center=None,
+            iter_value=_iter,
+        )
+        df_out_raw = cut_snps(
+            df,
+            centers,
+            windows,
+            stats_names,
+            fixed_center=None,
+            iter_value=_iter,
+        )
+    elif normalized_df is None and normalized_window is not None:
+        df_out = normalized_window
+        df_out_raw = df_window
+
+    return df_out, df_out_raw
+
+
+def normalize_snps_statistics_custom(df_snps, df_window, bins, stats_names):
+    """
+    Normalizes SNP-level statistics by comparing them to neutral expectations.
+
+    Parameters
+    ----------
+    df_snps : polars.DataFrame
+        DataFrame containing SNP-level statistics with binned frequency values.
+    binned_stats : dict or bins
+        Neutral and empirical statistics, either as a dictionary with 'neutral' and 'empirical'
+        keys (containing mean and std) or a bins object.
+    stats_names : list
+        List of statistical measure column names to normalize.
+
+    Returns
+    -------
+    polars.DataFrame
+        DataFrame with normalized statistics.
+    """
+    if df_snps is not None:
+        neutral_means = bins.mean[0].select(["freq_bins"] + stats_names)
+        neutral_stds = bins.std[0].select(["freq_bins"] + stats_names)
+
+        normalized_df = (
+            df_snps.join(
+                neutral_means,
+                on="freq_bins",
+                how="left",
+                coalesce=True,
+                suffix="_mean_neutral",
+            )
+            .join(
+                neutral_stds,
+                on="freq_bins",
+                how="left",
+                coalesce=True,
+                suffix="_std_neutral",
+            )
+            .fill_nan(None)
+        )
+
+        # Normalize with empirical statistics (assumed provided elsewhere)
+        normalized_cols = [
+            (
+                (pl.col(s) - pl.col(f"{s}_mean_neutral")) / pl.col(f"{s}_std_neutral")
+            ).alias(s)
+            for s in stats_names
+        ]
+        normalized_df = normalized_df.with_columns(normalized_cols).select(
+            ["positions"]
+            + stats_names
+            # ["positions", "center", "window"] + stats_names
+        )
+    else:
+        normalized_df = None
+
+    if df_window is not None:
+        # For VCF, df_window all windows, need to group by
+        if df_window.shape[0] > bins.mean[1].shape[0]:
+            stats_windowed = df_window.columns[3:]
+            df_window_normalized = (
+                df_window.join(
+                    bins.mean[1].select(pl.exclude("iter")),
+                    on=["center", "window"],
+                    how="left",
+                    suffix="_mean",
+                ).join(
+                    bins.std[1].select(pl.exclude("iter")),
+                    on=["center", "window"],
+                    how="left",
+                    suffix="_std",
+                )
+            ).with_columns(
+                [
+                    ((pl.col(c) - pl.col(f"{c}_mean")) / (pl.col(f"{c}_std"))).alias(
+                        f"{c}"
+                    )
+                    for c in stats_windowed
+                ]
+            )
+            df_window_normalized = df_window_normalized.select(
+                ["iter", "center", "window"] + stats_windowed
+            )
+        else:
+            df_window_normalized = pl.concat(
+                [
+                    df_window[:, :3],
+                    (df_window[:, 3:] - bins.mean[1][:, 3:]) / bins.std[1][:, 3:],
+                ],
+                how="horizontal",
+            )
+    else:
+        df_window_normalized = None
+    # Perform normalization and return the final DataFrame
+    return (normalized_df, df_window_normalized)
+
+
+def normalize_neutral_custom(d_stats_neutral, vcf=False):
+    """
+    Calculates the expected mean and standard deviation of summary statistics
+    from neutral simulations, used for normalization in downstream analyses.
+
+    This function processes a DataFrame of neutral simulation statistics, bins the
+    values based on frequency, and computes the mean (expected) and standard deviation
+    for each bin. These statistics are used as a baseline to normalize sweep or neutral simulations
+
+    Parameters
+    ----------
+    df_stats_neutral : list or pandas.DataFrame
+        A list or concatenated pandas DataFrame containing the neutral simulation statistics.
+        The DataFrame should contain frequency data and various summary statistics,
+        including H12 and HAF, across multiple windows and bins.
+
+    Returns
+    -------
+    expected : pandas.DataFrame
+        A DataFrame containing the mean (expected) values of the summary statistics
+        for each frequency bin. The frequency bins are the index, and the columns
+        are the summary statistics.
+
+    stdev : pandas.DataFrame
+        A DataFrame containing the standard deviation of the summary statistics
+        for each frequency bin. The frequency bins are the index, and the columns
+        are the summary statistics.
+
+    Notes
+    -----
+    - The function first concatenates the neutral statistics, if provided as a list,
+      and bins the values by frequency using the `bin_values` function.
+    - It computes both the mean and standard deviation for each frequency bin, which
+      can later be used to normalize observed statistics (e.g., from sweeps).
+    - The summary statistics processed exclude window-specific statistics such as "h12" and "haf."
+
+    """
+    # df_snps, df_window = df_stats_neutral
+
+    if vcf:
+        snps_list, windows_list = [], []
+        for d in d_stats_neutral:
+            snps_list.append(d["snps"])
+            windows_list.append(d["windows"])
+    else:
+        snps_list, windows_list = zip(
+            *((d["snps"], d["windows"]) for d in d_stats_neutral)
+        )
+
+    try:
+        tmp_neutral_snps = pl.concat(snps_list, how="vertical").fill_nan(None)
+
+        df_binned = bin_values(tmp_neutral_snps)
+
+        # get expected value (mean) and standard deviation
+        expected = (
+            df_binned.select(df_binned.columns[3:])
+            # df_binned.select(df_binned.columns[5:])
+            .group_by("freq_bins")
+            .mean()
+            .sort("freq_bins")
+            .fill_nan(None)
+        )
+        stdev = (
+            df_binned.select(df_binned.columns[3:])
+            # df_binned.select(df_binned.columns[5:])
+            .group_by("freq_bins")
+            .agg([pl.all().exclude("freq_bins").std()])
+            .sort("freq_bins")
+            .fill_nan(None)
+        )
+
+    except:
+        expected, stdev = None, None
+
+    try:
+        df_window = pl.concat(windows_list, how="vertical").fill_nan(None).drop_nulls()
+
+        df_window_mean = (
+            df_window.group_by(["center", "window"])
+            .agg(pl.all().mean())
+            .sort(["center", "window"])
+        )
+
+        df_window_std = (
+            df_window.group_by(["center", "window"])
+            .agg(pl.all().std())
+            .sort(["center", "window"])
+        )
+    except:
+        df_window_mean = None
+        df_window_std = None
+
+    return ([expected, df_window_mean], [stdev, df_window_std])
 
 
 ################## Haplotype length stats
@@ -3530,79 +3913,57 @@ def ihs_ihh(
     gap_scale=20000,
     max_gap=200000,
     is_accessible=None,
-    use_threads=True,
+    use_threads=False,
 ):
     """
-    Computes iHS (integrated Haplotype Score) and delta iHH (difference in integrated
-    haplotype homozygosity) for a given set of haplotypes and positions.
-    delta iHH represents the absolute difference in iHH between the
-    derived and ancestral alleles.
+    Compute iHS (integrated Haplotype Score) and delta iHH from haplotypes.
 
-    Parameters
-    ----------
-    h : numpy.ndarray
-        A 2D array of haplotypes where each row corresponds to a SNP (variant), and each
-        column corresponds to a haplotype for an individual. The entries are expected to
-        be binary (0 or 1), representing the ancestral and derived alleles.
+    The routine integrates EHH (extended haplotype homozygosity) on both sides
+    of each focal SNP to obtain iHH for ancestral and derived alleles, and then
+    reports iHS (log ratio) and the absolute difference in iHH (``delta_ihh``).
 
-    pos : numpy.ndarray
-        A 1D array of physical positions corresponding to the SNPs in `h`. The length
-        of `pos` should match the number of rows in `h`.
+    :param numpy.ndarray h:
+        Haplotype matrix of shape ``(n_snps, n_haplotypes)`` with 0/1 values,
+        where rows are SNPs and columns are haplotypes.
+    :param numpy.ndarray pos:
+        Physical positions for SNPs (length ``n_snps``). Used for gap handling
+        and, when ``map_pos`` is ``None``, for integration spacing.
+    :param numpy.ndarray map_pos:
+        Optional genetic map positions (same length as ``pos``). If provided,
+        integration uses these coordinates instead of ``pos``. Default ``None``.
+    :param float min_ehh:
+        Minimum EHH value to include in the integration. Default ``0.05``.
+    :param float min_maf:
+        Minimum minor-allele frequency required to compute iHS at a SNP.
+        Default ``0.05``.
+    :param bool include_edges:
+        If ``True``, permit edge SNPs to contribute even when EHH dips below
+        ``min_ehh``. Default ``False``.
+    :param int gap_scale:
+        Scaling used for gaps between consecutive SNPs when integrating over
+        physical distance (ignored if ``map_pos`` is provided). Default ``20000``.
+    :param int max_gap:
+        Maximum gap allowed when integrating; larger gaps are capped to
+        ``max_gap`` to avoid overweighting sparse regions. Default ``200000``.
+    :param numpy.ndarray is_accessible:
+        Optional boolean mask (length ``n_snps``) indicating accessible SNPs.
+        If ``None``, all SNPs are considered accessible. Default ``None``.
+    :param bool use_threads:
+        Enable threaded computation in downstream primitives when available.
+        Default ``False``.
 
-    map_pos : numpy.ndarray or None, optional (default=None)
-        A 1D array representing the genetic map positions (in centiMorgans or other genetic distance)
-        corresponding to the SNPs. If None, physical positions (`pos`) are used instead to compute
-        gaps between SNPs for EHH integration.
+    :returns:
+        Polars DataFrame with columns: ``positions`` (physical position),
+        ``daf`` (derived allele frequency), ``ihs`` (log iHH ratio), and
+        ``delta_ihh`` (absolute difference between derived and ancestral iHH).
+    :rtype: polars.DataFrame
 
-    min_ehh : float, optional (default=0.05)
-        The minimum EHH value required for integration. EHH values below this threshold are ignored
-        when calculating iHH.
+    :raises ValueError:
+        Propagated if inputs are inconsistent in length or malformed.
 
-    min_maf : float, optional (default=0.05)
-        The minimum minor allele frequency (MAF) required for computing iHS. Variants with lower MAF
-        are excluded from the analysis.
-
-    include_edges : bool, optional (default=False)
-        Whether to include SNPs at the edges of the haplotype array when calculating iHH. If False,
-        edge SNPs may be excluded if they don't meet the `min_ehh` threshold.
-
-    gap_scale : int, optional (default=20000)
-        The scaling factor for gaps between consecutive SNPs, used when computing iHH over physical
-        distances. If `map_pos` is provided, this scaling factor is not used.
-
-    max_gap : int, optional (default=200000)
-        The maximum allowed gap between SNPs when integrating EHH. Gaps larger than this are capped
-        to `max_gap` to avoid overly large contributions from distant SNPs.
-
-    is_accessible : numpy.ndarray or None, optional (default=None)
-        A boolean array of the same length as `pos`, indicating whether each SNP is in a genomic region
-        accessible for analysis (e.g., non-repetitive or non-masked regions). If None, all SNPs are
-        assumed to be accessible.
-
-    Returns
-    -------
-    df_ihs : pandas.DataFrame
-        A DataFrame containing the following columns:
-        - "positions": The physical positions of the SNPs.
-        - "daf": The derived allele frequency (DAF) at each SNP.
-        - "ihs": The iHS value for each SNP.
-        - "delta_ihh": The absolute difference in integrated haplotype homozygosity (iHH) between
-          the derived and ancestral alleles at each SNP.
-
-    Notes
-    -----
-    - The function first computes the iHH (integrated haplotype homozygosity) for both the forward
-      and reverse scans of the haplotypes. iHH represents the area under the EHH decay curve, which
-      measures the extent of haplotype homozygosity extending from the focal SNP.
-    - iHS is calculated as the natural logarithm of the ratio of iHH for the ancestral and derived
-      alleles at each SNP.
-    - SNPs with missing or invalid iHS values (e.g., due to low MAF) are removed from the output DataFrame.
-
-    Example Workflow:
-    - Compute iHH for forward and reverse directions using the haplotype data.
-    - Calculate iHS as `log(iHH_derived / iHH_ancestral)`.
-    - Calculate delta iHH as the absolute difference between the iHH values for derived and ancestral alleles.
-
+    .. note::
+       SNPs that fail the MAF threshold or have invalid iHS values are omitted
+       from the returned table.
     """
     # check inputs
     h = asarray_ndim(h, 2)
@@ -3682,48 +4043,43 @@ def ihs_ihh(
 
 def haf_top(hap, pos, cutoff=0.1, start=None, stop=None, window_size=None, n_snps=1001):
     """
-    Calculates the Haplotype Allele Frequency (HAF) for the top proportion of haplotypes,
-    which is a measure used to summarize haplotype diversity. The function computes the
-    HAF statistic for a filtered set of variants and returns the sum of the top `cutoff`
-    proportion of the HAF values.
+    Compute the upper-tail HAF (Haplotype Allele Frequency) summary in a region.
 
-    Parameters
-    ----------
-    hap : numpy.ndarray
-        A 2D array where each row represents a SNP (variant), and each column represents
-        a haplotype for an individual. The entries are expected to be binary (0 or 1),
-        indicating the presence of ancestral or derived alleles.
+    Rows of ``hap`` are SNPs, columns are haplotypes. HAF values are computed
+    per SNP from haplotypes, then restricted to the specified genomic region
+    (``start``/``stop`` or ``window_size``) if given. The HAF values are sorted
+    and the top portion after trimming by ``cutoff`` is summed.
 
-    pos : numpy.ndarray
-        A 1D array of physical positions corresponding to the SNPs in the `hap` matrix.
-        The length of `pos` should match the number of rows in `hap`.
+    :param numpy.ndarray hap:
+        Haplotype matrix of shape ``(n_snps, n_haplotypes)`` with 0/1 values.
+    :param numpy.ndarray pos:
+        Physical positions for SNPs (length ``n_snps``).
+    :param float cutoff:
+        Proportion used for tail trimming. For example, ``0.1`` trims the lowest
+        10% and the highest 10% before summing the remaining HAF values.
+        Default ``0.1``.
+    :param float start:
+        Optional region start position (inclusive). Default ``None``.
+    :param float stop:
+        Optional region end position (inclusive). Default ``None``.
+    :param int window_size:
+        Optional window size in base pairs centered by the caller’s convention.
+        If provided, it can be used to define the region when ``start``/``stop``
+        are not specified. Default ``None``.
+    :param int n_snps:
+        Optional limit on the number of SNPs considered by certain strategies
+        (implementation-dependent). Default ``1001``.
 
-    cutoff : float, optional (default=0.1)
-        The proportion of HAF values to exclude from the top and bottom when calculating the final HAF score.
-        For example, a `cutoff` of 0.1 excludes the lowest 10% and highest 10% of HAF values,
-        and the function returns the sum of the remaining HAF values.
+    :returns:
+        Upper-tail HAF summary as a single float after trimming by ``cutoff``.
+    :rtype: float
 
-    start : float or None, optional (default=None)
-        The starting physical position (in base pairs) for the genomic region of interest.
-        If provided, only SNPs at or after this position are included in the calculation.
+    :raises ValueError:
+        Propagated if inputs are malformed or if no SNPs fall within the region.
 
-    stop : float or None, optional (default=None)
-        The ending physical position (in base pairs) for the genomic region of interest.
-        If provided, only SNPs at or before this position are included in the calculation.
-
-    Returns
-    -------
-    haf_top : float
-        The sum of the top `cutoff` proportion of HAF values, which represents the
-        higher end of the haplotype diversity distribution within the specified region.
-
-    Notes
-    -----
-    - The function first filters the SNPs by the specified genomic region (using `start` and `stop`).
-    - HAF (Haplotype Allele Frequency) is computed by summing the pairwise dot product of
-      haplotypes and dividing by the total number of haplotypes.
-    - The HAF values are sorted, and the top proportion (based on the `cutoff`) is returned.
-
+    .. note::
+       If neither ``start``/``stop`` nor ``window_size`` is provided, the
+       computation uses all SNPs in ``hap``/``pos``.
     """
     if start is not None or stop is not None:
         loc = (pos >= start) & (pos <= stop)
@@ -3771,84 +4127,77 @@ def haf_top(hap, pos, cutoff=0.1, start=None, stop=None, window_size=None, n_snp
     return haf[idx_high:].sum()
 
 
-# def haf_top_jax(hap, pos, cutoff=0.1, start=None, stop=None, window_size=None):
-#     """
-#     Calculates the Haplotype Allele Frequency (HAF) for the top proportion of haplotypes,
-#     which is a measure used to summarize haplotype diversity. The function computes the
-#     HAF statistic for a filtered set of variants and returns the sum of the top `cutoff`
-#     proportion of the HAF values.
+@njit
+def garud_h_numba(h):
+    """
+    Compute Garud’s haplotype homozygosity statistics in Numba.
 
-#     Parameters
-#     ----------
-#     hap : numpy.ndarray
-#         A 2D array where each row represents a SNP (variant), and each column represents
-#         a haplotype for an individual. The entries are expected to be binary (0 or 1),
-#         indicating the presence of ancestral or derived alleles.
+    The input is a binary haplotype matrix with shape ``(L, n)``, where ``L`` is
+    the number of variant sites (rows) and ``n`` is the number of haplotypes
+    (columns). The function counts distinct haplotypes (columns), converts those
+    counts to frequencies :math:`p_i`, sorts them descending to obtain
+    :math:`p_1 \\ge p_2 \\ge p_3 \\ge \\dots`, and computes:
 
-#     pos : numpy.ndarray
-#         A 1D array of physical positions corresponding to the SNPs in the `hap` matrix.
-#         The length of `pos` should match the number of rows in `hap`.
+    - :math:`H1 = \\sum_i p_i^2`
+    - :math:`H12 = (p_1 + p_2)^2 + \\sum_{i\\ge 3} p_i^2`
+    - :math:`H123 = (p_1 + p_2 + p_3)^2 + \\sum_{i\\ge 4} p_i^2`
+    - :math:`H2/H1 = (H1 - p_1^2) / H1`
 
-#     cutoff : float, optional (default=0.1)
-#         The proportion of HAF values to exclude from the top and bottom when calculating the final HAF score.
-#         For example, a `cutoff` of 0.1 excludes the lowest 10% and highest 10% of HAF values,
-#         and the function returns the sum of the remaining HAF values.
+    :param numpy.ndarray h:
+        2D array of dtype ``uint8`` with values in ``{0, 1}`` and shape
+        ``(n_variants, n_haplotypes)``.
+    :returns:
+        Tuple ``(H12, H2_H1, H1, H123)`` as floats.
+    :rtype: tuple[float, float, float, float]
 
-#     start : float or None, optional (default=None)
-#         The starting physical position (in base pairs) for the genomic region of interest.
-#         If provided, only SNPs at or after this position are included in the calculation.
+    """
+    L, n = h.shape
 
-#     stop : float or None, optional (default=None)
-#         The ending physical position (in base pairs) for the genomic region of interest.
-#         If provided, only SNPs at or before this position are included in the calculation.
+    # 1) rolling uint64 hash to count distinct columns
+    counts = Dict.empty(key_type=uint64, value_type=int64)
+    for j in range(n):
+        hsh = np.uint64(146527)
+        for i in range(L):
+            hsh = (hsh * np.uint64(1000003)) ^ np.uint64(h[i, j])
+        counts[hsh] = counts.get(hsh, 0) + 1
 
-#     Returns
-#     -------
-#     haf_top : float
-#         The sum of the top `cutoff` proportion of HAF values, which represents the
-#         higher end of the haplotype diversity distribution within the specified region.
+    # 2) collect counts into an array
+    m = len(counts)
+    cnts = np.empty(m, np.int64)
+    idx = 0
+    for k in counts:
+        cnts[idx] = counts[k]
+        idx += 1
 
-#     Notes
-#     -----
-#     - The function first filters the SNPs by the specified genomic region (using `start` and `stop`).
-#     - HAF (Haplotype Allele Frequency) is computed by summing the pairwise dot product of
-#       haplotypes and dividing by the total number of haplotypes.
-#     - The HAF values are sorted, and the top proportion (based on the `cutoff`) is returned.
+    # 3) to frequencies & sort descending
+    freqs = cnts.astype(np.float64) / n
+    freqs = np.sort(freqs)[::-1]
 
-#     """
-#     if start is not None or stop is not None:
-#         loc = (pos >= start) & (pos <= stop)
-#         pos = pos[loc]
-#         hap = hap[loc, :]
-#     elif window_size is not None:
-#         loc = (pos >= (6e5 - window_size // 2)) & (pos <= (6e5 + window_size // 2))
-#         hap = hap[loc, :]
+    # 4) pad top‐3
+    p1 = freqs[0] if freqs.size > 0 else 0.0
+    p2 = freqs[1] if freqs.size > 1 else 0.0
+    p3 = freqs[2] if freqs.size > 2 else 0.0
 
-#     freqs = hap.sum(axis=1) / hap.shape[1]
-#     hap_tmp = hap[(freqs > 0) & (freqs < 1)]
-#     # haf_num = (np.dot(hap_tmp.T, hap_tmp) / hap.shape[1]).sum(axis=1)
-#     haf_num = (jax_dot(hap_tmp.T) / hap.shape[1]).sum(axis=1)
-#     haf_den = hap_tmp.sum(axis=0)
-#     # haf = np.sort(haf_num / haf_den)
+    # 5) compute H1, H12, H123, H2/H1
+    H1 = 0.0
+    for i in range(freqs.size):
+        H1 += freqs[i] * freqs[i]
 
-#     if 0 in haf_den:
-#         mask_zeros = haf_den != 0
-#         haf = np.full_like(haf_num, np.nan, dtype=np.float64)
-#         haf[mask_zeros] = haf_num[mask_zeros] / haf_den[mask_zeros]
-#         haf = jnp.sort(haf)
-#     else:
-#         haf = jnp.sort(haf_num / haf_den)
+    H12 = (p1 + p2) ** 2
+    for i in range(2, freqs.size):
+        H12 += freqs[i] * freqs[i]
 
-#     if cutoff <= 0 or cutoff >= 1:
-#         cutoff = 1
-#     idx_low = int(cutoff * haf.size)
-#     idx_high = int((1 - cutoff) * haf.size)
+    H123 = (p1 + p2 + p3) ** 2
+    for i in range(3, freqs.size):
+        H123 += freqs[i] * freqs[i]
 
-#     # 10% higher
-#     return haf[idx_high:].sum()
+    H2 = H1 - p1**2
+    H2_H1 = H2 / H1
+
+    return H12, H2_H1, H1, H123
 
 
-def h12_enard(hap, positions, focal_coord=600000, window_size=1200000):
+def h12_enard_og(hap, positions, focal_coord=600000, window_size=1200000):
     coords, haplos, true_coords, count_coords = process_hap_map(hap, positions)
 
     keep_haplo_freq = {}
@@ -4095,58 +4444,6 @@ def compare_haplos_optimized(haplo1, haplo2):
 
     total = identical + different
     return identical, different, total
-
-
-@njit
-def garud_h_numba(h):
-    """
-    Numba-accelerated Garud’s H-stats.
-    h: (n_variants, n_haplotypes) uint8 array of 0/1
-    """
-    L, n = h.shape
-
-    # 1) rolling uint64 hash to count distinct columns
-    counts = Dict.empty(key_type=uint64, value_type=int64)
-    for j in range(n):
-        hsh = np.uint64(146527)
-        for i in range(L):
-            hsh = (hsh * np.uint64(1000003)) ^ np.uint64(h[i, j])
-        counts[hsh] = counts.get(hsh, 0) + 1
-
-    # 2) collect counts into an array
-    m = len(counts)
-    cnts = np.empty(m, np.int64)
-    idx = 0
-    for k in counts:
-        cnts[idx] = counts[k]
-        idx += 1
-
-    # 3) to frequencies & sort descending
-    freqs = cnts.astype(np.float64) / n
-    freqs = np.sort(freqs)[::-1]
-
-    # 4) pad top‐3
-    p1 = freqs[0] if freqs.size > 0 else 0.0
-    p2 = freqs[1] if freqs.size > 1 else 0.0
-    p3 = freqs[2] if freqs.size > 2 else 0.0
-
-    # 5) compute H1, H12, H123, H2/H1
-    H1 = 0.0
-    for i in range(freqs.size):
-        H1 += freqs[i] * freqs[i]
-
-    H12 = (p1 + p2) ** 2
-    for i in range(2, freqs.size):
-        H12 += freqs[i] * freqs[i]
-
-    H123 = (p1 + p2 + p3) ** 2
-    for i in range(3, freqs.size):
-        H123 += freqs[i] * freqs[i]
-
-    H2 = H1 - p1**2
-    H2_H1 = H2 / H1
-
-    return H12, H2_H1, H1, H123
 
 
 @njit(cache=True)
@@ -4502,19 +4799,80 @@ def _argsort_by_count_then_lex(cnts, H, reprj):
 
 
 @njit(cache=True)
-def h12_enard_numba(
+def h12_enard(
     hap,
     positions,
     focal_coord=600000,
     n_snps=1001,
-    # window_size=500_000,
     min_derived_freq=0.05,
     similarity_threshold=0.8,
     top_k=10,
 ):
     """
-    Legacy-exact outputs with much lower overhead.
-    Returns: (H12, H2_H1, H2)
+    Estimate Garud's  ``H12, H2/H1, H1`` around a focal coordinate,
+    grouping haplotypes that are at least a given identity threshold (default 80%).
+
+    The method builds a count-based, symmetric SNP window centered at ``focal_coord``,
+    constructs a haplotype matrix ``H`` for the selected SNPs, collapses identical
+    haplotypes (columns), orders the unique haplotypes by frequency (descending) and
+    lexicographic order (ascending), selects a set of representative haplotypes, and
+    then **merges representatives into similarity groups** whenever the **column-wise
+    identity** meets or exceeds ``similarity_threshold`` (``0.8`` by default). Haplotype
+    group frequencies are then used to compute the H12 family of statistics.
+
+    Identity between two haplotype columns is defined as:
+
+    .. math::
+
+       \\text{identity} = \\frac{\\#(1,1)}{\\#(1,1) + \\#(1,0) + \\#(0,1)}
+
+    (i.e., matches on the derived allele over all non-equal-or-derived comparisons).
+
+    :param numpy.ndarray hap:
+        Haplotype matrix of shape ``(L_total, n)`` with 0/1 values (ancestral/derived).
+        Rows are SNPs; columns are haplotypes.
+    :param numpy.ndarray positions:
+        1D array (length ``L_total``) of genomic coordinates (``int64``) aligned to ``hap`` rows.
+    :param int focal_coord:
+        Genomic coordinate used to center the SNP window. Default ``600000``.
+    :param int n_snps:
+        Target number of SNPs for the window (the focal SNP, if present, is excluded from
+        the returned set). Default ``1001``.
+    :param float min_derived_freq:
+        Minimum derived-allele frequency required for a SNP to enter the window
+        (inclusive; upper bound is ``1.0``). Default ``0.05``.
+    :param float similarity_threshold:
+        Column similarity threshold for grouping haplotypes. Two representative columns
+        are merged if their identity fraction (formula above) is **≥ this value**.
+        Default ``0.8`` (80% identity).
+    :param int top_k:
+        Limit controlling how many unique-haplotype representatives are considered before
+        grouping. Default ``10``.
+
+    :returns:
+        Tuple ``(H12, H2_H1, H2)`` as floats. If no usable SNPs or groups are found,
+        returns ``(0.0, 0.0, 0.0)``.
+    :rtype: tuple[float, float, float]
+
+    .. math::
+
+       H1 = \\sum_g p_g^2,\\qquad
+       H12 = (p_1 + p_2)^2,\\qquad
+       H2 = H1 - p_1^2,\\qquad
+       \\frac{H2}{H1} = \\begin{cases}
+           (H1 - p_1^2)/H1, & H1 \\ne 0,\\\\
+           0, & H1 = 0~.
+       \\end{cases}
+
+    Notes
+    -----
+    - The SNP window is built by balancing sites to the left and right of ``focal_coord``
+      by proximity, after applying the derived-frequency filter ``[min_derived_freq, 1.0]``,
+      and excluding the focal position itself.
+    - Unique haplotypes are detected via hashing of ``H`` columns; sample-to-group
+      frequencies :math:`p_g` are computed after the identity-based grouping step.
+    - The default behavior corresponds to **H12 with 80% identity grouping** in the
+      haplotype matrix, which can increase robustness by merging highly similar haplotypes.
     """
 
     L_total, n = hap.shape
@@ -4900,10 +5258,58 @@ def fast_sq_freq_pairs(
     rec_map,
     min_focal_freq=0.25,
     max_focal_freq=0.95,
-    window_size=300000,
-    genetic_distance=False,
+    window_size=50000,
+    # genetic_distance=False,
 ):
-    """Optimized version that also returns SNP indices"""
+    """
+    Compute per-focal-SNP frequency-pair summaries within a sliding window.
+
+    For each focal SNP whose derived allele frequency is within
+    ``[min_focal_freq, max_focal_freq]``, the function scans neighboring SNPs
+    within ``window_size`` centered at the focal SNP physical coordinate , and computes:
+
+    * ``f_d``: frequency of the neighbor SNP among haplotypes carrying the
+      **derived** allele at the focal SNP.
+    * ``f_a``: frequency of the neighbor SNP among haplotypes carrying the
+      **ancestral** allele at the focal SNP.
+    * ``f_tot``: total derived allele frequency of the neighbor SNP.
+
+    :param numpy.ndarray hap:
+        Haplotype matrix of shape ``(n_snps, n_samples)`` with values in ``{0, 1}``
+        (dtype compatible with Numba arithmetic).
+    :param numpy.ndarray ac:
+        Allele counts of shape ``(n_snps, 2)`` where column 0 is ancestral count
+        and column 1 is derived count.
+    :param numpy.ndarray rec_map:
+        Mapping array whose penultimate column is used as the coordinate for
+        windowing (e.g., genetic or physical position). Must have at least two
+        trailing numeric columns.
+    :param float min_focal_freq:
+        Minimum derived allele frequency for a SNP to be considered focal.
+        Default is ``0.25``.
+    :param float max_focal_freq:
+        Maximum derived allele frequency for a SNP to be considered focal.
+        Default is ``0.95``.
+    :param int window_size:
+        Window size (same units as ``rec_map[:, -2]``). Default is ``50000``.
+
+    :returns:
+        A tuple of three elements contaning all the information needed to run DIND,
+        hapDAF-o/s, Sratio, highfreq and lowfreq:
+
+        - ``sq_out_list``: list of length ``n_focal``; each element is a
+          ``(k, 3)`` float array with columns ``[f_d, f_a, f_tot]`` for the
+          neighbors of that focal SNP.
+        - ``info``: ``(n_focal, 4)`` float array with columns
+          ``[position, daf_focal, focal_derived_count, focal_ancestral_count]``,
+          where ``position`` is physical postion from `rec_map[focal_idx, -2]`` and
+          ``daf_focal`` is derived allele frequency at the focal SNP.
+        - ``snp_indices_list``: list of length ``n_focal``; each element is a
+          1D int array of neighbor SNP indices aligned with the corresponding
+          rows in ``sq_out_list[j]``.
+
+    :rtype: tuple[list[numpy.ndarray], numpy.ndarray, list[numpy.ndarray]]
+    """
 
     # Direct calculations - no intermediate arrays
     n_snps, n_samples = hap.shape
@@ -4917,7 +5323,11 @@ def fast_sq_freq_pairs(
         freqs[i] = derived_count[i] / total_count[i]
 
     # Get positions directly
-    rec_pos = rec_map[:, -2] if genetic_distance else rec_map[:, -1]
+    # Stuck if rec_pos is physical position, need to checked with genetic position
+    # if genetic_distance is False:
+    # rec_pos = rec_map[:, -2]
+
+    rec_pos = rec_map[:, -2]
     half_window = window_size * 0.5
 
     # Find focal SNPs without creating boolean mask
@@ -4964,7 +5374,7 @@ def fast_sq_freq_pairs(
         if total_len == 0:
             sq_out_list[j] = np.empty((0, 3), dtype=np.float64)
             snp_indices_list[j] = np.empty(0, dtype=np.int64)
-            info[j, 0] = rec_map[focal_idx, -1]
+            info[j, 0] = rec_map[focal_idx, -2]
             info[j, 1] = freqs[focal_idx]
             continue
 
@@ -5026,7 +5436,7 @@ def fast_sq_freq_pairs(
         # info[j] = freqs[focal_idx]
         info[j] = np.array(
             [
-                rec_map[focal_idx, -1],
+                rec_map[focal_idx, -2],
                 freqs[focal_idx],
                 float64(focal_d_count),
                 float64(focal_a_count),
@@ -5043,11 +5453,32 @@ def s_ratio(
     min_tot_freq=0,
     min_focal_freq=0.25,
     max_focal_freq=0.95,
-    window_size=300000,
+    window_size=50000,
     genetic_distance=False,
 ):
+    """
+    Compute the S-ratio statistic for each focal SNP.
+
+    For each focal SNP (derived frequency in ``[min_focal_freq, max_focal_freq]``),
+    neighbors within ``window_size`` are summarized by indicators of intermediate
+    frequency on the derived and ancestral partitions, and the ratio of their
+    counts is reported.
+
+    :param numpy.ndarray hap: Haplotype matrix ``(n_snps, n_samples)`` with 0/1 values.
+    :param numpy.ndarray ac: Allele counts ``(n_snps, 2)`` as ``[ancestral, derived]``.
+    :param numpy.ndarray rec_map: Map array; penultimate column is the window coordinate.
+    :param float max_ancest_freq: Maximum ancestral-partition frequency threshold. Default ``1``.
+    :param float min_tot_freq: Minimum neighbor total derived frequency. Default ``0``.
+    :param float min_focal_freq: Minimum focal derived frequency. Default ``0.25``.
+    :param float max_focal_freq: Maximum focal derived frequency. Default ``0.95``.
+    :param int window_size: Window size in coordinate units of ``rec_map[:, -2]``. Default ``50000``.
+    :param bool genetic_distance: Unused here (kept for API symmetry).
+
+    :returns: DataFrame with columns ``positions``, ``daf``, ``s_ratio``.
+    :rtype: polars.DataFrame
+    """
     sq_freqs, info, snps_indices = fast_sq_freq_pairs(
-        hap, ac, rec_map, min_focal_freq, max_focal_freq, window_size, genetic_distance
+        hap, ac, rec_map, min_focal_freq, max_focal_freq, window_size
     )
 
     n_rows = len(sq_freqs)
@@ -5098,11 +5529,30 @@ def hapdaf_o(
     min_tot_freq=0.25,
     min_focal_freq=0.25,
     max_focal_freq=0.95,
-    window_size=300000,
+    window_size=50000,
     genetic_distance=False,
 ):
+    """
+    Compute hapDAF-o for each focal SNP.
+
+    hapDAF-o averages ``f_d^2 - f_a^2`` over neighbors that satisfy
+    ``(f_d > f_a) & (f_a <= max_ancest_freq) & (f_tot >= min_tot_freq)``.
+
+    :param numpy.ndarray hap: Haplotype matrix ``(n_snps, n_samples)`` with 0/1 values.
+    :param numpy.ndarray ac: Allele counts ``(n_snps, 2)`` as ``[ancestral, derived]``.
+    :param numpy.ndarray rec_map: Map array; penultimate column is the window coordinate.
+    :param float max_ancest_freq: Ancestral partition frequency threshold. Default ``0.25``.
+    :param float min_tot_freq: Minimum neighbor total derived frequency. Default ``0.25``.
+    :param float min_focal_freq: Minimum focal derived frequency. Default ``0.25``.
+    :param float max_focal_freq: Maximum focal derived frequency. Default ``0.95``.
+    :param int window_size: Window size in coordinate units of ``rec_map[:, -2]``. Default ``50000``.
+    :param bool genetic_distance: Unused here (kept for API symmetry).
+
+    :returns: DataFrame with columns ``positions``, ``daf``, ``hapdaf_o``.
+    :rtype: polars.DataFrame
+    """
     sq_freqs, info, snps_indices = fast_sq_freq_pairs(
-        hap, ac, rec_map, min_focal_freq, max_focal_freq, window_size, genetic_distance
+        hap, ac, rec_map, min_focal_freq, max_focal_freq, window_size
     )
 
     n_rows = len(sq_freqs)
@@ -5173,11 +5623,30 @@ def hapdaf_s(
     min_tot_freq=0.1,
     min_focal_freq=0.25,
     max_focal_freq=0.95,
-    window_size=300000,
+    window_size=50000,
     genetic_distance=False,
 ):
+    """
+    Compute hapDAF-s for each focal SNP.
+
+    hapDAF-s is the same construction as hapDAF-o but uses more stringent
+    thresholds (e.g., smaller ``max_ancest_freq`` and ``min_tot_freq``).
+
+    :param numpy.ndarray hap: Haplotype matrix ``(n_snps, n_samples)`` with 0/1 values.
+    :param numpy.ndarray ac: Allele counts ``(n_snps, 2)`` as ``[ancestral, derived]``.
+    :param numpy.ndarray rec_map: Map array; penultimate column is the window coordinate.
+    :param float max_ancest_freq: Ancestral partition frequency threshold. Default ``0.1``.
+    :param float min_tot_freq: Minimum neighbor total derived frequency. Default ``0.1``.
+    :param float min_focal_freq: Minimum focal derived frequency. Default ``0.25``.
+    :param float max_focal_freq: Maximum focal derived frequency. Default ``0.95``.
+    :param int window_size: Window size in coordinate units of ``rec_map[:, -2]``. Default ``50000``.
+    :param bool genetic_distance: Unused here (kept for API symmetry).
+
+    :returns: DataFrame with columns ``positions``, ``daf``, ``hapdaf_s``.
+    :rtype: polars.DataFrame
+    """
     sq_freqs, info, snps_indices = fast_sq_freq_pairs(
-        hap, ac, rec_map, min_focal_freq, max_focal_freq, window_size, genetic_distance
+        hap, ac, rec_map, min_focal_freq, max_focal_freq, window_size
     )
 
     n_rows = len(sq_freqs)
@@ -5248,12 +5717,30 @@ def dind_high_low(
     min_tot_freq=0,
     min_focal_freq=0.25,
     max_focal_freq=0.95,
-    window_size=300000,
+    window_size=50000,
     genetic_distance=False,
 ):
-    # Extract frequency pairs and info array
+    """
+    Compute DIND, highfreq, and lowfreq statistics per focal SNP.
+
+    :param numpy.ndarray hap: Haplotype matrix ``(n_snps, n_samples)`` with 0/1 values.
+    :param numpy.ndarray ac: Allele counts ``(n_snps, 2)`` as ``[ancestral, derived]``.
+    :param numpy.ndarray rec_map: Map array; penultimate column is the window coordinate.
+    :param float max_ancest_freq: Threshold used in high/low frequency components. Default ``0.25``.
+    :param float min_tot_freq: Unused here (kept for API symmetry). Default ``0``.
+    :param float min_focal_freq: Minimum focal derived frequency. Default ``0.25``.
+    :param float max_focal_freq: Maximum focal derived frequency. Default ``0.95``.
+    :param int window_size: Window size in coordinate physical units from ``rec_map[:, -2]``. Default ``50000``.
+    :param bool genetic_distance: Unused here (kept for API symmetry).
+
+    :returns:
+        DataFrame with columns ``positions``, ``daf``, ``dind``, ``high_freq``,
+        ``low_freq``.
+    :rtype: polars.DataFrame
+    """
+
     sq_freqs, info, snps_indices = fast_sq_freq_pairs(
-        hap, ac, rec_map, min_focal_freq, max_focal_freq, window_size, genetic_distance
+        hap, ac, rec_map, min_focal_freq, max_focal_freq, window_size
     )
 
     focal_counts = info[:, 2:]
@@ -5343,8 +5830,26 @@ def run_fs_stats(
     min_focal_freq=0.25,
     max_focal_freq=0.95,
     window_size=50000,
-    genetic_distance=False,
+    # genetic_distance=False,
 ):
+    """
+
+    Wrapper to extracts per-focal-SNP neighbor pairs via
+    :func:`fast_sq_freq_pairs`, then estimate DIND, hapDAF-o/s, Sratio, highfreq and lowfreq
+    statistics. Results are returned as four Polars DataFrames.
+
+    :param numpy.ndarray hap: Haplotype matrix ``(n_snps, n_samples)`` with 0/1 values.
+    :param numpy.ndarray ac: Allele counts ``(n_snps, 2)`` as ``[ancestral, derived]``.
+    :param numpy.ndarray rec_map: Map array; penultimate column is the window coordinate.
+    :param float min_focal_freq: Minimum focal derived frequency. Default ``0.25``.
+    :param float max_focal_freq: Maximum focal derived frequency. Default ``0.95``.
+    :param int window_size: Window size in coordinate physicial units extracted from ``rec_map[:, -2]``. Default ``50000``.
+
+    :returns:
+        Four DataFrames in order: ``df_dind_high_low``, ``df_s_ratio``,
+        ``df_hapdaf_s``, ``df_hapdaf_o``.
+    :rtype: tuple[polars.DataFrame, polars.DataFrame, polars.DataFrame, polars.DataFrame]
+    """
     sq_freqs, info, snps_indices = fast_sq_freq_pairs(
         hap,
         ac,
@@ -5352,7 +5857,7 @@ def run_fs_stats(
         min_focal_freq=min_focal_freq,
         max_focal_freq=max_focal_freq,
         window_size=window_size,
-        genetic_distance=genetic_distance,
+        # genetic_distance=genetic_distance,
     )
 
     if info.shape[0] == 0:
@@ -5882,26 +6387,50 @@ def run_isafe(
     max_rank=15,
 ):
     """
-    Estimate iSAFE or SAFE when not possible using default Flex-Sweep values.
+    Estimate iSAFE or SAFE on a genomic region following Flex-sweep default values.
 
-    Args:
-     hap (TYPE): Description
-     total_window_size (TYPE): Description
-     positions (TYPE): Description
-     max_freq (int, optional): Description
-     min_region_size_bp (int, optional): Description
-     min_region_size_ps (int, optional): Description
-     ignore_gaps (bool, optional): Description
-     window (int, optional): Description
-     step (int, optional): Description
-     top_k (int, optional): Description
-     max_rank (int, optional): Description
+    The function removes monomorphic SNPs, then checks region size. If
+    ``num_snps <= min_region_size_ps`` or ``positions.max() - positions.min() < min_region_size_bp``,
+    it computes **SAFE**; otherwise it computes **iSAFE** using the provided sliding-window
+    settings. Results are returned as a Polars DataFrame with columns ``positions`` (bp),
+    ``daf`` (derived allele frequency), and ``isafe`` (score). Variants with
+    ``daf >= max_freq`` are filtered out.
 
-    Returns:
-     TYPE: Description
+    :param numpy.ndarray hap:
+        Haplotype matrix of shape ``(n_snps, n_haplotypes)`` with 0/1 values
+        (ancestral/derived).
+    :param numpy.ndarray positions:
+        1D array of physical coordinates (length ``n_snps``) aligned to ``hap`` rows.
+    :param float max_freq:
+        Maximum allowed derived allele frequency in the output (``daf < max_freq``).
+        Default ``1`` (no filter).
+    :param int min_region_size_bp:
+        Minimum region span in base pairs required to run iSAFE. Default ``49000``.
+    :param int min_region_size_ps:
+        Minimum number of polymorphic SNPs required to run iSAFE. Default ``300``.
+    :param bool ignore_gaps:
+        Reserved for gap handling; currently not used. Default ``True``.
+    :param int window:
+        iSAFE sliding window size (number of SNPs or bp, depending on the
+        downstream implementation). Default ``300``.
+    :param int step:
+        iSAFE step between windows. Default ``150``.
+    :param int top_k:
+        iSAFE parameter controlling the number of top candidates per window.
+        Default ``1``.
+    :param int max_rank:
+        iSAFE parameter controlling the maximum rank to track. Default ``15``.
 
-    Raises:
-     ValueError: Description
+    :returns:
+        Polars DataFrame with columns ``positions`` (int), ``daf`` (float),
+        and ``isafe`` (float), sorted by position and filtered to ``daf < max_freq``.
+        If the region is small, the ``isafe`` column contains SAFE scores.
+    :rtype: polars.DataFrame
+
+    .. note::
+       Monomorphic sites are removed using ``(1 - f) * f > 0``, where ``f`` is the
+       derived allele frequency per SNP. When computing iSAFE, the function passes
+       ``window``, ``step``, ``top_k``, and ``max_rank`` to the underlying implementation.
     """
 
     total_window_size = positions.max() - positions.min()
@@ -6091,18 +6620,34 @@ def get_top_k_snps_in_each_window(df_snps, k=1):
 
 def Ld(r_2, mask=None) -> tuple:
     """
-    Compute Kelly Zns statistic (1997) and omega_max. Average r2
-    among every pair of loci in the genomic window.
+    Compute **Kelly's ZnS** (mean pairwise :math:`r^2`) and **omega\\_max** from an LD matrix.
 
-    Args:hap (numpy.ndarray): 2D array representing haplotype data. Rows correspond to different mutations, and columnscorrespond to chromosomes.
-    pos (numpy.ndarray): 1D array representing the positions of mutations.
-    min_freq (float, optional): Minimum frequency threshold. Default is 0.05.
-    max_freq (float, optional): Maximum frequency threshold. Default is 1.
-    window (int, optional): Genomic window size. Default is 500000.
+    The input ``r_2`` is a square matrix of pairwise linkage disequilibrium
+    values :math:`r^2` among SNPs within a window. If ``mask`` is provided,
+    the computation is restricted to the subset of indices where ``mask`` is
+    ``True``.
 
-    Returns:tuple: A tuple containing two values:
-    - kelly_zns (float): Kelly Zns statistic.
-    - omega_max (float): Nielsen omega max.
+    ZnS is defined as:
+
+    .. math::
+
+       \\mathrm{ZnS} = \\frac{\\sum_{i<j} r^2_{ij}}{\\binom{S}{2}},
+
+    where :math:`S` is the number of SNPs after masking.
+
+    The function also returns ``omega_max`` (Kim & Nielsen, 2004), computed via
+    :func:`omega_linear_correct_mask`, which scans split points and compares the
+    average LD within versus between the two partitions.
+
+    :param numpy.ndarray r_2:
+        Square matrix (``S`` × ``S``) of pairwise :math:`r^2` values. The routine
+        treats it as symmetric; values on and below the diagonal are ignored for ZnS.
+    :param numpy.ndarray mask:
+        Optional boolean vector of length ``S`` to select a subset of SNPs. Default ``None``.
+
+    :returns:
+        Tuple ``(zns, omega_max)`` as floats.
+    :rtype: tuple[float, float]
     """
 
     # r2_matrix = r2_torch(hap_filter)
@@ -6113,7 +6658,8 @@ def Ld(r_2, mask=None) -> tuple:
         _r_2 = r_2
 
     S = _r_2.shape[0]
-    zns = _r_2.sum() / comb(S, 2)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        zns = _r_2.sum() / comb(S, 2)
     # Index combination to iter
     omega_max = omega_linear_correct_mask(np.asarray(_r_2))
 
@@ -6121,43 +6667,34 @@ def Ld(r_2, mask=None) -> tuple:
     return zns, omega_max
 
 
-# def Ld_jax(r_2) -> tuple:
-#     """
-#     Compute Kelly Zns statistic (1997) and omega_max. Average r2
-#     among every pair of loci in the genomic window.
-
-#     Args:hap (numpy.ndarray): 2D array representing haplotype data. Rows correspond to different mutations, and columnscorrespond to chromosomes.
-#     pos (numpy.ndarray): 1D array representing the positions of mutations.
-#     min_freq (float, optional): Minimum frequency threshold. Default is 0.05.
-#     max_freq (float, optional): Maximum frequency threshold. Default is 1.
-#     window (int, optional): Genomic window size. Default is 500000.
-
-#     Returns:tuple: A tuple containing two values:
-#     - kelly_zns (float): Kelly Zns statistic.
-#     - omega_max (float): Nielsen omega max.
-#     """
-
-#     # r2_matrix = r2_torch(hap_filter)
-
-#     S = r_2.shape[0]
-#     zns = r_2.sum() / comb(S, 2)
-#     # Index combination to iter
-#     omega_max = omega_linear_correct_jax(r_2)
-
-#     # return zns, 0
-#     return zns, omega_max
-
-
 @njit("float64(int8[:], int8[:])", parallel=False)
 def r2(locus_A: np.ndarray, locus_B: np.ndarray) -> float:
     """
-    Calculate r^2 and D between the two loci A and B.
+    Compute the squared correlation coefficient :math:`r^2` between two biallelic loci.
 
-    Args: locus_A (numpy.ndarray): 1D array representing alleles at locus A.
-    locus_B (numpy.ndarray): 1D array representing alleles at locus B.
+    Given two 0/1 vectors of equal length (haplotypes across samples), this function
+    computes:
 
-    Returns:
-        float: r^2 value.
+    .. math::
+
+       D = P_{11} - p_A p_B,\\quad
+       r^2 = \\frac{D^2}{p_A (1-p_A)\\, p_B (1-p_B)},
+
+    where :math:`p_A` and :math:`p_B` are the allele-1 frequencies at loci A and B,
+    and :math:`P_{11}` is the empirical joint frequency that both loci equal 1.
+
+    :param numpy.ndarray locus_A:
+        1D array of 0/1 alleles for locus A (dtype ``int8`` expected by Numba signature).
+    :param numpy.ndarray locus_B:
+        1D array of 0/1 alleles for locus B (same length and dtype as ``locus_A``).
+
+    :returns:
+        The :math:`r^2` value as a float.
+    :rtype: float
+
+    .. note::
+       If either locus is monomorphic (denominator zero), the result may be ``inf`` or
+       ``nan`` depending on arithmetic; callers typically filter such sites beforehand.
     """
     n = locus_A.size
     # Frequency of allele 1 in locus A and locus B
@@ -6236,6 +6773,28 @@ def compute_r2_matrix_upper_og(hap):
 
 @njit(parallel=False)
 def compute_r2_matrix_upper(hap):
+    """
+    Compute pairwise LD :math:`r^2` for all SNP pairs and return the strict upper triangle.
+
+    The input is a biallelic haplotype matrix with rows as SNPs and columns as haplotypes.
+    For SNPs :math:`i` and :math:`j`, the statistic is:
+
+    .. math::
+
+       r^2_{ij} = \\frac{\\left(P_{ij} - p_i p_j\\right)^2}{p_i(1-p_i)\\,p_j(1-p_j)},
+
+    where :math:`p_i` is the allele-1 frequency at SNP :math:`i` and
+    :math:`P_{ij}` is the joint frequency of both SNPs being 1 across samples.
+
+    :param numpy.ndarray hap:
+        Integer matrix of shape ``(S, N)`` with values in ``{0,1}`` (SNPs × haplotypes).
+        Dtype may be ``int8``/``bool``; the computation is performed in ``float64``.
+
+    :returns:
+        A ``(S, S)`` float64 matrix whose **upper triangle** (``i < j``) contains the
+        :math:`r^2` values and zeros elsewhere (diagonal and lower triangle are zero).
+    :rtype: numpy.ndarray
+    """
     S, N = hap.shape
     X = hap.astype(np.float64)
 
@@ -6269,11 +6828,49 @@ def compute_r2_matrix_upper(hap):
 @njit(parallel=False)
 def omega_linear_correct(r2_matrix):
     """
-    Compute omega_max with:
-      - O(n^2) to build row_sum & col_sum
-      - O(n) to sweep over cutpoints _l with no inner loops
-    Only reads r2_matrix[i,j] for i<j.
+    Compute :math:`\\omega_\\text{max}` (Kim & Nielsen, 2004) from an :math:`r^2` matrix.
+
+    The statistic compares the average LD within two partitions (left/right of a split)
+    to the average LD between the partitions. For a split index :math:`\\ell` on a
+    sequence of length :math:`S`, define:
+
+    .. math::
+
+       \\begin{aligned}
+       &\\text{within-left}   &&= \\sum_{0 \\le i < j < \\ell} r^2_{ij},\\\\
+       &\\text{within-right}  &&= \\sum_{\\ell \\le i < j < S} r^2_{ij},\\\\
+       &\\text{between}       &&= \\sum_{0 \\le i < \\ell} \\sum_{\\ell \\le j < S} r^2_{ij},
+       \\end{aligned}
+
+    and the means are obtained by dividing by the corresponding pair counts
+    :math:`\\binom{\\ell}{2}`, :math:`\\binom{S-\\ell}{2}`, and :math:`\\ell(S-\\ell)`.
+    The omega score at :math:`\\ell` is:
+
+    .. math::
+
+       \\omega(\\ell) = \\frac{\\dfrac{\\text{within-left}}{\\binom{\\ell}{2}}
+                          + \\dfrac{\\text{within-right}}{\\binom{S-\\ell}{2}}}
+                         {\\dfrac{\\text{between}}{\\ell(S-\\ell)}}.
+
+    This function scans admissible :math:`\\ell` and returns the maximum value.
+
+    :param numpy.ndarray _r2:
+        Square matrix (``S`` × ``S``) of pairwise :math:`r^2` values. Only the
+        upper triangle (``i < j``) is required to hold valid values.
+    :param numpy.ndarray mask:
+        Optional boolean vector selecting a subset of SNP indices to consider.
+        Default ``None`` (use all SNPs).
+
+    :returns:
+        The maximum omega value over all candidate split points.
+    :rtype: float
+
+    :notes:
+        - The implementation is :math:`O(S^2)` using prefix/suffix aggregates for the
+          within-left and within-right sums, avoiding recomputation per split.
+        - Very small windows (``S < 3`` after masking) return ``0.0``.
     """
+
     S = r2_matrix.shape[0]
     if S < 3:
         # return np.array([0.0,0.0])
@@ -6326,28 +6923,51 @@ def omega_linear_correct(r2_matrix):
 @njit(parallel=False)
 def omega_linear_correct_mask(_r2, mask=None):
     """
-    Computes the omega statistic (Kim and Nielsen, 2004) from an r^2 matrix,
-    used to detect signatures of recent selective sweeps by comparing LD within
-    vs. between partitions of a SNP window.
+    Compute :math:`\\omega_{\\max}` from an LD matrix of pairwise :math:`r^2` values.
 
-    This implementation returns the maximum omega value over all valid
-    SNP split points (l) within the region.
+    Given a square matrix ``_r2`` of pairwise linkage disequilibrium :math:`r^2`
+    between :math:`S` SNPs (only the upper triangle needs valid values), this
+    function scans all admissible split points :math:`\\ell` and compares the mean
+    LD **within** each side of the split to the mean LD **between** sides. It
+    returns the maximum value over :math:`\\ell`.
 
-    Precomputes all LD sums once (O(S²)) and uses cumulative prefix/suffix arrays for fast within/between partitioning avoding redundant recomputation for each l
+    Let
 
-    Parameters
-    ----------
-    _r2 : ndarray (S x S)
-        Symmetric matrix of pairwise r^2 values between S SNPs.
-        Only the upper triangle is assumed to contain valid values.
-    mask : ndarray of bool, optional
-        Boolean array to restrict computation to a subset of SNPs.
-        If None, all SNPs are included.
+    .. math::
 
-    Returns
-    -------
-    omega_max : float
-        Maximum omega value observed across all candidate breakpoints.
+       \\begin{aligned}
+       &\\text{within-left}  &&= \\sum_{0 \\le i < j < \\ell} r^2_{ij},\\\\
+       &\\text{within-right} &&= \\sum_{\\ell \\le i < j < S} r^2_{ij},\\\\
+       &\\text{between}      &&= \\sum_{0 \\le i < \\ell} \\sum_{\\ell \\le j < S} r^2_{ij},
+       \\end{aligned}
+
+    and define their means by dividing by the corresponding pair counts
+    :math:`\\binom{\\ell}{2}`, :math:`\\binom{S-\\ell}{2}`, and :math:`\\ell(S-\\ell)`.
+    The omega score at :math:`\\ell` is
+
+    .. math::
+
+       \\omega(\\ell) = \\frac{\\dfrac{\\text{within-left}}{\\binom{\\ell}{2}}
+                          + \\dfrac{\\text{within-right}}{\\binom{S-\\ell}{2}}}
+                         {\\dfrac{\\text{between}}{\\ell(S-\\ell)}}\\,,
+
+    and the function returns :math:`\\max_\\ell \\omega(\\ell)`.
+
+    :param numpy.ndarray _r2:
+        Square matrix (``S`` × ``S``) of pairwise :math:`r^2`. Only the upper triangle
+        (``i < j``) must contain valid values; the routine treats the matrix as symmetric.
+    :param numpy.ndarray mask:
+        Optional boolean array (length ``S``) selecting a subset of SNP indices to include.
+        If ``None``, all indices are used. Default ``None``.
+
+    :returns:
+        Maximum omega value across candidate split points.
+    :rtype: float
+
+    :notes:
+        - Time complexity is :math:`O(S^2)` via one pass to accumulate pairwise sums and
+          prefix/suffix aggregates; each candidate split is then evaluated in :math:`O(1)`.
+        - Very small windows (``S < 3`` after masking) yield ``0.0``.
     """
 
     # Select the SNP indices to include based on mask
@@ -6408,382 +7028,84 @@ def omega_linear_correct_mask(_r2, mask=None):
     return omega_max
 
 
-# @jit
-# def compute_r2_matrix_upper_jax(hap):
-#     """
-#     Vectorized, JAX‐native computation of the strict upper triangle of
-#     the r^2 matrix for a (S x N) 0/1 haplotype array `hap`.
-
-#     Returns:
-#       r2_upper (S x S) float64 array where
-#         r2_upper[i,j] = r^2 between site i and j if i<j, else 0.
-#     """
-#     # 1) Cast to float64
-#     X = hap.astype(jnp.float64)
-#     S, N = X.shape
-
-#     # 2) Allele freqs p_i = mean over cols
-#     p = jnp.mean(X, axis=1)  # (S,)
-
-#     # 3) Joint freqs P = (X @ X.T) / N
-#     P = (X @ X.T) / N  # (S, S)
-
-#     # 4) Covariance D = P - p_i * p_j
-#     D = P - p[:, None] * p[None, :]  # (S, S)
-
-#     # 5) Variance denom = p*(1-p), and outer product
-#     var = p * (1.0 - p)  # (S,)
-#     den = var[:, None] * var[None, :]  # (S, S)
-
-#     # 6) Compute r2 with guard: when den==0, set 0
-#     r2 = (D * D) / den
-#     r2 = jnp.where(den > 0.0, r2, 0.0)
-
-#     # 7) Strict upper triangle
-#     r2_upper = jnp.triu(r2, k=1)
-
-#     return r2_upper
-
-
-# @jit
-# def omega_linear_correct_jax(r2_matrix):
-#     S = r2_matrix.shape[0]
-#     if S < 3:
-#         return 0.0
-
-#     # Build row_sum[i] = sum_{j>i} r2[i,j]
-#     #       col_sum[j] = sum_{i<j} r2[i,j]
-#     mask = jnp.triu(jnp.ones((S, S)), k=1)
-#     row_sum = jnp.sum(r2_matrix * mask, axis=1)
-#     col_sum = jnp.sum(r2_matrix * mask, axis=0)
-#     total = jnp.sum(row_sum)
-
-#     # prefix_L[_l] = sum_{i<j<_l} r2[i,j] (cumsum over col_sum)
-#     prefix_L = jnp.zeros(S)
-#     prefix_L = prefix_L.at[1:].set(jnp.cumsum(col_sum[:-1]))
-
-#     # suffix_R[_l] = sum_{_l≤i<j} r2[i,j] (reverse cumsum over row_sum)
-#     suffix_R = jnp.zeros(S + 1)
-#     suffix_R = suffix_R.at[:-1].set(jnp.cumsum(row_sum[::-1])[::-1])
-
-#     # Sweep _l = 3..S-3
-#     def omega_body(_l, state):
-#         omega_max, omega_argmax = state
-#         sum_L = prefix_L[_l]
-#         sum_R = suffix_R[_l]
-#         sum_LR = total - sum_L - sum_R
-#         cond = sum_LR > 0.0
-#         denom_L = (_l * (_l - 1) / 2.0) + ((S - _l) * (S - _l - 1) / 2.0)
-#         denom_R = _l * (S - _l)
-#         _omega = jnp.where(
-#             cond,
-#             ((sum_L + sum_R) / denom_L) / (sum_LR / denom_R),
-#             -jnp.inf,
-#         )
-#         update = _omega > omega_max
-#         omega_max = jnp.where(update, _omega, omega_max)
-#         omega_argmax = jnp.where(update, _l + 2, omega_argmax)
-#         return omega_max, omega_argmax
-
-#     omega_max = 0.0
-#     omega_argmax = -1.0
-
-#     # Use JAX's fori_loop for efficient iteration
-#     (omega_max, omega_argmax) = fori_loop(
-#         3, S - 2, omega_body, (omega_max, omega_argmax)
-#     )
-
-#     return omega_max
-
-
 ################## Spectrum stats
 
 
-def fay_wu_h_normalized(hap: np.ndarray, pos, start=None, stop=None) -> tuple:
-    """
-    Compute Fay-Wu's H test statistic and its normalized version.
-
-    Args:hap (numpy.ndarray): 2D array representing haplotype data. Rows correspond to different mutations, and columns correspond to chromosomes.
-
-    Returns:tuple: A tuple containing two values:
-        - h (float): Fay-Wu H test statistic.
-        - h_normalized (float): Normalized Fay-Wu H test statistic.
-    """
-
-    if start is not None or stop is not None:
-        loc = (pos >= start) & (pos <= stop)
-        pos = pos[loc]
-        hap = hap[loc, :]
-
-    # Count segregating and chromosomes
-    S, n = hap.shape
-    # Create SFS to count ith mutation in sample
-    Si = sfs(hap.sum(axis=1), n)[1:-1]
-    # ith mutations
-    i = np.arange(1, n)
-
-    # (n-1)th harmonic numbers
-    an = np.sum(1 / i)
-    bn = np.sum(1 / i**2)
-    bn_1 = bn + 1 / (n**2)
-
-    # calculate theta_w absolute value
-    theta_w = S / an
-
-    # calculate theta_pi absolute value
-    theta_pi = ((2 * Si * i * (n - i)) / (n * (n - 1))).sum()
-
-    # calculate theta_h absolute value
-    theta_h = ((2 * Si * np.power(i, 2)) / (n * (n - 1))).sum()
-
-    # calculate theta_l absolute value
-    theta_l = (np.arange(1, n) * Si).sum() / (n - 1)
-
-    theta_square = (S * (S - 1)) / (an**2 + bn)
-
-    h = theta_pi - theta_h
-
-    var_1 = (n - 2) / (6 * (n - 1)) * theta_w
-
-    var_2 = (
-        (
-            (18 * (n**2) * (3 * n + 2) * bn_1)
-            - ((88 * (n**3) + 9 * (n**2)) - (13 * n + 6))
-        )
-        / (9 * n * ((n - 1) ** 2))
-    ) * theta_square
-
-    # cov = (((n+1) / (3*(n-1)))*theta_w) + (((7*n*n+3*n-2-4*n*(n+1)*bn_1)/(2*(n-1)**2))*theta_square)
-
-    # var_theta_l = (n * theta_w)/(2.0 * (n - 1.0)) + (2.0 * np.power(n/(n - 1.0), 2.0) * (bn_1 - 1.0) - 1.0) * theta_square;
-    # var_theta_pi = (3.0 * n *(n + 1.0) * theta_w + 2.0 * ( n * n + n + 3.0) * theta_square)/ (9 * n * (n -1.0));
-
-    h_normalized = h / np.sqrt(var_1 + var_2)
-
-    # h_prime = h / np.sqrt(var_theta_l+var_theta_pi - 2.0 * cov)
-
-    return (h, h_normalized)
-
-
-def zeng_e(hap: np.ndarray, pos, start=None, stop=None) -> float:
-    """
-    Compute Zeng's E test statistic.
-
-    Args:hap (numpy.ndarray): 2D array representing haplotype data. Rows correspond to different mutations, and columnscorrespond to chromosomes.
-
-    Returns:
-    float: Zeng's E test statistic.
-    """
-
-    if start is not None or stop is not None:
-        loc = (pos >= start) & (pos <= stop)
-        pos = pos[loc]
-        hap = hap[loc, :]
-
-    # Count segregating and chromosomes
-    S, n = hap.shape
-    # Create SFS to count ith mutation in sample
-    Si = sfs(hap.sum(axis=1), n)[1:-1]
-    # ith mutations
-    i = np.arange(1, n)
-
-    # (n-1)th harmonic numbers
-    an = np.sum(1.0 / i)
-    bn = np.sum(1.0 / i**2.0)
-
-    # calculate theta_w absolute value
-    theta_w = S / an
-
-    # calculate theta_l absolute value
-    theta_l = (np.arange(1, n) * Si).sum() / (n - 1)
-
-    theta_square = S * (S - 1.0) / (an**2 + bn)
-
-    # Eq. 14
-    var_1 = (n / (2.0 * (n - 1.0)) - 1.0 / an) * theta_w
-    var_2 = (
-        bn / an**2
-        + 2 * (n / (n - 1)) ** 2 * bn
-        - 2 * (n * bn - n + 1) / ((n - 1) * an)
-        - (3 * n + 1) / (n - 1)
-    ) * theta_square
-
-    (
-        (bn / an**2)
-        + (2 * (n / (n - 1)) ** 2 * bn)
-        - (2 * (n * bn - n + 1) / ((n - 1) * an))
-        - ((3 * n + 1) / (n - 1)) * theta_square
-    )
-    e = (theta_l - theta_w) / (var_1 + var_2) ** 0.5
-    return e
-
-
-def fuli_f_star(hap, ac):
-    """Calculates Fu and Li's D* statistic"""
-    S, n = hap.shape
-
-    an = np.sum(np.divide(1.0, range(1, n)))
-    bn = np.sum(np.divide(1.0, np.power(range(1, n), 2)))
-    an1 = an + np.true_divide(1, n)
-
-    vfs = (
-        (
-            (2 * (n**3.0) + 110.0 * (n**2.0) - 255.0 * n + 153)
-            / (9 * (n**2.0) * (n - 1.0))
-        )
-        + ((2 * (n - 1.0) * an) / (n**2.0))
-        - ((8.0 * bn) / n)
-    ) / ((an**2.0) + bn)
-    ufs = (
-        (
-            n / (n + 1.0)
-            + (n + 1.0) / (3 * (n - 1.0))
-            - 4.0 / (n * (n - 1.0))
-            + ((2 * (n + 1.0)) / ((n - 1.0) ** 2)) * (an1 - ((2.0 * n) / (n + 1.0)))
-        )
-        / an
-    ) - vfs
-
-    pi = mean_pairwise_difference(ac).sum()
-    ss = np.sum(np.sum(hap, axis=1) == 1)
-    Fstar1 = (pi - (((n - 1.0) / n) * ss)) / ((ufs * S + vfs * (S**2.0)) ** 0.5)
-    return Fstar1
-
-
-def fuli_f(hap, ac):
-    an = np.sum(np.divide(1.0, range(1, n)))
-    an1 = an + 1.0 / n
-    bn = np.sum(np.divide(1.0, np.power(range(1, n), 2)))
-
-    ss = np.sum(np.sum(hap, axis=1) == 1)
-    pi = mean_pairwise_difference(ac).sum()
-
-    if n == 2:
-        cn = 1
-    else:
-        cn = 2.0 * (n * an - 2.0 * (n - 1.0)) / ((n - 1.0) * (n - 2.0))
-
-    v = (
-        cn + 2.0 * (np.power(n, 2) + n + 3.0) / (9.0 * n * (n - 1.0)) - 2.0 / (n - 1.0)
-    ) / (np.power(an, 2) + bn)
-    u = (
-        1.0
-        + (n + 1.0) / (3.0 * (n - 1.0))
-        - 4.0 * (n + 1.0) / np.power(n - 1, 2) * (an1 - 2.0 * n / (n + 1.0))
-    ) / an - v
-    F = (pi - ss) / np.sqrt(u * S + v * np.power(S, 2))
-
-    return F
-
-
-def fuli_d_star(hap):
-    """Calculates Fu and Li's D* statistic"""
-
-    S, n = hap.shape
-    an = np.sum(np.divide(1.0, range(1, n)))
-    bn = np.sum(np.divide(1.0, np.power(range(1, n), 2)))
-    an1 = an + np.true_divide(1, n)
-
-    cn = 2 * (((n * an) - 2 * (n - 1))) / ((n - 1) * (n - 2))
-    dn = (
-        cn
-        + np.true_divide((n - 2), ((n - 1) ** 2))
-        + np.true_divide(2, (n - 1)) * (3.0 / 2 - (2 * an1 - 3) / (n - 2) - 1.0 / n)
-    )
-
-    vds = (
-        ((n / (n - 1.0)) ** 2) * bn
-        + (an**2) * dn
-        - 2 * (n * an * (an + 1)) / ((n - 1.0) ** 2)
-    ) / (an**2 + bn)
-    uds = ((n / (n - 1.0)) * (an - n / (n - 1.0))) - vds
-
-    ss = np.sum(np.sum(hap, axis=1) == 1)
-    Dstar1 = ((n / (n - 1.0)) * S - (an * ss)) / (uds * S + vds * (S ^ 2)) ** 0.5
-    return Dstar1
-
-
-def fuli_d(hap):
-    S, n = hap.shape
-
-    an = np.sum(np.divide(1.0, range(1, n)))
-    bn = np.sum(np.divide(1.0, np.power(range(1, n), 2)))
-
-    ss = np.sum(np.sum(hap, axis=1) == 1)
-
-    if n == 2:
-        cn = 1
-    else:
-        cn = 2.0 * (n * an - 2.0 * (n - 1.0)) / ((n - 1.0) * (n - 2.0))
-
-    v = 1.0 + (np.power(an, 2) / (bn + np.power(an, 2))) * (cn - (n + 1.0) / (n - 1.0))
-    u = an - 1.0 - v
-    D = (S - ss * an) / np.sqrt(u * S + v * np.power(S, 2))
-    return D
-
-
-@njit
-def achaz_y(fs):
-    n = fs.sum()
-    if n < 3:
-        return np.nan  # Or raise Exception if you prefer
-
-    a1, a2 = _harmonic_sums(n)
-    a1m1 = a1 - 1.0
-    ff = (n - 2.0) / (n * a1m1)
-
-    # Precomputed constants
-    alpha = (
-        ff**2 * a1m1
-        + ff
-        * (
-            a1 * (4.0 * (n + 1.0) / (n - 1.0) ** 2)
-            - 2.0 * (n + 1.0) * (n + 2.0) / (n * (n - 1.0))
-        )
-        - a1 * 8.0 * (n - 1.0) / (n * (n - 1.0) ** 2)
-        + (2.0 * n**2 + 60.0 * n + 12.0) / ((3.0 * n**2) * (n - 1.0))
-    )
-
-    beta = (
-        ff**2 * (a2 + a1 * (4.0 / ((n - 1.0) * (n - 2.0))) - 4.0 / (n - 2.0))
-        + ff
-        * (
-            -a1 * (4.0 * (n + 2.0) / (n * (n - 1.0) * (n - 2.0)))
-            - (n**2 - 3.0 * n**2 - 16.0 * n + 20.0) / (n * (n - 1.0) * (n - 2.0))
-        )
-        + a1 * (8.0 / (n * (n - 1.0) * (n - 2.0)))
-        + (2.0 * (n**4 - n**3 - 17.0 * n**2 - 42.0 * n + 72.0))
-        / ((9.0 * n**2) * (n - 1.0) * (n - 2.0))
-    )
-
-    # Mask singletons and fixed sites
-    y = fs.copy()
-    y[0] = 0.0
-    y[1] = 0.0
-    y[n] = 0.0
-
-    # Segregating sites
-    S = 0.0
-    for i in range(2, n):
-        S += y[i]
-
-    # Pairwise π̂
-    pi_hat = 0.0
-    for i in range(1, n):
-        pi_hat += y[i] * i * (n - i)
-    pi_hat /= n * (n - 1.0) / 2.0
-
-    that = S / a1m1
-    that_sq = S * (S - 1.0) / (a1m1**2)
-
-    num = pi_hat - ff * S
-    den = np.sqrt(alpha * that + beta * that_sq)
-
-    return num / den
+# @njit
+# def achaz_y(fs):
+#     n = fs.sum()
+#     if n < 3:
+#         return np.nan  # Or raise Exception if you prefer
+
+#     a1, a2 = _harmonic_sums(n)
+#     a1m1 = a1 - 1.0
+#     ff = (n - 2.0) / (n * a1m1)
+
+#     # Precomputed constants
+#     alpha = (
+#         ff**2 * a1m1
+#         + ff
+#         * (
+#             a1 * (4.0 * (n + 1.0) / (n - 1.0) ** 2)
+#             - 2.0 * (n + 1.0) * (n + 2.0) / (n * (n - 1.0))
+#         )
+#         - a1 * 8.0 * (n - 1.0) / (n * (n - 1.0) ** 2)
+#         + (2.0 * n**2 + 60.0 * n + 12.0) / ((3.0 * n**2) * (n - 1.0))
+#     )
+
+#     beta = (
+#         ff**2 * (a2 + a1 * (4.0 / ((n - 1.0) * (n - 2.0))) - 4.0 / (n - 2.0))
+#         + ff
+#         * (
+#             -a1 * (4.0 * (n + 2.0) / (n * (n - 1.0) * (n - 2.0)))
+#             - (n**2 - 3.0 * n**2 - 16.0 * n + 20.0) / (n * (n - 1.0) * (n - 2.0))
+#         )
+#         + a1 * (8.0 / (n * (n - 1.0) * (n - 2.0)))
+#         + (2.0 * (n**4 - n**3 - 17.0 * n**2 - 42.0 * n + 72.0))
+#         / ((9.0 * n**2) * (n - 1.0) * (n - 2.0))
+#     )
+
+#     # Mask singletons and fixed sites
+#     y = fs.copy()
+#     y[0] = 0.0
+#     y[1] = 0.0
+#     y[n] = 0.0
+
+#     # Segregating sites
+#     S = 0.0
+#     for i in range(2, n):
+#         S += y[i]
+
+#     # Pairwise π̂
+#     pi_hat = 0.0
+#     for i in range(1, n):
+#         pi_hat += y[i] * i * (n - i)
+#     pi_hat /= n * (n - 1.0) / 2.0
+
+#     that = S / a1m1
+#     that_sq = S * (S - 1.0) / (a1m1**2)
+
+#     num = pi_hat - ff * S
+#     den = np.sqrt(alpha * that + beta * that_sq)
+
+#     return num / den
 
 
 @njit(float64[:](int64), cache=True)
 def _harmonic_sums(n):
+    """
+    Return harmonic sums up to ``n-1``.
+
+    Computes:
+      - ``a1 = sum_{i=1}^{n-1} 1/i``
+      - ``a2 = sum_{i=1}^{n-1} 1/i^2``
+
+    :param int n:
+        Sample size (number of chromosomes).
+    :returns:
+        A length-2 array ``[a1, a2]`` as ``float64``.
+    :rtype: numpy.ndarray
+    """
     a1 = 0.0
     a2 = 0.0
     for i in range(1, int(n)):
@@ -6794,21 +7116,36 @@ def _harmonic_sums(n):
 
 
 @njit
-def _harmonic_watterson(n):
-    w = 0.0
-    for i in range(1, n):
-        w += 1 / i
-    return w
-
-
-@njit
 def theta_watterson(ac, positions):
+    """
+    Watterson's theta per base from allele counts and positions.
+
+    The absolute estimator is ``theta_W_abs = S / a1`` with
+    ``S = ac.shape[0]`` segregating sites and ``a1 = sum_{i=1}^{n-1} 1/i``.
+    This implementation then divides by a span length computed from
+    ``positions`` to output **per-base** ``theta_W``.
+
+    :param numpy.ndarray ac:
+        Allele counts array of shape ``(S, 2)`` where columns are
+        (ancestral_count, derived_count). Assumes a constant ``n`` across sites.
+    :param numpy.ndarray positions:
+        Sorted 1D array (length ``S``) of physical positions for the
+        segregating sites.
+    :returns:
+        Per-base Watterson’s theta (float).
+    :rtype: float
+
+    .. note::
+       Per-base normalization uses
+       ``positions[-1] - (positions[1] + 1)`` as the span. Ensure positions
+       are sorted and represent the intended accessible region.
+    """
     # count segregating variants
     S = ac.shape[0]
     n = ac[0].sum()
 
     # (n-1)th harmonic number
-    a1 = _harmonic_watterson(n)
+    a1 = _harmonic_sums(n)[0]
 
     # calculate absolute value
     theta_hat_w_abs = S / a1
@@ -6823,17 +7160,19 @@ def theta_watterson(ac, positions):
 @njit
 def sfs_nb(dac, n):
     """
-    Compute the site frequency spectrum given derived allele counts.
+    Site-frequency spectrum (SFS) from derived-allele counts.
 
-    Parameters
-    ----------
-    dac : int64[:]   # array of derived allele counts (0..n)
-    n   : int64      # total number of chromosomes; if <= 0, inferred as max(dac)
-
-    Returns
-    -------
-    sfs : int64[:]   # length n+1, where sfs[k] is count of sites with k derived alleles
+    :param numpy.ndarray dac:
+        1D array of derived allele counts per site, values in ``[0..n]``.
+    :param int n:
+        Total number of chromosomes. If ``n <= 0``, it is inferred as
+        ``max(dac)``.
+    :returns:
+        Integer array of length ``n+1``; ``sfs[k]`` is the number of sites
+        with ``k`` derived copies.
+    :rtype: numpy.ndarray
     """
+
     # infer n if not provided or invalid
     if n <= 0:
         maxv = 0
@@ -6855,6 +7194,20 @@ def sfs_nb(dac, n):
 
 @njit
 def theta_pi(ac):
+    """
+    Per-site nucleotide diversity (π) from allele counts.
+
+    For each site ``j``, computes
+    ``pi_j = 2 * a_j * (n - a_j) / [n * (n - 1)]``, where ``a_j`` is the
+    derived allele count and ``n`` is the total number of chromosomes.
+
+    :param numpy.ndarray ac:
+        Allele counts array of shape ``(S, 2)`` (ancestral, derived), with
+        constant ``n`` across sites.
+    :returns:
+        Array of per-site π values of length ``S``.
+    :rtype: numpy.ndarray
+    """
     S = ac.shape[0]
     # assume number of chromosomes sampled is constant for all variants
     n = ac[0].sum()
@@ -6870,6 +7223,22 @@ def theta_pi(ac):
 
 @njit
 def tajima_d(ac, min_sites=3):
+    """
+    Tajima’s D from allele counts.
+
+    Compares the mean pairwise difference (sum of per-site π) to the
+    Watterson estimator based on the number of segregating sites.
+    Returns ``nan`` if the number of segregating sites is below ``min_sites``.
+
+    :param numpy.ndarray ac:
+        Allele counts array of shape ``(S, 2)`` (ancestral, derived), with
+        constant ``n`` across sites.
+    :param int min_sites:
+        Minimum required number of segregating sites. Default ``3``.
+    :returns:
+        Tajima’s D as a float (``nan`` if insufficient sites).
+    :rtype: float
+    """
     # count segregating variants
     S = ac.shape[0]
 
@@ -6912,6 +7281,21 @@ def tajima_d(ac, min_sites=3):
 
 @njit(float64(int64[:]), cache=True)
 def achaz_y(fs):
+    """
+    Achaz’s Y neutrality test (standardized).
+
+    Input ``fs`` is a site-frequency spectrum array of length ``n+1`` for a
+    sample size ``n`` (with bins 0..n). The statistic downweights polarization
+    errors by using the **folded** spectrum and emphasizes deviations in the
+    abundance of very rare variants.
+
+    :param numpy.ndarray fs:
+        Folded site-frequency spectrum of length ``n+1`` (``int64``).
+    :returns:
+        Standardized Achaz’s Y as a float; returns ``nan`` if ``n < 3`` or
+        if there are no segregating sites (after folding exclusions).
+    :rtype: float
+    """
     n = fs.shape[0] - 1
     if n < 3:
         return np.nan
@@ -6968,6 +7352,24 @@ def achaz_y(fs):
 
 @njit
 def fay_wu_h_norm_si(ac, positions=None):
+    """
+    Fay & Wu’s H and its normalized form (single-population, infinite sites).
+
+    Computes:
+      - ``theta_h``: estimator that upweights high-frequency derived alleles.
+      - ``h = pi - theta_h`` (Fay & Wu’s H).
+      - ``h_norm``: normalized H using variance terms.
+
+    :param numpy.ndarray ac:
+        Allele counts array of shape ``(S, 2)`` (ancestral, derived), constant ``n``.
+    :param numpy.ndarray positions:
+        Optional positions (length ``S``). If provided, ``theta_h`` is divided
+        by the accessible span ``positions[-1] - (positions[0] - 1)``.
+    :returns:
+        Tuple ``(theta_h, h, h_norm)`` as floats.
+    :rtype: tuple[float, float, float]
+    """
+
     # count segregating variants
     S = ac.shape[0]
     # assume number of chromosomes sampled is constant for all variants
@@ -7006,6 +7408,19 @@ def fay_wu_h_norm_si(ac, positions=None):
 
 @njit
 def zeng_e_si(ac):
+    """
+    Zeng’s E statistic (single-population, infinite sites), standardized.
+
+    Contrasts Watterson’s estimator with a linear SFS component related to
+    high-frequency derived signal. Useful alongside Tajima’s D and Fay & Wu’s H.
+
+    :param numpy.ndarray ac:
+        Allele counts array of shape ``(S, 2)`` (ancestral, derived), constant ``n``.
+    :returns:
+        Standardized Zeng’s E as a float.
+    :rtype: float
+    """
+
     # count segregating variants
     S = ac.shape[0]
     # assume number of chromosomes sampled is constant for all variants
@@ -7013,10 +7428,11 @@ def zeng_e_si(ac):
 
     fs = sfs_nb(ac[:, 1], n)[1:-1]
 
-    i_arr = np.arange(1, int(n))
-    a1 = np.sum(1.0 / i_arr)
-    bn = np.sum(1.0 / (i_arr * i_arr))
+    # i_arr = np.arange(1, int(n))
+    a1, bn = _harmonic_sums(n)
+    # bn = np.sum(1.0 / (i_arr * i_arr))
     theta_w = S / a1
+
     tl = 0.0
     for k in range(1, int(n)):
         tl += k * fs[k - 1]
@@ -7034,7 +7450,20 @@ def zeng_e_si(ac):
 
 @njit
 def fuli_f_star_nb(ac):
-    """Calculates Fu and Li's D* statistic"""
+    """
+    Fu and Li’s F* (starred) statistic (no outgroup required).
+
+    Focuses on deviations in the **singleton** class of the (folded) SFS,
+    contrasting singleton abundance with diversity (π). The starred form
+    does not require ancestral state polarization.
+
+    :param numpy.ndarray ac:
+        Allele counts array of shape ``(S, 2)`` (ancestral, derived), constant ``n``.
+    :returns:
+        Fu & Li’s F* as a float.
+    :rtype: float
+    """
+
     # count segregating variants
     S = ac.shape[0]
     # assume number of chromosomes sampled is constant for all variants
@@ -7076,6 +7505,18 @@ def fuli_f_star_nb(ac):
 
 @njit
 def fuli_f_nb(ac):
+    """
+    Fu and Li’s F statistic (polarized).
+
+    Uses singleton counts and diversity (π); typically assumes **derived**
+    states are known (e.g., via outgroup).
+
+    :param numpy.ndarray ac:
+        Allele counts array of shape ``(S, 2)`` (ancestral, derived), constant ``n``.
+    :returns:
+        Fu & Li’s F as a float.
+    :rtype: float
+    """
     # count segregating variants
     S = ac.shape[0]
     # assume number of chromosomes sampled is constant for all variants
@@ -7111,8 +7552,19 @@ def fuli_f_nb(ac):
 
 @njit
 def fuli_d_star_nb(ac):
-    """Calculates Fu and Li's D* statistic"""
+    """
+    Fu and Li’s D* (starred) statistic (no outgroup required).
 
+    Compares the number of segregating sites against singleton counts in the
+    folded spectrum. The starred form does not require ancestral state
+    polarization.
+
+    :param numpy.ndarray ac:
+        Allele counts array of shape ``(S, 2)`` (ancestral, derived), constant ``n``.
+    :returns:
+        Fu & Li’s D* as a float.
+    :rtype: float
+    """
     # count segregating variants
     S = ac.shape[0]
     # assume number of chromosomes sampled is constant for all variants
@@ -7142,6 +7594,19 @@ def fuli_d_star_nb(ac):
 
 @njit
 def fuli_d_nb(ac):
+    """
+    Fu and Li’s D statistic (polarized form).
+
+    Uses the total number of segregating sites and singletons; typically assumes
+    **derived** states are known (e.g., via outgroup) to define singletons.
+
+    :param numpy.ndarray ac:
+        Allele counts array of shape ``(S, 2)`` (ancestral, derived), constant ``n``.
+    :returns:
+        Fu & Li’s D as a float.
+    :rtype: float
+    """
+
     # count segregating variants
     S = ac.shape[0]
     # assume number of chromosomes sampled is constant for all variants
@@ -7476,6 +7941,42 @@ def compute_t_m(
     params=None,
     parallel_manager=None,
 ):
+    """
+    Compute LASSI-style T and m-hat over a set of simulations.
+
+    The function builds truncated haplotype-frequency spectra per window, estimates a neutral
+    spectrum if not provided, scores each window with T and m, and then reduces the scan to
+    fixed physical windows around the specified centers. If ``params`` are provided, they are
+    attached and the result may be pivoted to a wide format.
+
+    :param sim_list: Iterable of simulation items consumable by LASSI_spectrum_and_Kspectrum.
+    :type sim_list: sequence
+    :param K_truncation: Number of top haplotype counts retained in the truncated spectrum. Default 5.
+    :type K_truncation: int
+    :param w_size: Sliding window size in SNPs used to build K-spectra. Default 110.
+    :type w_size: int
+    :param step: Step in SNPs between consecutive windows. Default 5.
+    :type step: int
+    :param K_neutral: Precomputed neutral truncated spectrum; if None, estimated via neut_average. Optional.
+    :type K_neutral: array-like or None
+    :param windows: Physical window widths (bp) for cut_t_m_argmax. Default [50000, 100000, 200000, 500000, 1000000].
+    :type windows: list[int]
+    :param center: Inclusive physical range (bp) defining centers. Default [500000, 700000].
+    :type center: list[int]
+    :param nthreads: Number of joblib workers. Default 1.
+    :type nthreads: int
+    :param params: Optional parameter matrix aligned to sim_list with columns [s, t, f_i, f_t].
+    :type params: array-like or None
+    :param parallel_manager: Existing joblib.Parallel to reuse; if None, a new one is created.
+    :type parallel_manager: joblib.Parallel or None
+
+    :returns: (t_m_cut, K_neutral)
+    :rtype: tuple
+
+    :notes: T is a log-likelihood ratio comparing sweep-distorted vs neutral truncated spectra.
+            m is the estimated number of sweeping haplotypes (1 = hard; >1 = soft),
+            upper-bounded by ``K_truncation``.
+    """
     if parallel_manager is None:
         parallel_manager = Parallel(n_jobs=nthreads, verbose=5)
 
@@ -7735,21 +8236,62 @@ def compute_mu_ld(start_idx: int, end_idx: int, r2: np.ndarray) -> float:
     return num / den
 
 
-@njit
-def _harmonic_watterson(n):
-    w = 0.0
-    for i in range(1, n):
-        w += 1 / i
-    return w
-
-
 # @njit
 def mu_stat(hap, snp_positions, r2_matrix, window_size=50):
+    """
+    Compute RAiSD composite sweep score :math:`\\mu` over overlapping SNP windows.
+
+    For each sliding window of ``window_size`` consecutive SNPs (step = 1 SNP),
+    this routine evaluates three components and their product:
+
+    * **mu_var** – reduction-of-variation component (computed by
+      :func:`compute_mu_var`), scaled by the region length.
+    * **mu_sfs** – site-frequency-spectrum skew component (from
+      :func:`compute_mu_sfs`), standardized using Watterson’s harmonic correction
+      (``_harmonic_sums(n)[0]``).
+    * **mu_ld** – linkage-disequilibrium contrast component (from
+      :func:`compute_mu_ld`) using the supplied :math:`r^2` matrix.
+    * **mu_total** – composite statistic ``mu_var * mu_sfs * mu_ld``.
+
+    The window center coordinate is recorded as the midpoint between the first
+    and last SNP positions in the window. Results are returned as a Polars
+    DataFrame with one row per window.
+
+    :param numpy.ndarray hap: Haplotype matrix of shape ``(S, n)`` with 0/1 alleles
+        (rows = SNPs, columns = haplotypes or chromosomes).
+    :param numpy.ndarray snp_positions: Monotonically increasing physical positions
+        of length ``S`` (aligned to rows of ``hap``).
+    :param numpy.ndarray r2_matrix: Pairwise LD matrix :math:`r^2` of shape ``(S, S)``.
+        Must index compatibly with SNP order in ``hap`` / ``snp_positions``.
+        (A symmetric full matrix is expected; using an upper-triangular fill is fine
+        if :func:`compute_mu_ld` only reads ``i < j``.)
+    :param int window_size: SNP window size; defaults to ``50`` (RAiSD’s ``-w`` default).
+
+    :returns: A Polars DataFrame with columns
+        * ``positions`` (int): window center (bp, midpoint of first/last SNP in window)
+        * ``mu_var`` (float): variation component
+        * ``mu_sfs`` (float): SFS component
+        * ``mu_ld`` (float): LD component
+        * ``mu_total`` (float): composite score ``mu_var * mu_sfs * mu_ld``
+    :rtype: polars.DataFrame
+
+    :notes:
+        * The genome/region span used for scaling the variation component is
+          ``D_ln = (snp_positions[-1] + 1) - snp_positions[0]``.
+        * Windows advance by one SNP (maximally overlapping). For ``S`` SNPs and
+          window size ``W``, the output has ``S - W + 1`` rows.
+        * Inputs must be consistent (same SNP order across ``hap``, ``snp_positions``,
+          and ``r2_matrix``); this function does not validate shapes beyond usage.
+
+    :see also:
+        :func:`compute_mu_var`, :func:`compute_mu_sfs`, :func:`compute_mu_ld`,
+        :func:`compute_r2_matrix_upper`
+    """
     # full chromosome/region length
     D_ln = (snp_positions[-1] + 1) - snp_positions[0]
     S, n = hap.shape
 
-    theta_w_correction = _harmonic_watterson(n)
+    theta_w_correction = _harmonic_sums(n)[0]
     # Match RAiSD -w option (default: 50)
     _window_size = window_size
 
@@ -7963,6 +8505,516 @@ def pcc_column_sort_numba(matrix):
                     matrix[k, j] = tmp
 
     return matrix
+
+
+# from jax import config
+
+# config.update("jax_enable_x64", True)
+# config.update("jax_platform_name", "cpu")
+
+# import jax.numpy as jnp
+# from jax import jit
+# from jax.lax import fori_loop
+
+# @jit
+# def jax_dot(hap):
+#     _hap = hap.astype(jnp.float32)
+#     return hap @ hap.T
+
+# def haf_top_jax(hap, pos, cutoff=0.1, start=None, stop=None, window_size=None):
+#     """
+#     Calculates the Haplotype Allele Frequency (HAF) for the top proportion of haplotypes,
+#     which is a measure used to summarize haplotype diversity. The function computes the
+#     HAF statistic for a filtered set of variants and returns the sum of the top `cutoff`
+#     proportion of the HAF values.
+
+#     Parameters
+#     ----------
+#     hap : numpy.ndarray
+#         A 2D array where each row represents a SNP (variant), and each column represents
+#         a haplotype for an individual. The entries are expected to be binary (0 or 1),
+#         indicating the presence of ancestral or derived alleles.
+
+#     pos : numpy.ndarray
+#         A 1D array of physical positions corresponding to the SNPs in the `hap` matrix.
+#         The length of `pos` should match the number of rows in `hap`.
+
+#     cutoff : float, optional (default=0.1)
+#         The proportion of HAF values to exclude from the top and bottom when calculating the final HAF score.
+#         For example, a `cutoff` of 0.1 excludes the lowest 10% and highest 10% of HAF values,
+#         and the function returns the sum of the remaining HAF values.
+
+#     start : float or None, optional (default=None)
+#         The starting physical position (in base pairs) for the genomic region of interest.
+#         If provided, only SNPs at or after this position are included in the calculation.
+
+#     stop : float or None, optional (default=None)
+#         The ending physical position (in base pairs) for the genomic region of interest.
+#         If provided, only SNPs at or before this position are included in the calculation.
+
+#     Returns
+#     -------
+#     haf_top : float
+#         The sum of the top `cutoff` proportion of HAF values, which represents the
+#         higher end of the haplotype diversity distribution within the specified region.
+
+#     Notes
+#     -----
+#     - The function first filters the SNPs by the specified genomic region (using `start` and `stop`).
+#     - HAF (Haplotype Allele Frequency) is computed by summing the pairwise dot product of
+#       haplotypes and dividing by the total number of haplotypes.
+#     - The HAF values are sorted, and the top proportion (based on the `cutoff`) is returned.
+
+#     """
+#     if start is not None or stop is not None:
+#         loc = (pos >= start) & (pos <= stop)
+#         pos = pos[loc]
+#         hap = hap[loc, :]
+#     elif window_size is not None:
+#         loc = (pos >= (6e5 - window_size // 2)) & (pos <= (6e5 + window_size // 2))
+#         hap = hap[loc, :]
+
+#     freqs = hap.sum(axis=1) / hap.shape[1]
+#     hap_tmp = hap[(freqs > 0) & (freqs < 1)]
+#     # haf_num = (np.dot(hap_tmp.T, hap_tmp) / hap.shape[1]).sum(axis=1)
+#     haf_num = (jax_dot(hap_tmp.T) / hap.shape[1]).sum(axis=1)
+#     haf_den = hap_tmp.sum(axis=0)
+#     # haf = np.sort(haf_num / haf_den)
+
+#     if 0 in haf_den:
+#         mask_zeros = haf_den != 0
+#         haf = np.full_like(haf_num, np.nan, dtype=np.float64)
+#         haf[mask_zeros] = haf_num[mask_zeros] / haf_den[mask_zeros]
+#         haf = jnp.sort(haf)
+#     else:
+#         haf = jnp.sort(haf_num / haf_den)
+
+#     if cutoff <= 0 or cutoff >= 1:
+#         cutoff = 1
+#     idx_low = int(cutoff * haf.size)
+#     idx_high = int((1 - cutoff) * haf.size)
+
+#     # 10% higher
+#     return haf[idx_high:].sum()
+
+
+# def Ld_jax(r_2) -> tuple:
+#     """
+#     Compute Kelly Zns statistic (1997) and omega_max. Average r2
+#     among every pair of loci in the genomic window.
+
+#     Args:hap (numpy.ndarray): 2D array representing haplotype data. Rows correspond to different mutations, and columnscorrespond to chromosomes.
+#     pos (numpy.ndarray): 1D array representing the positions of mutations.
+#     min_freq (float, optional): Minimum frequency threshold. Default is 0.05.
+#     max_freq (float, optional): Maximum frequency threshold. Default is 1.
+#     window (int, optional): Genomic window size. Default is 500000.
+
+#     Returns:tuple: A tuple containing two values:
+#     - kelly_zns (float): Kelly Zns statistic.
+#     - omega_max (float): Nielsen omega max.
+#     """
+
+#     # r2_matrix = r2_torch(hap_filter)
+
+#     S = r_2.shape[0]
+#     zns = r_2.sum() / comb(S, 2)
+#     # Index combination to iter
+#     omega_max = omega_linear_correct_jax(r_2)
+
+#     # return zns, 0
+#     return zns, omega_max
+
+
+# @jit
+# def compute_r2_matrix_upper_jax(hap):
+#     """
+#     Vectorized, JAX‐native computation of the strict upper triangle of
+#     the r^2 matrix for a (S x N) 0/1 haplotype array `hap`.
+
+#     Returns:
+#       r2_upper (S x S) float64 array where
+#         r2_upper[i,j] = r^2 between site i and j if i<j, else 0.
+#     """
+#     # 1) Cast to float64
+#     X = hap.astype(jnp.float64)
+#     S, N = X.shape
+
+#     # 2) Allele freqs p_i = mean over cols
+#     p = jnp.mean(X, axis=1)  # (S,)
+
+#     # 3) Joint freqs P = (X @ X.T) / N
+#     P = (X @ X.T) / N  # (S, S)
+
+#     # 4) Covariance D = P - p_i * p_j
+#     D = P - p[:, None] * p[None, :]  # (S, S)
+
+#     # 5) Variance denom = p*(1-p), and outer product
+#     var = p * (1.0 - p)  # (S,)
+#     den = var[:, None] * var[None, :]  # (S, S)
+
+#     # 6) Compute r2 with guard: when den==0, set 0
+#     r2 = (D * D) / den
+#     r2 = jnp.where(den > 0.0, r2, 0.0)
+
+#     # 7) Strict upper triangle
+#     r2_upper = jnp.triu(r2, k=1)
+
+#     return r2_upper
+
+
+# @jit
+# def omega_linear_correct_jax(r2_matrix):
+#     S = r2_matrix.shape[0]
+#     if S < 3:
+#         return 0.0
+
+#     # Build row_sum[i] = sum_{j>i} r2[i,j]
+#     #       col_sum[j] = sum_{i<j} r2[i,j]
+#     mask = jnp.triu(jnp.ones((S, S)), k=1)
+#     row_sum = jnp.sum(r2_matrix * mask, axis=1)
+#     col_sum = jnp.sum(r2_matrix * mask, axis=0)
+#     total = jnp.sum(row_sum)
+
+#     # prefix_L[_l] = sum_{i<j<_l} r2[i,j] (cumsum over col_sum)
+#     prefix_L = jnp.zeros(S)
+#     prefix_L = prefix_L.at[1:].set(jnp.cumsum(col_sum[:-1]))
+
+#     # suffix_R[_l] = sum_{_l≤i<j} r2[i,j] (reverse cumsum over row_sum)
+#     suffix_R = jnp.zeros(S + 1)
+#     suffix_R = suffix_R.at[:-1].set(jnp.cumsum(row_sum[::-1])[::-1])
+
+#     # Sweep _l = 3..S-3
+#     def omega_body(_l, state):
+#         omega_max, omega_argmax = state
+#         sum_L = prefix_L[_l]
+#         sum_R = suffix_R[_l]
+#         sum_LR = total - sum_L - sum_R
+#         cond = sum_LR > 0.0
+#         denom_L = (_l * (_l - 1) / 2.0) + ((S - _l) * (S - _l - 1) / 2.0)
+#         denom_R = _l * (S - _l)
+#         _omega = jnp.where(
+#             cond,
+#             ((sum_L + sum_R) / denom_L) / (sum_LR / denom_R),
+#             -jnp.inf,
+#         )
+#         update = _omega > omega_max
+#         omega_max = jnp.where(update, _omega, omega_max)
+#         omega_argmax = jnp.where(update, _l + 2, omega_argmax)
+#         return omega_max, omega_argmax
+
+#     omega_max = 0.0
+#     omega_argmax = -1.0
+
+#     # Use JAX's fori_loop for efficient iteration
+#     (omega_max, omega_argmax) = fori_loop(
+#         3, S - 2, omega_body, (omega_max, omega_argmax)
+#     )
+
+#     return omega_max
+
+
+# def filter_gt(hap, rec_map, region=None):
+#     """
+#     Convert the 2d numpy haplotype matrix to HaplotypeArray from scikit-allel and change type np.int8. It filters and processes the haplotype matrix based on a recombination map and
+#     returns key information for further analysis such as allele frequencies and physical positions.
+
+#     Parameters
+#     ----------
+#     hap : array-like, HaplotypeArray
+#         The input haplotype data which can be in one of the following forms:
+#         - A `HaplotypeArray` object.
+#         - A genotype matrix (as a numpy array or similar).
+
+#     rec_map : numpy.ndarray
+#         A 2D numpy array representing the recombination map, where each row corresponds
+#         to a genomic variant and contains recombination information. The third column (index 2)
+#         of the recombination map provides the physical positions of the variants.
+
+#     Returns
+#     -------
+#     tuple
+#         A tuple containing the following elements:
+#         - hap_01 (numpy.ndarray): The filtered haplotype matrix, with only biallelic variants.
+#         - ac (AlleleCounts): An object that stores allele counts for the filtered variants.
+#         - biallelic_mask (numpy.ndarray): A boolean mask indicating which variants are biallelic.
+#         - hap_int (numpy.ndarray): The haplotype matrix converted to integer format (int8).
+#         - rec_map_01 (numpy.ndarray): The recombination map filtered to include only biallelic variants.
+#         - position_masked (numpy.ndarray): The physical positions of the biallelic variants.
+#         - sequence_length (int): An arbitrary sequence length set to 1.2 million bases (1.2e6).
+#         - freqs (numpy.ndarray): The frequencies of the alternate alleles for each biallelic variant.
+#     """
+#     try:
+#         # Avoid unnecessary conversion if hap is already a HaplotypeArray
+#         if not isinstance(hap, HaplotypeArray):
+#             hap = HaplotypeArray(
+#                 hap if isinstance(hap, np.ndarray) else hap.genotype_matrix()
+#             )
+#     except:
+#         hap = HaplotypeArray(load(hap).genotype_matrix())
+
+#     # positions = rec_map[:, -1]
+#     # physical_position = rec_map[:, -2]
+
+#     # HAP matrix centered to analyse whole chromosome
+#     hap_01, ac, biallelic_mask = filter_biallelics(hap)
+#     sequence_length = int(1.2e6)
+
+#     rec_map_01 = rec_map[biallelic_mask]
+
+#     mask_dup = (~pl.DataFrame(rec_map_01)[:, -1].is_duplicated()).to_numpy()
+
+#     hap_01 = hap_01[mask_dup]
+#     rec_map_01 = rec_map_01[mask_dup]
+#     position_masked = rec_map_01[:, -1].astype(int)
+#     genetic_position_masked = rec_map_01[:, -2]
+
+#     ac = ac[mask_dup]
+
+#     return (
+#         hap_01,
+#         rec_map_01,
+#         ac,
+#         biallelic_mask,
+#         position_masked,
+#         genetic_position_masked,
+#     )
+
+
+# def filter_biallelics(hap: HaplotypeArray) -> tuple:
+#     """
+#     Filter out non-biallelic loci from the haplotype data.
+
+#     Args:
+#         hap (allel.HaplotypeArray): Haplotype data represented as a HaplotypeArray.
+
+#     Returns:
+#         tuple: A tuple containing three elements:
+#             - hap_biallelic (allel.HaplotypeArray): Filtered biallelic haplotype data.
+#             - ac_biallelic (numpy.ndarray): Allele counts for the biallelic loci.
+#             - biallelic_mask (numpy.ndarray): Boolean mask indicating biallelic loci.
+#     """
+#     ac = hap.count_alleles()
+#     biallelic_mask = ac.is_biallelic_01()
+
+#     # Use a subset to filter directly, minimizing intermediate memory usage
+#     hap_biallelic = hap.subset(biallelic_mask)
+
+#     ac_biallelic = ac[biallelic_mask]
+
+#     return (hap_biallelic.values, ac_biallelic.values, biallelic_mask)
+
+
+# def ms_parser(ms_file, param=None, seq_len=1.2e6):
+#     """Read a ms file and output the positions and the genotypes.
+#     Genotypes are a numpy array of 0s and 1s with shape (num_segsites, num_samples).
+#     """
+
+#     assert (
+#         ms_file.endswith(".out")
+#         or ms_file.endswith(".out.gz")
+#         or ms_file.endswith(".ms")
+#         or ms_file.endswith(".ms.gz")
+#     )
+
+#     open_function = gzip.open if ms_file.endswith(".gz") else open
+
+#     with open_function(ms_file, "rt") as file:
+#         file_content = file.read()
+
+#     # Step 2: Split by pattern (e.g., `---`)
+#     pattern = r"//"
+#     partitions = re.split(pattern, file_content)
+
+#     if len(partitions) == 1:
+#         warn(f"File {ms_file} is malformed.")
+#         return None
+#     else:
+#         positions = []
+#         haps = []
+#         rec_map = []
+#         for r in partitions[1:]:
+#             # Read in number of segregating sites and positions
+#             data = []
+#             for line in r.splitlines()[1:]:
+#                 if line == "":
+#                     continue
+#                 # if "discoal" in line or "msout" in line:
+#                 # seq_len = int(line.strip().split()[3])
+#                 if line.startswith("segsites"):
+#                     num_segsites = int(line.strip().split()[1])
+#                     if num_segsites == 0:
+#                         continue
+#                         #     # Shape of data array for 0 segregating sites should be (0, 1)
+#                         # return np.array([]), np.array([], ndmin=2, dtype=np.uint8).T
+#                 elif line.startswith("positions"):
+#                     tmp_pos = np.array([float(x) for x in line.strip().split()[1:]])
+#                     tmp_pos = np.round(tmp_pos * seq_len).astype(int)
+
+#                     # Find duplicates in the array
+#                     duplicates = np.diff(tmp_pos) == 0
+
+#                     # While there are any duplicates, increment them by 1
+#                     for i in np.where(duplicates)[0]:
+#                         tmp_pos[i + 1] += 1
+#                     tmp_pos += 1
+#                     positions.append(tmp_pos)
+#                     tmp_map = np.column_stack(
+#                         [
+#                             np.repeat(1, tmp_pos.size),
+#                             np.arange(tmp_pos.size),
+#                             tmp_pos,
+#                             tmp_pos,
+#                         ]
+#                     )
+#                     rec_map.append(tmp_map)
+
+#                 else:
+#                     # Now read in the data
+#                     data.append(np.array(list(line), dtype=np.int8))
+#             try:
+#                 data = np.vstack(data).T
+#             except:
+#                 data = None
+#                 warn(f"File {ms_file} is malformed.")
+#                 return None
+
+#             # data = np.vstack(data).T
+#             haps.append(data)
+
+#     if param is None:
+#         param = np.zeros(4)
+
+#     return (haps[0], rec_map[0], param)
+
+
+# def ms_parser_np(ms_file, param=None, seq_len=1.2e6):
+#     """Read an ms/msms/hudson file and return (haps, rec_map, param) for the FIRST replicate.
+#     haps: (num_segsites, num_samples) int8 array of 0/1
+#     rec_map: (num_segsites, 4) int64 array: [1, idx, pos, pos]
+#     """
+#     if not ms_file.endswith((".out", ".out.gz", ".ms", ".ms.gz")):
+#         warn(f"File {ms_file} has an unexpected extension.")
+
+#     open_function = gzip.open if ms_file.endswith(".gz") else open
+
+#     in_rep = False
+#     num_segsites = None
+#     pos_arr = None
+#     hap_rows = []  # strings of '0'/'1', one per sample
+
+#     def finish_and_return(p_in):
+#         # Validate minimal structure
+#         if num_segsites is None or pos_arr is None or not hap_rows:
+#             warn(f"File {ms_file} is malformed.")
+#             return None
+
+#         # Build hap matrix fast: bytes -> uint8 -> 0/1 -> int8, then transpose
+#         try:
+#             n_samples = len(hap_rows)
+#             n_sites = len(hap_rows[0])
+#             H = np.empty((n_samples, n_sites), dtype=np.int8)
+#             for i, s in enumerate(hap_rows):
+#                 H[i, :] = (
+#                     np.frombuffer(s.encode("ascii"), dtype=np.uint8) - 48
+#                 ).astype(np.int8, copy=False)
+#             H = H.T  # (num_segsites, num_samples)
+#         except Exception:
+#             warn(f"File {ms_file} is malformed.")
+#             return None
+
+#         n = pos_arr.size
+#         rec_map = np.column_stack(
+#             (np.repeat(1, n), np.arange(n, dtype=np.int64), pos_arr, pos_arr)
+#         ).astype(np.int64, copy=False)
+
+#         p_out = np.zeros(4) if p_in is None else p_in
+#         return (H, rec_map, p_out)
+
+#     with open_function(ms_file, "rt") as fh:
+#         for raw in fh:
+#             line = raw.strip()
+
+#             # start of a replicate
+#             if line.startswith("//"):
+#                 if in_rep:
+#                     out = finish_and_return(param)
+#                     if out is not None:
+#                         return out
+#                     # else, malformed replicate; continue scanning for next
+#                 in_rep = True
+#                 num_segsites = None
+#                 pos_arr = None
+#                 hap_rows.clear()
+#                 continue
+
+#             if not in_rep or not line:
+#                 continue
+
+#             if line.startswith("segsites"):
+#                 parts = line.split()
+#                 if len(parts) >= 2:
+#                     try:
+#                         num_segsites = int(parts[1])
+#                     except ValueError:
+#                         warn(f"File {ms_file} is malformed.")
+#                         return None
+#                 else:
+#                     warn(f"File {ms_file} is malformed.")
+#                     return None
+#                 continue
+
+#             if line.startswith("positions"):
+#                 # line like: "positions: 0.123 0.456 ..."
+#                 try:
+#                     _, values = line.split(":", 1)
+#                     tmp_pos = np.fromstring(values, sep=" ", dtype=np.float64)
+#                 except Exception:
+#                     warn(f"File {ms_file} is malformed.")
+#                     return None
+
+#                 # EXACTLY match original: np.round then single-pass bump of consecutive duplicates, then +1
+#                 tmp_pos = np.round(tmp_pos * seq_len).astype(np.int64, copy=False)
+
+#                 dups = np.diff(tmp_pos) == 0
+#                 if dups.any():
+#                     idxs = np.nonzero(dups)[0]
+#                     tmp_pos[idxs + 1] += 1  # bump NEXT duplicate once
+
+#                 tmp_pos += 1
+#                 pos_arr = tmp_pos
+#                 continue
+
+#             # haplotype row ('0'/'1' string)
+#             c0 = line[0]
+#             if c0 == "0" or c0 == "1":
+#                 hap_rows.append(line)
+
+#         # EOF: if a replicate was started, finalize it
+#         if in_rep:
+#             return finish_and_return(param)
+
+#     warn(f"File {ms_file} is malformed.")
+#     return None
+
+
+# def cleaning_summaries(data, summ_stats, params, model):
+#     # Cleaning params and simulations to remove malformed simulations
+#     mask = []
+#     summ_stats_filtered = []
+#     malformed_files = []
+#     for i, j in enumerate(summ_stats[0]):
+#         if j is None:
+#             mask.append(i)
+#             malformed_files.append(
+#                 f"Model {model}, index {i} is malformed."
+#             )
+#         else:
+#             summ_stats_filtered.append(summ_stats[])
+
+#     if len(mask) != 0:
+#         params = np.delete(params, mask, axis=0)
+
+#     return summ_stats_filtered, params, malformed_files
 
 
 # def calculate_stats(
