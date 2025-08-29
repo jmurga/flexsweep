@@ -22,7 +22,6 @@ extensions = [
     "sphinx.ext.autosummary",
     "sphinx.ext.mathjax",
     "sphinx.ext.githubpages",
-    "sphinx_copybutton",
 ]
 
 templates_path = ["_templates"]

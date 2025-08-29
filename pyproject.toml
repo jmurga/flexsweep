@@ -40,5 +40,5 @@ build-backend = "poetry.core.masonry.api"
 [tool.poetry.group.docs.dependencies]
 sphinx = "^7.0"
 sphinx-rtd-theme = "^2.0"
-sphinx-copybutton = "^0.5.2"
+
 
