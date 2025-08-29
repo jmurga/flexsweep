@@ -1,11 +1,3 @@
-# Configuration file for the Sphinx documentation builder.
-#
-# For the full list of built-in configuration values, see the documentation:
-# https://www.sphinx-doc.org/en/master/usage/configuration.html
-
-# -- Project information -----------------------------------------------------
-# https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
-
 project = "Flex-sweep"
 copyright = "2025, Jesús Murga-Moreno"
 author = "Jesús Murga-Moreno, David Enard"
@@ -33,7 +25,4 @@ language = "en"
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
 html_theme = "sphinx_rtd_theme"
-
-
-_static = Path(__file__).parent / "_static"
-html_static_path = ["_static"] if _static.exists() else []
+html_static_path = ["_static"]
