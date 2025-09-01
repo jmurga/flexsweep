@@ -1,7 +1,7 @@
 {% set name = "flexsweep" %}
 {% set version = "1.0" %}
-{% set python_min = "3.10" %}
-{% set python_max = "3.12" %}
+{% set python_min = "3.12" %}
+{% set python_max = "3.13" %}
 
 package:
   name: {{ name|lower }}

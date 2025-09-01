@@ -8,8 +8,8 @@ This new version simplifies and streamlines the project structure, files, simula
 Similar to the first version, Flex-sweep works in three main steps: simulation, summary statistics estimation (feature vectors), and training/classification. Once installed, you can access the Command Line Interface to run any module as needed.
 
 
-Minimum requirements
---------------------
+Recommend requirements
+----------------------
 Flex-sweep is now able to run into a workstation, moving from HPC and high storage necessities. The minimum requirements will depend mainly on the species' genome and the number of samples. We tested Flex-sweep on the entire 1000GP dataset. The examples presented in the documentation run YRI population (n = 108) simulations, summary estimations from simulations, summary statistics from autosomes, training and prediction using the following workstation configuration in a few hours.
 
 The summary statistics estimation heavily relies on numpy arrays, so sample size and RAM consumption are the limiting factors of our software. We tested YRI population workflow using the following recommended configuration to achieve reasonable fast genome-wide predictions.
