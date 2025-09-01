@@ -219,6 +219,7 @@ def fvs_discoal(simulations_path, nthreads):
     required=False,
     help="Recombination map. Decode CSV format: Chr,Begin,End,cMperMb,cM",
 )
+@click.option("--pop", type=str, default="pop", required=False, help="Population ID")
 def fvs_vcf(vcf_path, recombination_map, nthreads):
     """
     Estimate summary statistics from VCF files and build feature vectors.
@@ -243,6 +244,7 @@ def fvs_vcf(vcf_path, recombination_map, nthreads):
         nthreads=nthreads,
         vcf=True,
         recombination_map=recombination_map,
+        population=pop,
     )
 
 

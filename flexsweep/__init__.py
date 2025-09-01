@@ -2,6 +2,8 @@ import os
 
 import warnings
 
+import inspect
+
 # Suppress polars warnings. Force 1 thread polars shouldn't cause deadlocks
 warnings.filterwarnings(
     "ignore", category=RuntimeWarning, module="joblib.externals.loky.backend.fork_exec"
@@ -40,6 +42,7 @@ from typing import TYPE_CHECKING
 from .simulate_discoal import Simulator, DISCOAL, DECODE_MAP, DEMES_EXAMPLES
 from .fv import summary_statistics
 from .data import Data
+from . import balancing
 
 # Version
 try:
@@ -90,13 +93,13 @@ class _LazyAttr:
         self._attr = attr
 
     def _target(self):
-        return getattr(self._mod_proxy._load(), self._attr)
+        return getattr(
+            self._mod_proxy._load(), self._attr
+        )  # Allow calling like fs.CNN(...)
 
-    # Allow calling like fs.CNN(...)
     def __call__(self, *a, **kw):
-        return self._target()(*a, **kw)
+        return self._target()(*a, **kw)  # Support attribute access like fs.CNN.__name__
 
-    # Support attribute access like fs.CNN.__name__
     def __getattr__(self, name):
         return getattr(self._target(), name)
 
@@ -104,15 +107,26 @@ class _LazyAttr:
         return f"<lazy attr {self._mod_proxy._fqname}.{self._attr} (unloaded)>"
 
 
-# Create a module proxy for .cnn and lightweight attribute proxies
-_cnn_module_proxy = _LazyModule(".cnn", __name__)
-cnn = _cnn_module_proxy
-CNN = _LazyAttr(_cnn_module_proxy, "CNN")
-rank_probabilities = _LazyAttr(_cnn_module_proxy, "rank_probabilities")
+BUILDING_DOCS = (
+    os.environ.get("READTHEDOCS") == "True"
+    or os.environ.get("FLEXSWEEP_BUILD_DOCS") == "1"
+)
+
+if BUILDING_DOCS:
+    from .cnn import CNN, rank_probabilities
+
+    cnn = importlib.import_module(".cnn", __name__)
+else:
+    _cnn_module_proxy = _LazyModule(".cnn", __name__)
+    cnn = _cnn_module_proxy
+    CNN = _LazyAttr(_cnn_module_proxy, "CNN")
+    rank_probabilities = _LazyAttr(_cnn_module_proxy, "rank_probabilities")
+
 
 # What the package exports (also helps tab completion)
 __all__ = [
     # eager
+    "balancing",
     "Simulator",
     "DISCOAL",
     "DEMES_EXAMPLES",

@@ -64,6 +64,7 @@ class Data:
         self.step = step
         self.nthreads = nthreads
         self.sequence_length = sequence_length
+        self.in_memory = in_memory
 
     def genome_reader(self, region, samples):
         """

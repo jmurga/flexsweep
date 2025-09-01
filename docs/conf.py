@@ -1,6 +1,15 @@
 import os
 import sys
 
+import os
+
+os.environ.setdefault("FLEXSWEEP_BUILD_DOCS", "1")
+
+import sys, pathlib
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
 project = "Flex-sweep"
 copyright = "2025, Jesús Murga-Moreno"
 author = "Jesús Murga-Moreno, David Enard"
@@ -20,6 +29,7 @@ extensions = [
     "sphinx.ext.autosummary",
     "sphinx.ext.mathjax",
     "sphinx.ext.githubpages",
+    "sphinx.ext.viewcode",
 ]
 
 templates_path = ["_templates"]
@@ -31,4 +41,5 @@ language = "en"
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
 html_theme = "sphinx_rtd_theme"
+html_show_sourcelink = True
 html_static_path = []

@@ -1,3 +1,8 @@
+from . import np, Parallel, delayed, pl
+
+from numba import njit, float64, int64
+
+
 @njit
 def calc_d(freq, core_freq, p):
     """Calculates the value of d, the similarity measure
@@ -624,19 +629,6 @@ def run_beta_window(snp_info, p=2, m=0.1):
 
     # return output
     return pl.DataFrame(output)
-
-
-(
-    hap_int,
-    rec_map_01,
-    ac,
-    biallelic_mask,
-    position_masked,
-    genetic_position_masked,
-) = filter_gt(hap, rec_map, region=region)
-freqs = ac[:, 1] / ac.sum(axis=1)
-S, n = hap_int.shape
-snp_info = np.column_stack([position_masked, freqs, ac, np.repeat(n, ac.shape[0])])
 
 
 @njit

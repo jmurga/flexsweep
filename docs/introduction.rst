@@ -10,7 +10,9 @@ Similar to the first version, Flex-sweep works in three main steps: simulation, 
 
 Minimum requirements
 --------------------
-Flex-sweep is now able to run into a workstation, moving from HPC and high storage necessities. The minimum requirements will depend mainly on the species' genome and the number of samples. We tested Flex-sweep on 1000GP data. We run YRI population (n = 108) simulations, summary estimations from simulations, summary statistics from autosomes, training and prediction using the following workstation configuration in a few hours.
+Flex-sweep is now able to run into a workstation, moving from HPC and high storage necessities. The minimum requirements will depend mainly on the species' genome and the number of samples. We tested Flex-sweep on the entire 1000GP dataset. The examples presented in the documentation run YRI population (n = 108) simulations, summary estimations from simulations, summary statistics from autosomes, training and prediction using the following workstation configuration in a few hours.
+
+The summary statistics estimation heavily relies on numpy arrays, so sample size and RAM consumption are the limiting factors of our software. We tested YRI population workflow using the following recommended configuration to achieve reasonable fast genome-wide predictions.
 
 * Pop!_OS 22.04
 * AMD Ryzen 9 PRO 5945 workstation (24 cores)
@@ -18,7 +20,6 @@ Flex-sweep is now able to run into a workstation, moving from HPC and high stora
 * 64GB RAM
 * NVIDIA GeForce RTX 3080
 
-The summary statistics estimation heavily relies on numpy arrays, so sample size and RAM consumption are the limiting factors of our software.
 
 New features
 ------------
@@ -28,7 +29,7 @@ The software now works with VCF data, so it is not needed to convert VCF to hap/
 
 The software is now able to estimate summary statistics in custom genomic center ranges as well as window sizes. Features vectors are now estimated in custom regions.
 
-We refactor the entire package, focusing on speed and traceability. The code was refactored and takes advantage of `Numba <https://numba.pydata.org/>`_ as much as possible for all the previous statistics except for nSL and iHS, which rely on scikit-allel functions. All the summary statistic outputs and feature vectors rely on `Polars DataFrames <https://pola.rs/>`_ to avoid the previous huge number of intermediate files and easily inspect outputs while reducing RAM consumption as much as possible.
+We refactor the entire package, focusing on speed and traceability. The code was refactored and takes advantage of `Numba <https://numba.pydata.org/>`_ as much as possible for all the previous statistics except for :math:`nS_{L}` and :math:`iHS`, which rely on scikit-allel functions. All the summary statistic outputs and feature vectors rely on `Polars DataFrames <https://pola.rs/>`_ to avoid the previous huge number of intermediate files and easily inspect outputs while reducing RAM consumption as much as possible.
 
 The new version included optimised versions of `iSAFE <https://doi.org/10.1038/nmeth.4606>`_, `DIND <https://doi.org/10.1371/journal.pgen.1000562>`_, hapDAF-o/s, Sratio, highfreq, lowfreq as well as the custom HAF and H12 as described in `Flex-sweep manuscript <https://doi.org/10.1093/molbev/msad139>`_.
 
@@ -65,4 +66,15 @@ We included a rank algorithm to post-process sweep probabilities and ranking for
 
 .. A saliency map class to explore which genomic region and statistic are more revelant during training.
 
-Flex-sweep is now able to work with demography mis-specification! We extend our CNN with the Domain-Adaptive model proposed by `Mo, Z. and Siepel A. 2023 <https://doi.org/10.1371/journal.pgen.1011032>`_.
+Flex-sweep is now able to work with demography and/or BGS mis-specification! We extend our CNN with the Domain-Adaptive (DA) model proposed by `Mo, Z. and Siepel A. 2023 <https://doi.org/10.1371/journal.pgen.1011032>`_. Supervised machine learning in population genetics relies on the assumption that the simulated data would follow same distribution as the empirical data. The DA model implemented is explicitely designed to account for and alleviate such a mismatch between simulated and real data. Flex-sweep is now more versatile to analyze non-model organisms where the quality or availability of simulated parameters such as the mutation rate, recombination rate, and demography are limited.
+
+
+
+.. figure:: images/sia_da.png
+   :align: center
+   :width: 80%
+   :figclass: extra-space cap-justify
+   :alt: Summary of neural networks, domain adaptation architecture, input data and benchmarking in population genetic inference.
+
+   Figure extracted from `Mo, Z. and Siepel, A. 2023 <https://doi.org/10.1371/journal.pgen.1011032>`_.
+   Summary of neural networks, domain adaptation architecture, input data and benchmarking in the context of population genetic inference. Flex-sweep takes the same approach but *Source* and *Target* outputs are now feature-vector images instead of genealogies.

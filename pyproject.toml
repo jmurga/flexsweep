@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "flexsweep"
-version = "1.2"
+version = "1.2.5"
 description = ""
 authors = ["Jesus Murga-Moreno <murgamoreno@gmail.com>"]
 license = "MIT"

@@ -25,6 +25,35 @@ from copy import deepcopy
 
 @register_keras_serializable(package="custom", name="masked_bce_fn")
 def masked_bce_fn(y_true, y_pred):
+    """
+    Binary cross-entropy (BCE) with masking for multi-task domain adaptation.
+
+    This loss behaves like standard BCE **except** that examples with label ``-1``
+    are **ignored** (masked) and do not contribute to the loss or gradients.
+    It enables mixed minibatches where each sample supervises only the relevant head
+    (e.g., classifier vs. domain discriminator) while being ignored by the other.
+
+    Parameters
+    ----------
+    y_true : tf.Tensor
+        Ground-truth labels of shape ``(batch, 1)``. For samples that should be
+        ignored by this loss, set the label value to ``-1.0``.
+    y_pred : tf.Tensor
+        Predicted probabilities of shape ``(batch, 1)``.
+
+    Returns
+    -------
+    tf.Tensor
+        A scalar tensor: the mean BCE over **unmasked** examples.
+        If no unmasked examples are present in the batch, returns ``0.0``.
+
+    Notes
+    -----
+    - Mask sentinel is ``-1.0`` (float). Do not use ``-1`` as a valid class label.
+    - This function is used for **both** the classifier head (sweep vs. neutral)
+      and the domain discriminator head (source vs. target).
+    """
+
     bce = tf.keras.losses.BinaryCrossentropy(reduction=tf.keras.losses.Reduction.NONE)
     mask = tf.not_equal(y_true, -1.0)
     y_true_m = tf.boolean_mask(y_true, mask)
@@ -38,7 +67,40 @@ def masked_bce_fn(y_true, y_pred):
 
 @register_keras_serializable(package="custom", name="GradReverse")
 class GradReverse(tf.keras.layers.Layer):
-    # ---- custom-gradient helper lives INSIDE the class ----
+    """
+    Gradient Reversal Layer (GRL) with tunable strength ``λ``.
+
+    Forward pass: identity (returns the input unchanged).
+    Backward pass: multiplies the incoming gradient by ``-λ``, which
+    *reverses* (and scales) gradients flowing into the shared feature extractor.
+    This encourages the extractor to learn **domain-invariant** features when
+    the GRL feeds a domain classifier.
+
+    Parameters
+    ----------
+    lambd : float, default=0.0
+        Initial GRL strength ``λ``. The effective gradient multiplier is ``-λ``.
+        Can be updated during training (e.g., via :class:`GRLRamp`).
+    **kw : Any
+        Passed to :class:`tf.keras.layers.Layer`.
+
+    Attributes
+    ----------
+    lambd : tf.Variable
+        Non-trainable scalar variable storing the current ``λ`` value. It can be
+        modified by callbacks to schedule warm-up or annealing.
+
+    Notes
+    -----
+    - Serialization: the layer is Keras-serializable and preserves the initial
+      ``λ`` in configs. At runtime, the **variable** value may be updated.
+    - Typical schedules **warm up** ``λ`` from 0 → 0.4–1.0 over several epochs.
+
+    References
+    ----------
+    Ganin & Lempitsky (2015), "Unsupervised Domain Adaptation by
+    Backpropagation" (DANN/GRL).
+    """
     @staticmethod
     @tf.custom_gradient
     def _grl_with_lambda(x, lambd):
@@ -75,6 +137,30 @@ class GradReverse(tf.keras.layers.Layer):
 
 
 class GRLRamp(tf.keras.callbacks.Callback):
+    """
+    Linear warm-up schedule for GRL strength ``λ``.
+
+    Increases the GRL factor linearly from 0 to ``max_lambda`` over
+    ``epochs`` calls to :meth:`on_epoch_begin`. After warm-up, ``λ`` is held
+    constant at ``max_lambda``.
+
+    Parameters
+    ----------
+    grl_layer : GradReverse
+        The GRL layer instance whose ``lambd`` variable will be updated.
+    max_lambda : float, default=0.5
+        Target value for ``λ`` at the end of the warm-up.
+    epochs : int, default=50
+        Number of warm-up epochs. If total training epochs exceed this value,
+        ``λ`` remains fixed thereafter.
+
+    Notes
+    -----
+    - Warm-up helps stabilize training by letting the classifier learn a useful
+      decision surface **before** strong domain-adversarial pressure is applied.
+    - Consider tuning ``max_lambda`` and warm-up length based on how quickly the
+      domain accuracy approaches ~0.5 (a sign of domain invariance).
+    """
     def __init__(self, grl_layer, max_lambda=0.5, epochs=50):
         """
         epochs = number of ramp epochs (not total training epochs).
@@ -106,17 +192,44 @@ def se_block_2d(x, reduction=8):
 
 class CNN:
     """
-    A class for building and training a Convolutional Neural Network (CNN) for classification tasks using flex-sweep input statistics.
-    Attributes:
-        train_data (str or pl.DataFrame): Path to the training data file or a pandas DataFrame containing the training data.
-        test_data (pl.DataFrame): DataFrame containing test data after being loaded from a file.
-        output_folder (str): Directory where the trained model and history will be saved.
-        num_stats (int): Number of statistics/features in the training data. Default is 11.
-        center (np.ndarray): Array defining the center positions for processing. Default ranges from 500000 to 700000.
-        windows (np.ndarray): Array defining the window sizes for the CNN. Default values are [50000, 100000, 200000, 500000, 1000000].
-        train_split (float): Fraction of the training data used for training. Default is 0.8.
-        model (tf.keras.Model): Keras model instance for the CNN.
-        gpu (bool): Indicates whether to use GPU for training. Default is True.
+    Class to build and train a Convolutional Neural Network (CNN) for Flex-sweep.
+    It loads/reshapes Flex-sweep feature vectors, trains, evaluates and predicts, including
+    domain-adaptation extension.
+
+    Attributes
+    ----------
+    train_data : str | pl.DataFrame | None
+        Path to training parquet/CSV (or a Polars DataFrame).
+    source_data : str | None
+        Path to *source* (labeled) parquet for domain adaptation.
+    target_data : str | None
+        Path to *target/empirical* parquet for domain adaptation (unlabeled).
+    predict_data : str | pl.DataFrame | None
+        Path/DataFrame with samples to predict (standard supervised path).
+    valid_data : Any
+        (Reserved) Optional separate validation set path/DF (unused).
+    output_folder : str | None
+        Directory where models, figures and predictions are written.
+    normalize : bool
+        If True, apply a Keras `Normalization` layer (fit on train only).
+    model : tf.keras.Model | str | None
+        A compiled Keras model or a path to a saved model.
+    num_stats : int
+        Number of per-window statistics used as channels. Default 11.
+    center : np.ndarray[int]
+        Center coordinates (bp) used to index columns; defaults to 500k..700k step 10k.
+    windows : np.ndarray[int]
+        Window sizes used to index columns; default [50k, 100k, 200k, 500k, 1M].
+    train_split : float
+        Fraction of data used for training (rest split equally into val/test).
+    gpu : bool
+        If False, disable CUDA via `CUDA_VISIBLE_DEVICES=-1`.
+    tf : module | None
+        TensorFlow module, set by :meth:`check_tf`.
+    history : pl.DataFrame | None
+        Training history after :meth:`train` / :meth:`train_da`.
+    prediction : pl.DataFrame | None
+        Latest prediction table produced by :meth:`train` or :meth:`predict*`.
     """
 
     def __init__(
@@ -131,11 +244,31 @@ class CNN:
         model=None,
     ):
         """
-        Initializes the CNN class with training data and output folder.
+        Initialize a CNN runner.
 
-        Args:
-            train_data (str or pl.DataFrame): Path to the training data file or a pandas DataFrame containing the training data.
-            output_folder (str): Directory to save the trained model and history.
+        Parameters
+        ----------
+        train_data : str | pl.DataFrame | None
+            Path to training data (`.parquet`, `.csv[.gz]`) or Polars DataFrame.
+        source_data : str | None
+            Path to labeled source parquet for domain adaptation.
+        target_data : str | None
+            Path to unlabeled empirical/target parquet for domain adaptation.
+        predict_data : str | pl.DataFrame | None
+            Path/DataFrame for inference in :meth:`predict`.
+        valid_data : Any, optional
+            Reserved for a future explicit validation split (unused).
+        output_folder : str | None
+            Output directory for artifacts (models, plots, CSVs).
+        normalize : bool, default=False
+            If True, fit a `Normalization` layer on training features.
+        model : tf.keras.Model | str | None
+            Prebuilt Keras model or path to a saved model.
+
+        Notes
+        -----
+        Defaults assume 11 statistics × 5 windows × 21 centers
+        organized in column names like: ``{stat}_{window}_{center}``.
         """
         # self.sweep_data = sweep_data
         self.normalize = normalize
@@ -158,10 +291,17 @@ class CNN:
 
     def check_tf(self):
         """
-        Checks and imports the TensorFlow library.
+        Import TensorFlow (optionally forcing CPU).
 
-        Returns:
-            tf.Module: The TensorFlow module.
+        Returns
+        -------
+        module
+            Imported ``tensorflow`` module.
+
+        Notes
+        -----
+        If ``self.gpu`` is ``False``, the environment variable
+        ``CUDA_VISIBLE_DEVICES`` is set to ``-1`` **before** importing TF.
         """
         if self.gpu is False:
             os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
@@ -170,13 +310,28 @@ class CNN:
 
     def cnn_flexsweep(self, model_input, num_classes=1):
         """
-        Flex-sweep CNN architecture with multiple convolutional and pooling layers.
+        Flex-sweep CNN feature extractor + classifier head.
 
-        Args:            input_shape (tuple): Shape of the input data, e.g., (224, 224, 3). Default Flex-sweep input statistics, windows and centers
-            num_classes (int): Number of output classes in the classification problem. Default: Flex-sweep binary classification
+        Parameters
+        ----------
+        model_input : tf.keras.layers.Input
+            Keras input tensor with shape ``(W, C, S)`` where
+            ``W=len(self.windows)``, ``C=len(self.center)``, ``S=self.num_stats)``.
+        num_classes : int, default=1
+            Number of output classes. This method currently returns a single
+            sigmoid unit for binary classification.
 
-        Returns:
-            Model: A Keras model instance representing the Flex-sweep CNN architecture.
+        Returns
+        -------
+        tf.Tensor
+            Output tensor with shape ``(None, 1)`` and sigmoid activation.
+
+        Notes
+        -----
+        Architecture uses three parallel Conv2D branches:
+        a 3×3 stack, a 2×2 stack with dilation (1,3), and a 2×2 stack with
+        dilations (5,1) then (1,5). Their flattened features are concatenated
+        and passed through dense layers to a single sigmoid.
         """
 
         # 3x3 layer
@@ -188,7 +343,7 @@ class CNN:
             name="convlayer1_1",
             kernel_initializer=initializer,
         )(model_input)
-        layer1 = tf.keras.layers.ReLU(negative_slope=0)(layer1)
+        layer1 = tf.keras.layers.ReLU()(layer1)
         layer1 = tf.keras.layers.Conv2D(
             128,
             3,
@@ -196,11 +351,11 @@ class CNN:
             name="convlayer1_2",
             kernel_initializer=initializer,
         )(layer1)
-        layer1 = tf.keras.layers.ReLU(negative_slope=0)(layer1)
+        layer1 = tf.keras.layers.ReLU()(layer1)
         layer1 = tf.keras.layers.Conv2D(256, 3, padding="same", name="convlayer1_3")(
             layer1
         )
-        layer1 = tf.keras.layers.ReLU(negative_slope=0)(layer1)
+        layer1 = tf.keras.layers.ReLU()(layer1)
         layer1 = tf.keras.layers.MaxPooling2D(
             pool_size=3, name="poollayer1", padding="same"
         )(layer1)
@@ -216,7 +371,7 @@ class CNN:
             name="convlayer2_1",
             kernel_initializer=initializer,
         )(model_input)
-        layer2 = tf.keras.layers.ReLU(negative_slope=0)(layer2)
+        layer2 = tf.keras.layers.ReLU()(layer2)
         layer2 = tf.keras.layers.Conv2D(
             128,
             2,
@@ -225,11 +380,11 @@ class CNN:
             name="convlayer2_2",
             kernel_initializer=initializer,
         )(layer2)
-        layer2 = tf.keras.layers.ReLU(negative_slope=0)(layer2)
+        layer2 = tf.keras.layers.ReLU()(layer2)
         layer2 = tf.keras.layers.Conv2D(
             256, 2, dilation_rate=[1, 3], padding="same", name="convlayer2_3"
         )(layer2)
-        layer2 = tf.keras.layers.ReLU(negative_slope=0)(layer2)
+        layer2 = tf.keras.layers.ReLU()(layer2)
         layer2 = tf.keras.layers.MaxPooling2D(pool_size=2, name="poollayer2")(layer2)
         layer2 = tf.keras.layers.Dropout(0.15, name="droplayer2")(layer2)
         layer2 = tf.keras.layers.Flatten(name="flatlayer2")(layer2)
@@ -244,7 +399,7 @@ class CNN:
             name="convlayer4_1",
             kernel_initializer=initializer,
         )(model_input)
-        layer3 = tf.keras.layers.ReLU(negative_slope=0)(layer3)
+        layer3 = tf.keras.layers.ReLU()(layer3)
         layer3 = tf.keras.layers.Conv2D(
             128,
             2,
@@ -253,11 +408,11 @@ class CNN:
             name="convlayer4_2",
             kernel_initializer=initializer,
         )(layer3)
-        layer3 = tf.keras.layers.ReLU(negative_slope=0)(layer3)
+        layer3 = tf.keras.layers.ReLU()(layer3)
         layer3 = tf.keras.layers.Conv2D(
             256, 2, dilation_rate=[1, 5], padding="same", name="convlayer4_3"
         )(layer3)
-        layer3 = tf.keras.layers.ReLU(negative_slope=0)(layer3)
+        layer3 = tf.keras.layers.ReLU()(layer3)
         layer3 = tf.keras.layers.MaxPooling2D(pool_size=2, name="poollayer3")(layer3)
         layer3 = tf.keras.layers.Dropout(0.15, name="droplayer3")(layer3)
         layer3 = tf.keras.layers.Flatten(name="flatlayer3")(layer3)
@@ -279,302 +434,45 @@ class CNN:
 
         return output
 
-    def cnn_flexsweep_2d(self, model_input, num_classes=1):
+    def load_training_data(self, _stats=None, w=None, n=None, one_dim = False):
         """
-        Build a CNN as described in the provided JSON, following the explicit, layered cnn_flexsweep style.
-        All parameters and layer names are from your config.
-        """
+        Load and reshape training/validation/test tensors from table-format features.
 
-        # --- Main branch ---
-        x = tf.keras.layers.Dropout(0.1, name="dropout")(model_input)
-        x = tf.keras.layers.Flatten(name="flatten")(x)
-        x = tf.keras.layers.Dense(64, activation="relu", name="dense_2")(x)
-        x = tf.keras.layers.Dropout(0.2, name="dropout_1")(x)
-        x = tf.keras.layers.Dense(128, activation="relu", name="dense_3")(x)
-        x = tf.keras.layers.Dropout(0.2, name="dropout_2")(x)
-        out = tf.keras.layers.Dense(num_classes, activation="sigmoid", name="dense_4")(
-            x
-        )
+        Parameters
+        ----------
+        _stats : list[str] | None
+            List of statistic base names to include (e.g., ``["ihs","nsl",...]``).
+            If None, you must pass an explicit list later in :meth:`train`.
+        w : int | list[int] | None
+            Restrict to specific window sizes (e.g., 100000 or [50000,100000]).
+            Columns are selected by regex suffix ``_{window}``.
+        n : int | None
+            Optional number of rows to sample from parquet.
+        one_dim : bool, default=False
+            If True, flatten spatial grid to ``(W*C, S)`` for 1D models.
 
-        return out
+        Returns
+        -------
+        tuple
+            ``(X_train, X_test, Y_train, Y_test, X_valid, Y_valid)`` with shapes:
 
-    def cnn_flexsweep_small_v2(self, model_input, num_classes=1):
-        """
-        Fine-scale Flex-sweep CNN with:
-          • Per-stat depthwise spatial filters
-          • Cross-stat mixing via 1×1 conv
-          • Branches for local, mid, and broad patterns
-        Designed for (windows=5, centers=21, stats=11) when channel==11.
-        """
+            - if ``one_dim`` is False:
+              ``X_*`` → ``(N, W, C, S)``, labels are 0/1.
+            - if ``one_dim`` is True:
+              ``X_*`` → ``(N, W*C, S)``.
 
-        He = tf.keras.initializers.HeNormal()
+        Raises
+        ------
+        AssertionError
+            If ``train_data`` is missing or has an unsupported extension.
 
-        def se_block(x, reduction=8):
-            c = x.shape[-1]
-            s = tf.keras.layers.GlobalAveragePooling2D()(x)
-            s = tf.keras.layers.Dense(
-                max(c // reduction, 4), activation="relu", kernel_initializer=He
-            )(s)
-            s = tf.keras.layers.Dense(c, activation="sigmoid", kernel_initializer=He)(s)
-            s = tf.keras.layers.Reshape((1, 1, c))(s)
-            return tf.keras.layers.Multiply()([x, s])
-
-        def per_stat_then_mix(
-            x, k, d=(1, 1), filters_out=24, padding="same", name=None
-        ):
-            """Depthwise conv per stat -> pointwise conv to mix stats."""
-            x = tf.keras.layers.DepthwiseConv2D(
-                kernel_size=k,
-                padding=padding,
-                dilation_rate=d,
-                depthwise_initializer=He,
-                name=None if name is None else f"{name}_dw",
-            )(x)
-            x = tf.keras.layers.LayerNormalization(epsilon=1e-5)(x)
-            x = tf.keras.layers.ReLU()(x)
-
-            x = tf.keras.layers.Conv2D(
-                filters_out,
-                (1, 1),
-                padding="same",
-                kernel_initializer=He,
-                name=None if name is None else f"{name}_pw",
-            )(x)
-            x = tf.keras.layers.LayerNormalization(epsilon=1e-5)(x)
-            x = tf.keras.layers.ReLU()(x)
-            return x
-
-        # --- Stage 0: Early 1×1 stat mixing (light)
-        x0 = tf.keras.layers.Conv2D(
-            16, (1, 1), padding="same", kernel_initializer=He, name="mix_stats"
-        )(model_input)
-        x0 = tf.keras.layers.ReLU()(x0)
-        x0 = se_block(x0)  # channel attention
-
-        # === Branch A: ultra-local (fine detail)
-        a = per_stat_then_mix(
-            x0, k=(1, 3), filters_out=16, name="A_c1"
-        )  # across centers
-        a = per_stat_then_mix(
-            a, k=(3, 1), filters_out=24, name="A_c2"
-        )  # across windows
-        a = tf.keras.layers.MaxPooling2D(
-            pool_size=(1, 2), padding="same", name="A_pool"
-        )(a)
-        a = tf.keras.layers.SpatialDropout2D(0.10)(a)
-        a = tf.keras.layers.GlobalAveragePooling2D()(a)
-
-        # === Branch B: mid-context
-        b = per_stat_then_mix(
-            x0, k=(1, 5), filters_out=16, name="B_c1"
-        )  # 5-center span
-        b = per_stat_then_mix(
-            b, k=(3, 1), filters_out=24, name="B_c2"
-        )  # small window context
-        b = tf.keras.layers.MaxPooling2D(
-            pool_size=(1, 2), padding="same", name="B_pool"
-        )(b)
-        b = tf.keras.layers.SpatialDropout2D(0.10)(b)
-        b = tf.keras.layers.GlobalAveragePooling2D()(b)
-
-        # === Branch C: broad context (late dilation)
-        c = per_stat_then_mix(
-            x0, k=(1, 3), d=(1, 2), filters_out=16, name="C_c1"
-        )  # ~5 centers effective
-        c = per_stat_then_mix(
-            c, k=(3, 1), d=(2, 1), filters_out=24, name="C_c2"
-        )  # ~5 windows effective
-        c = tf.keras.layers.MaxPooling2D(
-            pool_size=(1, 2), padding="same", name="C_pool"
-        )(c)
-        c = tf.keras.layers.SpatialDropout2D(0.10)(c)
-        c = tf.keras.layers.GlobalAveragePooling2D()(c)
-
-        # === Merge branches
-        x = tf.keras.layers.Concatenate()([a, b, c])
-
-        # === Head
-        x = tf.keras.layers.Dense(64, activation="relu", kernel_initializer=He)(x)
-        x = tf.keras.layers.Dropout(0.25)(x)
-        act = "sigmoid" if num_classes == 1 else "softmax"
-        out = tf.keras.layers.Dense(num_classes, activation=act, kernel_initializer=He)(
-            x
-        )
-
-        return out
-
-    def cnn_flexsweep_small(self, model_input, num_classes=1):
-        """
-        Fine-scale Flex-sweep CNN with:
-          • Per-stat depthwise spatial filters
-          • Cross-stat mixing via 1×1 conv
-          • Branches for local, mid, and broad patterns
-        Designed for (windows=5, centers=21, stats=11) when channel==11.
-        """
-
-        He = tf.keras.initializers.HeNormal()
-
-        def se_block(x, reduction=8):
-            c = x.shape[-1]
-            s = tf.keras.layers.GlobalAveragePooling2D()(x)
-            s = tf.keras.layers.Dense(
-                max(c // reduction, 4), activation="relu", kernel_initializer=He
-            )(s)
-            s = tf.keras.layers.Dense(c, activation="sigmoid", kernel_initializer=He)(s)
-            s = tf.keras.layers.Reshape((1, 1, c))(s)
-            return tf.keras.layers.Multiply()([x, s])
-
-        def per_stat_then_mix(
-            x, k, d=(1, 1), filters_out=24, padding="same", name=None
-        ):
-            """Depthwise conv per stat -> pointwise conv to mix stats."""
-            x = tf.keras.layers.DepthwiseConv2D(
-                kernel_size=k,
-                padding=padding,
-                dilation_rate=d,
-                depthwise_initializer=He,
-                name=None if name is None else f"{name}_dw",
-            )(x)
-            x = tf.keras.layers.LayerNormalization(epsilon=1e-5)(x)
-            x = tf.keras.layers.ReLU()(x)
-
-            x = tf.keras.layers.Conv2D(
-                filters_out,
-                (1, 1),
-                padding="same",
-                kernel_initializer=He,
-                name=None if name is None else f"{name}_pw",
-            )(x)
-            x = tf.keras.layers.LayerNormalization(epsilon=1e-5)(x)
-            x = tf.keras.layers.ReLU()(x)
-            return x
-
-        # --- Stage 0: Early 1×1 stat mixing (light)
-        x0 = tf.keras.layers.Conv2D(
-            16, (1, 1), padding="same", kernel_initializer=He, name="mix_stats"
-        )(model_input)
-        x0 = tf.keras.layers.ReLU()(x0)
-        x0 = se_block(x0)  # channel attention
-
-        # === Branch A: ultra-local (fine detail)
-        a = per_stat_then_mix(
-            x0, k=(1, 3), filters_out=16, name="A_c1"
-        )  # across centers
-        a = per_stat_then_mix(
-            a, k=(3, 1), filters_out=24, name="A_c2"
-        )  # across windows
-        a = tf.keras.layers.MaxPooling2D(
-            pool_size=(1, 2), padding="same", name="A_pool"
-        )(a)
-        a = tf.keras.layers.SpatialDropout2D(0.10)(a)
-        a = tf.keras.layers.GlobalAveragePooling2D()(a)
-
-        # === Branch B: mid-context
-        b = per_stat_then_mix(
-            x0, k=(1, 5), filters_out=16, name="B_c1"
-        )  # 5-center span
-        b = per_stat_then_mix(
-            b, k=(3, 1), filters_out=24, name="B_c2"
-        )  # small window context
-        b = tf.keras.layers.MaxPooling2D(
-            pool_size=(1, 2), padding="same", name="B_pool"
-        )(b)
-        b = tf.keras.layers.SpatialDropout2D(0.10)(b)
-        b = tf.keras.layers.GlobalAveragePooling2D()(b)
-
-        # === Branch C: broad context (late dilation)
-        c = per_stat_then_mix(
-            x0, k=(1, 3), d=(1, 2), filters_out=16, name="C_c1"
-        )  # ~5 centers effective
-        c = per_stat_then_mix(
-            c, k=(3, 1), d=(2, 1), filters_out=24, name="C_c2"
-        )  # ~5 windows effective
-        c = tf.keras.layers.MaxPooling2D(
-            pool_size=(1, 2), padding="same", name="C_pool"
-        )(c)
-        c = tf.keras.layers.SpatialDropout2D(0.10)(c)
-        c = tf.keras.layers.GlobalAveragePooling2D()(c)
-
-        # === Merge branches
-        x = tf.keras.layers.Concatenate()([a, b, c])
-
-        # === Head
-        x = tf.keras.layers.Dense(64, activation="relu", kernel_initializer=He)(x)
-        x = tf.keras.layers.Dropout(0.25)(x)
-        act = "sigmoid" if num_classes == 1 else "softmax"
-        out = tf.keras.layers.Dense(num_classes, activation=act, kernel_initializer=He)(
-            x
-        )
-
-        return out
-
-    def cnn_simple_opt(self, model_input, num_classes=1):
-        """
-        Improved CNN for popgen summary statistics with tiny spatial dimensions.
-        Includes BN, global pooling, and tuned dropout to help generalization and recall.
-        """
-
-        initializer = tf.keras.initializers.HeNormal()
-
-        x = tf.keras.layers.Conv2D(
-            64, (2, 1), padding="same", kernel_initializer=initializer, name="conv_2x1"
-        )(model_input)
-        x = tf.keras.layers.BatchNormalization()(x)
-        x = tf.keras.layers.ReLU()(x)
-
-        x = tf.keras.layers.Conv2D(
-            64, (1, 2), padding="same", kernel_initializer=initializer, name="conv_1x2"
-        )(x)
-        x = tf.keras.layers.BatchNormalization()(x)
-        x = tf.keras.layers.ReLU()(x)
-
-        x = tf.keras.layers.Conv2D(
-            128, (2, 2), padding="same", kernel_initializer=initializer, name="conv_2x2"
-        )(x)
-        x = tf.keras.layers.BatchNormalization()(x)
-        x = tf.keras.layers.ReLU()(x)
-
-        # Optional deeper conv layer
-        x = tf.keras.layers.Conv2D(
-            128, (1, 1), padding="same", kernel_initializer=initializer, name="conv_1x1"
-        )(x)
-        x = tf.keras.layers.BatchNormalization()(x)
-        x = tf.keras.layers.ReLU()(x)
-
-        x = tf.keras.layers.MaxPooling2D(pool_size=(2, 1), name="gentle_pool")(x)
-        x = tf.keras.layers.Dropout(0.15, name="dropout_1")(x)
-
-        # Swap Flatten → GlobalAveragePooling2D
-        x = tf.keras.layers.GlobalAveragePooling2D(name="global_avg_pool")(x)
-        # x = self.attention_pool_2d(x, name="attn_pool")
-
-        x = tf.keras.layers.Dense(128, activation="relu", name="dense_1")(x)
-        x = tf.keras.layers.Dropout(0.2, name="dropout_2")(x)
-
-        x = tf.keras.layers.Dense(32, activation="relu", name="dense_2")(x)
-        x = tf.keras.layers.Dropout(0.1, name="dropout_3")(x)
-
-        output = tf.keras.layers.Dense(
-            num_classes, activation="sigmoid", name="output"
-        )(x)
-
-        return output
-
-    def load_training_data(self, _stats=None, w=None, n=None):
-        """
-        Loads training data from specified files and preprocesses it for training.
-
-        Returns:
-            tuple: Contains the training and validation datasets:
-                - X_train (np.ndarray): Input features for training.
-                - X_test (np.ndarray): Input features for testing.
-                - Y_train (np.ndarray): One-hot encoded labels for training.
-                - Y_test (np.ndarray): One-hot encoded labels for testing.
-                - X_valid (np.ndarray): Input features for validation.
-                - Y_valid (np.ndarray): One-hot encoded labels for validation.
+        Notes
+        -----
+        Any ``model`` value not equal to ``"neutral"`` is coerced to ``"sweep"``.
         """
 
         assert self.train_data is not None, "Please input training data"
+
         assert (
             "txt" in self.train_data
             or "csv" in self.train_data
@@ -687,6 +585,36 @@ class CNN:
             self.stat_norm = tf.keras.layers.Normalization(axis=-1, name="stat_norm")
             self.stat_norm.adapt(X_train)  # learns mean/std from training set only
 
+
+        # Input stats as channel to improve performance
+        # Avoiding changes stats order
+
+        X_train = X_train.reshape(
+            X_train.shape[0], self.windows.size, self.center.size, self.num_stats
+        )
+        X_test = X_test.reshape(
+            X_test.shape[0], self.windows.size, self.center.size, self.num_stats
+        )
+        X_valid = X_valid.reshape(
+            X_valid.shape[0], self.windows.size, self.center.size, self.num_stats
+        )
+
+        X_test = X_test.reshape(
+            X_test.shape[0], self.windows.size, self.center.size, self.num_stats
+        )
+
+        if one_dim:
+
+            X_train = X_train.reshape(
+                -1, self.windows.size * self.center.size, self.num_stats
+            )
+            X_valid = X_valid.reshape(
+                -1, self.windows.size * self.center.size, self.num_stats
+            )
+            X_test = X_test.reshape(
+                -1, self.windows.size * self.center.size, self.num_stats
+            )
+
         self.test_train_data = [X_test, X_test_params, Y_test]
 
         return (
@@ -698,13 +626,43 @@ class CNN:
             Y_valid,
         )
 
-    def train(self, _iter=1, _stats=None, w=None, cnn=None):
+    def train(self, _iter=1, _stats=None, w=None, cnn=None, one_dim = False):
         """
-        Trains the CNN model on the training data.
+        Train a CNN on flex-sweep tensors with early stopping and checkpoints.
 
-        This method preprocesses the data, sets up data augmentation, defines the model architecture,
-        compiles the model, and fits it to the training data while saving the best model and training history.
+        Parameters
+        ----------
+        _iter : int, default=1
+            Tag for output naming (kept for backwards compatibility).
+        _stats : list[str] | None
+            Statistic base names. If None, defaults to the 11 flex-sweep stats.
+        w : int | list[int] | None
+            Window size(s) to select (see :meth:`load_training_data`).
+        cnn : callable | None
+            A function mapping a Keras input tensor to an output tensor.
+            Defaults to :meth:`cnn_flexsweep`. If ``one_dim=True``, you must
+            provide a compatible 1D architecture.
+        one_dim : bool, default=False
+            If True, uses flattened ``(W*C, S)`` inputs.
+
+        Returns
+        -------
+        pl.DataFrame
+            Predictions on the held-out test set with columns:
+            ``['model','f_i','f_t','s','t','predicted_model','prob_sweep','prob_neutral']``.
+
+        Notes
+        -----
+        - Optimizer: Adam with cosine-restarts schedule.
+        - Loss: Binary cross-entropy with label smoothing (0.05).
+        - Early stopping monitors validation AUC (restore best weights).
+        - Saves ``model.keras`` to ``output_folder`` if provided.
         """
+
+
+        if one_dim:
+            assert cnn is not None, "Please input a 1D CNN architecture"
+
 
         # Default stats
         if _stats is None:
@@ -735,18 +693,8 @@ class CNN:
             Y_test,
             X_valid,
             Y_valid,
-        ) = self.load_training_data(w=w, _stats=_stats)
+        ) = self.load_training_data(w=w, _stats=_stats, one_dim = one_dim)
 
-        # Stats as channel
-        X_train = X_train.reshape(
-            X_train.shape[0], self.windows.size, self.center.size, self.num_stats
-        )
-        X_test = X_test.reshape(
-            X_test.shape[0], self.windows.size, self.center.size, self.num_stats
-        )
-        X_valid = X_valid.reshape(
-            X_valid.shape[0], self.windows.size, self.center.size, self.num_stats
-        )
         input_shape = (self.center.size, self.windows.size, self.num_stats)
 
         # put model together
@@ -865,9 +813,9 @@ class CNN:
 
         test_X, test_X_params, test_Y = deepcopy(self.test_train_data)
 
-        test_X = test_X.reshape(
-            test_X.shape[0], self.windows.size, self.center.size, self.num_stats
-        )
+        # test_X = test_X.reshape(
+        #     test_X.shape[0], self.windows.size, self.center.size, self.num_stats
+        # )
         preds = model.predict(test_X)
 
         preds = np.column_stack([1 - preds, preds])
@@ -935,12 +883,34 @@ class CNN:
 
     def predict(self, _stats=None, w=None, simulations = False, _iter=1):
         """
-        Makes predictions on the test data using the trained CNN model.
+        Predict on a feature table using a trained model.
 
-        This method loads test data, processes it, and applies the trained model to generate predictions.
+        Parameters
+        ----------
+        _stats : list[str] | None
+            Statistic base names to include; defaults to the 11 flex-sweep stats.
+        w : int | list[int] | None
+            Window size(s) to select.
+        simulations : bool, default=False
+            Reserved flag; has no effect here.
+        _iter : int, default=1
+            Tag for output naming (unused).
 
-        Raises:
-            AssertionError: If the model has not been trained or loaded.
+        Returns
+        -------
+        pl.DataFrame
+            Sorted predictions per region with columns:
+            ``['chr','start','end','f_i','f_t','s','t','predicted_model','prob_sweep','prob_neutral']``.
+
+        Raises
+        ------
+        AssertionError
+            If ``self.model`` is not set or ``predict_data`` is missing.
+
+        Notes
+        -----
+        If ``self.model`` is a string path, it is loaded via
+        ``tf.keras.models.load_model``.
         """
 
         if _stats is None:
@@ -998,21 +968,11 @@ class CNN:
 
         test_X_params = df_test.select("model", "iter", "s", "f_i", "f_t", "t")
 
-        test_X = (
-            X_test.select(X_test)
-            .to_numpy()
-            .reshape(
-                X_test.shape[0],
-                self.num_stats,
-                self.windows.size * self.center.size,
-                1,
-            )
-        )
 
-        test_X = test_X.reshape(
-            test_X.shape[0], self.windows.size, self.center.size, self.num_stats
-        )
 
+        test_X = X_test.to_numpy().reshape(
+            X_test.shape[0], self.windows.size, self.center.size, self.num_stats
+        )
 
         preds = model.predict(test_X)
 
@@ -1065,21 +1025,28 @@ class CNN:
 
         return df_prediction
 
-
     def roc_curve(self, _iter=1):
         """
-        Generates and plots ROC curves along with a history plot of model metrics.
+        Build ROC curve, confusion matrix and training-history plots.
 
-        Returns:
-            tuple: A tuple containing:
-                - plot_roc (Figure): The ROC curve plot.
-                - plot_history (Figure): The history plot of model metrics (loss, validation loss, accuracy, validation accuracy).
+        Parameters
+        ----------
+        _iter : int, default=1
+            Tag for output naming (kept for compatibility).
 
-        Example:
-            roc_plot, history_plot = model.roc_curves()
-            plt.show(roc_plot)
-            plt.show(history_plot)
+        Returns
+        -------
+        tuple[matplotlib.figure.Figure, matplotlib.figure.Figure]
+            ``(plot_roc, plot_history)`` figures. Confusion matrix is also saved
+            to ``confusion_matrix.svg`` when ``output_folder`` is set.
+
+        Notes
+        -----
+        - AUC is computed treating ``'sweep'`` as the positive class.
+        - The method expects :attr:`prediction` to contain the latest
+          predictions including ``prob_sweep``.
         """
+
         import matplotlib.pyplot as plt
 
         if isinstance(self.prediction, str):
@@ -1387,7 +1354,7 @@ class CNN:
 
         return X, y, params
 
-    def load_da_data(
+    def load_da_data_sims(
         self,
         _stats=None,
         w=None,
@@ -1395,7 +1362,6 @@ class CNN:
         n_tgt=None,
         test_size=0.20,
         val_size=0.10,
-        seed=42,
     ):
         assert (
             self.source_data is not None and self.target_data is not None
@@ -1432,11 +1398,10 @@ class CNN:
             tgt_params,
             test_size=test_size,
             stratify=y_tgt,
-            random_state=seed,
         )
         val_frac = val_size / (1.0 - test_size)
         X_t_tr, X_t_va, y_t_tr, y_t_va, p_tr, p_va = train_test_split(
-            X_t_tr, y_t_tr, p_tr, test_size=val_frac, stratify=y_t_tr, random_state=seed
+            X_t_tr, y_t_tr, p_tr, test_size=val_frac, stratify=y_t_tr
         )
 
         # keep for training/prediction
@@ -1457,11 +1422,11 @@ class CNN:
         self.test_data = [X_t_te, p_te, y_t_te]
         return self.da_data
 
-    def train_da(self, _stats=None, w=None, batch_size=32, epochs=100, seed=42):
+    def train_da_sims(self, _stats=None, w=None, batch_size=32, epochs=100):
         self.num_stats = len(_stats)
 
         if not hasattr(self, "da_data") or self.da_data is None:
-            self.load_da_data(_stats=_stats, w=w, seed=seed)
+            self.load_da_data_sims(_stats=_stats, w=w)
 
         da = self.da_data
 
@@ -1475,14 +1440,13 @@ class CNN:
             self.stat_norm_da.adapt(X_adapt)  # train-only union
 
         # generator: builds 2B batches with masking exactly like Siepel
-        gen = DAParquetSequence(
+        gen = DAParquetSequence_sims(
             da["X_src"],
             da["y_src"],
             da["X_tgt_train"],
             da["y_tgt_train"],
             batch_size=batch_size,
             shuffle=True,
-            rng_seed=seed,
         )
 
         input_shape = (self.windows.size, self.center.size, len(da["stats"]))
@@ -1490,7 +1454,7 @@ class CNN:
 
         # small mixed-domain validation (so discriminator metrics aren't 0/NaN)
         k = min(2000, len(da["X_src"]))
-        idx_src = np.random.RandomState(seed).choice(
+        idx_src = np.random.RandomState().choice(
             len(da["X_src"]), size=k, replace=False
         )
         Xv = np.concatenate([da["X_src"][idx_src], da["X_tgt_val"]], axis=0)
@@ -1586,8 +1550,8 @@ class CNN:
             model.save(f"{self.output_folder}/model_da.keras")
         return model
 
-    def predict_da(self, _stats=None):
-        assert self.model is not None, "Call train_da() first"
+    def predict_da_sims(self, _stats=None):
+        assert self.model is not None, "Call train_da_sims() first"
         assert isinstance(self.test_data, (list, tuple)) and len(self.test_data) == 3
 
         self.num_stats = len(_stats)
@@ -1623,6 +1587,23 @@ class CNN:
         return df_pred
 
     def feature_extractor(self, model_input):
+        """
+        Shared 2D-CNN feature extractor (three branches).
+
+        Parameters
+        ----------
+        model_input : tf.keras.layers.Input
+            Input tensor of shape ``(W, C, S)``.
+
+        Returns
+        -------
+        tf.Tensor
+            Flattened concatenated features from the three branches.
+
+        See Also
+        --------
+        cnn_flexsweep : Similar branch structure followed by classification head.
+        """
         He = tf.keras.initializers.HeNormal()
 
         # --- Branch 1: 3x3 convs ---
@@ -1715,6 +1696,36 @@ class CNN:
         return feat
 
     def build_grl_model(self, input_shape):
+        """
+        Build a two-head domain-adversarial CNN with a Gradient Reversal Layer.
+
+        Architecture
+        ------------
+        - **Shared feature extractor**: :meth:`feature_extractor` over inputs shaped
+          ``(W, C, S)`` (windows × centers × statistics), channels-last.
+        - **Classifier head** (task): 2 dense layers + sigmoid output named
+          ``"classifier"`` (sweep vs. neutral, BCE).
+        - **Domain head**: GRL → 2 dense layers + sigmoid output named
+          ``"discriminator"`` (source=0 vs. target=1, BCE).
+
+        Parameters
+        ----------
+        input_shape : tuple[int, int, int]
+            ``(W, C, S)`` defining windows, centers, and number of stats (channels).
+
+        Returns
+        -------
+        tf.keras.Model
+            Uncompiled Keras model with two outputs:
+            ``[classifier(sigmoid), discriminator(sigmoid)]``.
+
+        Notes
+        -----
+        - The GRL instance is stored at ``self.grl`` so a callback (e.g., :class:`GRLRamp`)
+          can update its strength during training.
+        - Compilation (optimizer, losses, metrics) is performed in
+          :meth:`train_da_empirical`.
+        """
         inp = tf.keras.Input(shape=input_shape)  # (W, C, S), channels-last
 
         x_in = (
@@ -1746,28 +1757,70 @@ class CNN:
 
         return model
 
-    def load_da_data_empirical(
-        self, _stats=None, w=None, n_src=None, seed=42, src_val_frac=0.10
+    def load_da_data(
+        self, _stats=None, w=None, n_src=None, src_val_frac=0.10
     ):
+        """
+        Prepare labeled **source** and unlabeled **target** tensors for DA training.
+
+        Source (simulated) data are split into train/validation. Target (empirical)
+        data are used for the domain discriminator and later inference. When
+        ``self.normalize`` is True, a `Normalization` layer is adapted on the union
+        of source-train and target features.
+
+        Parameters
+        ----------
+        _stats : list[str] | None
+            Statistic base names to include (e.g. ``["ihs","nsl",...]``). If None,
+            pass explicitly when calling.
+        w : int | list[int] | None
+            Restrict to one or more window sizes. Columns are matched via suffix.
+        n_src : int | None
+            Optional number of source rows to sample for faster tests.
+        src_val_frac : float, default=0.10
+            Fraction of the source set reserved for validation.
+
+        Returns
+        -------
+        dict
+            A mapping with keys:
+            - ``"stats"`` : list[str], the stats actually used
+            - ``"X_src_tr"`` : np.ndarray, shape ``(Ns_tr, W, C, S)``
+            - ``"y_src_tr"`` : np.ndarray, shape ``(Ns_tr,)`` (0/1)
+            - ``"X_src_val"`` : np.ndarray, shape ``(Ns_val, W, C, S)``
+            - ``"y_src_val"`` : np.ndarray, shape ``(Ns_val,)`` (0/1)
+            - ``"X_tgt"`` : np.ndarray, shape ``(Nt, W, C, S)``
+            - ``"tgt_params"`` : pl.DataFrame with region metadata
+
+        Notes
+        -----
+        - If the target parquet has no ``model`` column, a dummy ``"neutral"`` is
+          injected for column selection consistency; target labels are **not** used.
+        - The normalization layer (if enabled) is stored as ``self.stat_norm_da`` and
+          later applied in :meth:`build_grl_model`.
+        """
+
         # Source (labeled): split into train/val (for early stopping)
         src_df = pl.read_parquet(self.source_data)
+        n_simulations = src_df.shape[0]
         if n_src is not None:
-            src_df = src_df.sample(n_src, shuffle=True, seed=seed)
+            src_df = src_df.sample(n_src, shuffle=True)
+            n_simulations = n_src
 
-        stats = [] if _stats is None else list(_stats)
+        stats = []
+        if _stats is not None:
+            stats = stats + _stats
+
         X_src, y_src, _src_params = self._select_stats_matrix_like_old(
             src_df, stats, w=w
         )
 
-        # split source
-        from sklearn.model_selection import train_test_split
-
         Xs_tr, Xs_va, ys_tr, ys_va = train_test_split(
-            X_src, y_src, test_size=src_val_frac, stratify=y_src, random_state=seed
+            X_src, y_src, test_size=src_val_frac, stratify=y_src
         )
 
         # Target (empirical empirical): no split required, use all for domain training and later prediction
-        tgt_df = pl.read_parquet(self.target_data)
+        tgt_df = pl.read_parquet(self.target_data).sample(n_simulations)
         X_tgt, _yt_placeholder, tgt_params = self._select_stats_matrix_like_old(
             # if empirical files have no "model", you can inject a dummy column before calling:
             tgt_df.with_columns(pl.lit("neutral").alias("model"))
@@ -1800,23 +1853,74 @@ class CNN:
 
         return self.da_data
 
-    def train_da_empirical(
-        self, _stats=None, w=None, batch_size=32, epochs=200, seed=42
+    def train_da(
+        self, _stats=None, w=None, batch_size=32, epochs=200
     ):
+        """
+        Train the domain-adversarial model (GRL) using empirical target batches.
+
+        Uses a custom generator that interleaves: 1. **Source** (simulated) samples with true class labels for the classifier head, and 2. Mixed **source/target** samples for the domain head (source=0, target=1), while masking the irrelevant head per sample.
+
+        Parameters
+        ----------
+        _stats : list[str] | None
+            Statistic base names to include.
+        w : int | list[int] | None
+            Window size(s) to select.
+        batch_size : int, default=32
+            Number of **classifier** samples (A) per step.
+            The discriminator receives an additional ``batch_size`` examples per step
+            split between source and target (see generator notes).
+        epochs : int, default=200
+            Number of training epochs.
+
+
+        Returns
+        -------
+        tf.keras.Model
+            The trained DA model (also saved to ``model_da.keras`` when
+            ``output_folder`` is provided).
+
+        Training Details
+        ----------------
+        - **Compilation**: optimizer Adam (CosineDecayRestarts LR), losses:
+          ``masked_bce_fn`` for both ``"classifier"`` and ``"discriminator"``,
+          loss weights 1.0/1.0.
+        - **Metrics**:
+          - Classifier: ``AUC`` (ROC), ``BinaryAccuracy``.
+          - Discriminator: ``BinaryAccuracy`` (domain acc).
+        - **Validation**: source-only validation set (clean labels) with
+          domain labels fixed to 0. Early stopping monitors ``val_classifier_auc``.
+        - **GRL schedule**: :class:`GRLRamp` warms ``λ`` to ``max_lambda`` over
+          ~80% of epochs, then holds constant.
+
+        Notes
+        -----
+        - Healthy domain alignment typically drives domain accuracy towards ≈0.5.
+          If it stays ≫0.5, consider increasing GRL strength; if classifier AUC
+          stagnates, reduce it or decrease target ratio in the generator.
+        """
+
         tf_ = self.check_tf()
+        if _stats is None:
+            _stats = ["ihs", "nsl", "isafe","hapdaf_o", "hapdaf_s","dind", "s_ratio", "low_freq", "high_freq",'h12','haf']
+
+        self.test_data = self.target_data
+
         if not hasattr(self, "da_data") or self.da_data is None:
-            self.load_da_data_empirical(_stats=_stats, w=w, seed=seed)
+            self.load_da_data(_stats=_stats, w=w)
 
         d = self.da_data
-        # generator uses empirical target
-        gen = DAParquetSequence_empirical(
-            d["X_src_tr"], d["y_src_tr"], d["X_tgt"], batch_size=batch_size, tgt_ratio=2
+
+        # XYseq empirical target
+        gen = DAParquetSequence(
+            d["X_src_tr"], d["y_src_tr"], d["X_tgt"], batch_size=batch_size, tgt_ratio=1
         )
 
         input_shape = (self.windows.size, self.center.size, len(d["stats"]))
         model = self.build_grl_model(input_shape)
 
-        # optimizer + compile (masked losses already in your class)
+        # optimizer + compile (masked losses as needed)
         opt = tf_.keras.optimizers.Adam(
             learning_rate=tf_.keras.optimizers.schedules.CosineDecayRestarts(5e-5, 300),
             epsilon=1e-7,
@@ -1829,18 +1933,21 @@ class CNN:
             metrics={
                 "classifier": [
                     tf_.keras.metrics.AUC(name="auc"),
+                    tf_.keras.metrics.AUC(curve="PR", name="auc_pr"),
                     tf_.keras.metrics.BinaryAccuracy(name="accuracy"),
                 ],
                 "discriminator": [tf_.keras.metrics.BinaryAccuracy(name="accuracy")],
             },
         )
 
-        # VALIDATION SET: source-only for clean AUC (no masking issues)
+        # validation set: source-only for clean auc
         Xv = d["X_src_val"]
         yv_cls = d["y_src_val"][:, None].astype(
             np.float32
-        )  # real labels for classifier
-        yv_dom = np.zeros((Xv.shape[0], 1), np.float32)  # domain=0 (source)
+        )
+        # real labels for classifier
+        # domain=0 (source)
+        yv_dom = np.zeros((Xv.shape[0], 1), np.float32)
 
         callbacks = [
             # GRL λ-ramp: rise for ~80% epochs then hold (robust for stronger shifts)
@@ -1888,10 +1995,45 @@ class CNN:
         self.model = model
         if self.output_folder:
             model.save(f"{self.output_folder}/model_da.keras")
+
         return model
 
-    def predict_da_empirical(self, _stats=None):
-        assert self.model is not None, "Call train_da_empirical() first"
+    def predict_da(self, _stats=None):
+        """
+        Predict sweep probabilities on empirical (target) data using a DA model.
+
+        Loads a trained two-head model and returns per-region predictions from the
+        **classifier** head (sweep vs. neutral). The domain head is unused at inference.
+
+        Parameters
+        ----------
+        _stats : list[str] | None
+            Statistic base names to include (must match training).
+
+        Returns
+        -------
+        pl.DataFrame
+            Table with per-region predictions and metadata, including:
+            ``['chr','start','end','f_i','f_t','s','t','predicted_model',
+            'prob_sweep','prob_neutral']`` sorted by chromosome and start.
+
+        Raises
+        ------
+        AssertionError
+            If no model is loaded or the test data path is invalid.
+
+        Notes
+        -----
+        - Expects the same (W, C, S) layout used in training.
+        - Output ``prob_sweep`` is the classifier sigmoid; ``prob_neutral=1-prob_sweep``.
+        """
+        assert self.model is not None, "Call train_da() first"
+
+
+        tf_ = self.check_tf()
+        if _stats is None:
+            _stats = ["ihs", "nsl", "isafe","hapdaf_o", "hapdaf_s","dind", "s_ratio", "low_freq", "high_freq",'h12','haf']
+
 
         if isinstance(self.model, str):
             model = tf.keras.models.load_model(
@@ -1947,18 +2089,12 @@ class CNN:
             )
         )
 
-        if self.channel == 5:
-            test_X = test_X.reshape(
-                test_X.shape[0], self.num_stats, self.center.size, self.windows.size
-            )
-        elif self.channel == 11:
-            test_X = test_X.reshape(
-                test_X.shape[0], self.windows.size, self.center.size, self.num_stats
-            )
-        elif self.channel == 21:
-            test_X = test_X.reshape(
-                test_X.shape[0], self.windows.size, self.num_stats, self.center.size
-            )
+
+
+        test_X = test_X.reshape(
+            test_X.shape[0], self.windows.size, self.center.size, self.num_stats
+        )
+
 
         # Same folder custom fvs name based on input VCF.
         _output_prediction = (
@@ -2004,8 +2140,7 @@ class CNN:
                 pl.Series(chr_start_end[:, 0]).str.replace("chr", "").cast(int),
             ),
         )
-        df_prediction = df_prediction.sort("nchr", "start").select(
-            pl.exclude("region", "iter", "model", "nchr")
+        df_prediction = df_prediction.sort("nchr", "start").select(['chr', 'start', 'end', 'f_i','f_t', 's', 't', 'predicted_model', 'prob_sweep', 'prob_neutral']
         )
 
         self.prediction = df_prediction
@@ -2015,16 +2150,16 @@ class CNN:
         return df_prediction
 
 
-class DAParquetSequence:
+class DAParquetSequence_sims(Sequence):
     def __init__(
-        self, X_src, y_src, X_tgt, y_tgt, batch_size=32, shuffle=True, rng_seed=42
+        self, X_src, y_src, X_tgt, y_tgt, batch_size=32, shuffle=True
     ):
         assert X_src.shape[1:] == X_tgt.shape[1:], "Source/Target shapes must match"
         self.Xs, self.ys = X_src, y_src.astype(np.int32)
         self.Xt, self.yt = X_tgt, y_tgt.astype(np.int32)
         self.B = batch_size
         self.shuffle = shuffle
-        self.rng = np.random.RandomState(rng_seed)
+        self.rng = np.random.RandomState()
         self._reset_epoch()
         # limit batches by pools as Siepel does
         self.n_batches = int(
@@ -2077,9 +2212,61 @@ class DAParquetSequence:
             self._reset_epoch()
 
 
-class DAParquetSequence_empirical:
+class DAParquetSequence(Sequence):
+    """
+    Data generator for domain-adversarial training with masked multi-task labels.
+
+    Each step yields a mixed minibatch that contains:
+      A) ``B`` **source** samples for the classifier (with true labels 0/1),
+         masked for the domain head (label = -1).
+      B) ``half_src`` **source** samples for the domain discriminator (domain=0),
+         masked for the classifier (label = -1).
+      C) ``half_tgt`` **target** samples for the domain discriminator (domain=1),
+         masked for the classifier (label = -1).
+
+    The ratio ``half_src : half_tgt`` is controlled by ``tgt_ratio``. With
+    ``tgt_ratio=1``, the domain minibatch is balanced (50/50). The total number
+    of examples returned per step is ``B + half_src + half_tgt``.
+
+    Parameters
+    ----------
+    X_src : np.ndarray
+        Source feature tensor of shape ``(Ns, W, C, S)``.
+    y_src : np.ndarray
+        Source class labels of shape ``(Ns,)`` with values in ``{0,1}``.
+    X_tgt : np.ndarray
+        Target feature tensor of shape ``(Nt, W, C, S)`` (unlabeled).
+    batch_size : int, default=32
+        Number of **classifier** (A) examples per step (``B``).
+    shuffle : bool, default=True
+        If True, reshuffles source/target pools at each epoch.
+    tgt_ratio : int, default=2
+        Domain-target ratio relative to source in the discriminator part.
+        For example, with ``B=32`` and ``tgt_ratio=2``, the discriminator part
+        will allocate roughly 10 source vs. 22 target samples (numbers depend
+        on integer division).
+
+    Methods
+    -------
+    __len__()
+        Number of steps per epoch (limited by the smallest pool).
+    __getitem__(idx)
+        Return a tuple ``(X, {"classifier": y_cls, "discriminator": y_dom})`` where:
+          - ``X`` has shape ``(B + half_src + half_tgt, W, C, S)``,
+          - ``y_cls`` is shape-matched with labels ``{0,1,-1}`` (``-1`` masked),
+          - ``y_dom`` is shape-matched with labels ``{0,1,-1}`` (``-1`` masked).
+    on_epoch_end()
+        Shuffle pools at epoch boundaries when ``shuffle=True``.
+
+    Notes
+    -----
+    - Mask sentinel is ``-1.0`` for both heads; see :func:`masked_bce_fn`.
+    - Ensures ``X_src`` and ``X_tgt`` have identical spatial shapes.
+    - For exact parity with balanced domain batches, set ``tgt_ratio=1``.
+    """
+
     def __init__(
-        self, X_src, y_src, X_tgt, batch_size=32, shuffle=True, rng_seed=42, tgt_ratio=2
+        self, X_src, y_src, X_tgt, batch_size=32, shuffle=True, tgt_ratio=2
     ):
         # y_src is required (0/1); target is unlabeled
         assert X_src.shape[1:] == X_tgt.shape[1:], "Source/Target shapes must match"
@@ -2087,7 +2274,7 @@ class DAParquetSequence_empirical:
         self.Xt = X_tgt
         self.B = batch_size
         self.shuffle = shuffle
-        self.rng = np.random.RandomState(rng_seed)
+        self.rng = np.random.RandomState()
         self.tgt_ratio = int(max(1, tgt_ratio))
 
         self._reset_epoch()
@@ -2140,39 +2327,74 @@ class DAParquetSequence_empirical:
             self._reset_epoch()
 
 
-def rank_probabilities(data_dir, gene_coordinates, pop, include_xy=False):
+def rank_probabilities(data_dir, feature_coordinates, pop, include_xy=False):
     """
-    Ranks genes based on their associated maximum sweep probability.
+    Rank genomic features by their maximum nearby sweep probability.
+
+    The function scans per-chromosome prediction files inside ``data_dir``
+    (matching ``*_predictions.txt``), associates each feature in
+    ``feature_coordinates`` to the **closest** prediction window using
+    BEDTools ``closest``, and then ranks features by their **maximum**
+    associated sweep probability across all windows on the same chromosome.
 
     Parameters
     ----------
     data_dir : str
-        Path to the directory containing prediction files (*.predictions.txt).
-        Each file should contain genomic positions and their associated sweep probability.
-
-    gene_coordinates : str
-        Path to a BED file containing gene coordinates with the following columns:
-        chromosome, start position, end position, gene ID, and strand.
-
+        Directory containing per-chromosome prediction files produced by the
+        CNN pipeline. Each file must have at least the columns:
+        ``chr, start, end, prob_sweep``. File names are assumed to include a
+        token like ``chr{N}`` (e.g., ``chr7``) so the chromosome can be inferred.
+    feature_coordinates : str
+        Path to a BED-like, tab-separated file with **no header** and columns:
+        ``chr, start, end, feature_id, strand``. Coordinates are interpreted as
+        0-based half-open for BED operations (as per pybedtools conventions).
+    pop : str
+        Label used to name the output rank file:
+        ``{data_dir}/{pop}_predictions_ranks.txt``.
     include_xy : bool, default=False
-        If True, includes genes from X and Y chromosomes in the analysis.
-        If False, only includes genes from autosomal chromosomes (1-22).
+        If ``True``, X and Y features are included **provided** both the BED and
+        predictions contain those chromosomes with compatible naming
+        (e.g., ``chrX``/``chrY`` in predictions; ``X``/``Y`` or numeric codes in the BED).
+        If ``False``, only autosomes (1–22) are processed.
 
     Returns
     -------
-    tuple
-        A tuple containing:
-        - DataFrame with ranked genes (columns: gene_id, rank, prob_sweep, start, end),
-          sorted by rank in ascending order.
-        - Integer count of genes that have the maximum probability score found.
+    tuple[pl.DataFrame, int]
+        - **w_closest_rank** : Polars DataFrame with one row per feature and columns:
+          ``['gene_id', 'rank', 'prob_sweep', 'chr', 'start', 'end', 'iter']`` where
+          ``rank`` is an ordinal rank (1 = highest probability), ``prob_sweep`` is the
+          maximum sweep probability linked to the feature, and ``iter`` is the window
+          identifier of that maximum (from the predictions).
+        - **n_rank_max** : int
+          Number of features tied for the top ``prob_sweep`` value.
+
+    Writes a TSV/CSV to:
+    ``{data_dir}/{pop}_predictions_ranks.txt``
+
+    Notes
+    -----
+    - The function computes per-feature **midpoints** to create a 1-bp interval
+      and then uses BEDTools ``closest`` to link each feature to the nearest
+      prediction window on the same chromosome. Among all linked windows for a
+      feature, the **maximum** ``prob_sweep`` is retained.
+    - Chromosome handling:
+        * Autosomes are filtered as 1–22. Ensure prediction files use names like
+          ``chr1``…``chr22``; the code strips the ``chr`` prefix internally.
+        * If ``include_xy=True``, the BED and predictions must consistently
+          represent sex chromosomes (e.g., BED has ``X``/``Y`` and predictions
+          contain ``chrX``/``chrY``); otherwise those records may be excluded.
+    - Dependencies: requires **pybedtools** and an installed BEDTools binary.
+    - Performance: for large genomes, reading all per-chromosome predictions and
+      performing closest matches can be memory-intensive. Consider splitting
+      by chromosome or streaming if your datasets are very large.
 
     """
     # data_dir = "/labstorage/jmurgamoreno/bchak/mno/mno_260325/"
     # Always filtering
-    # gene_coordinates = "/labstorage/jmurgamoreno/bchak/ensembl_gene_coords_v109.bed"
+    # feature_coordinates = "/labstorage/jmurgamoreno/bchak/ensembl_gene_coords_v109.bed"
     df_genes = (
         pl.read_csv(
-            gene_coordinates,
+            feature_coordinates,
             has_header=False,
             separator="\t",
             schema={
