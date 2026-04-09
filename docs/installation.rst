@@ -27,31 +27,14 @@ It may also be necessary to update your PATH to run the command line interface. 
 
 Source
 ------
-<<<<<<< HEAD
 
-=======
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
-You also can build from scratch by cloning the repository and install using poetry and pip
-
-.. code-block:: bash
-
-    git clone https://github.com/jmurga/flexsweep.git
-    cd flexswepp
-<<<<<<< HEAD
-    poetry build
-    pip install dist/flexsweep-1.2.tar.gz
-=======
     uv build
     uv pip install dist/flexsweep-2.0.tar.gz
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
 
 Testing the Installation
 ------------------------
-<<<<<<< HEAD
 
-=======
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 You can easily test flexsweep by running the CLI in your terminal
 
 .. code-block:: bash

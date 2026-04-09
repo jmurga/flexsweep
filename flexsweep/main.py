@@ -39,21 +39,13 @@ def cli():
     "--recombination_rate",
     type=str,
     required=False,
-<<<<<<< HEAD
-    default="1e-9,4e-8,1e-8",
-=======
     default="1e-10,1e-7,1e-8",
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     help=(
         "Recombination rate specification. "
         "Please input:"
         "  - Two comma-separated values: lower,upper (uniform distribution bounds):"
         "  - Three values: min, max and mean of an exponential distribution."
-<<<<<<< HEAD
-        "Example: '1e-9,4e-8' or '1e-9,4e-8,1e-8'"
-=======
         "Example: '1e-9,4e-8' or '1e-10,1e-7,1e-8'"
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     ),
 )
 @click.option(
@@ -84,8 +76,6 @@ def cli():
         "Two comma-separated values: start,end. "
         "Default: '0,5000'"
     ),
-<<<<<<< HEAD
-=======
 )
 @click.option(
     "--s",
@@ -108,18 +98,12 @@ def cli():
     type=str,
     default="0.5,1",
     help=("End allel frequency.Two comma-separated values: min,max Default: '0.5,1'"),
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 )
 @click.option(
     "--num_simulations",
     type=int,
-<<<<<<< HEAD
-    default=int(1e4),
-    help="Number of neutral and sweep simulations to generate. Default: 10000.",
-=======
     default=int(2.5e5),
     help="Number of neutral and sweep simulations to generate. Default: 250000.",
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 )
 @click.option(
     "--nthreads",
@@ -151,11 +135,8 @@ def simulator(
     nthreads,
 ):
     """
-<<<<<<< HEAD
-    Run the discoal Simulator with user-specified parameters.
-=======
+
     Run the discoal simulator with user-specified parameters.
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
     flexsweep.Simulator class, parsing mutation and
     recombination rate specifications from the command line, and dispatches
@@ -172,14 +153,8 @@ def simulator(
     if discoal_path is None:
         discoal_path = fs.DISCOAL
 
-    # Parse mutation and recombination inputs
-<<<<<<< HEAD
-    mutation_rate_list = parse_float_list(None, None, mutation_rate)
-    recombination_rate_list = parse_float_list(None, None, recombination_rate)
-=======
     mutation_rate_list = parse_float_list(mutation_rate)
     recombination_rate_list = parse_float_list(recombination_rate)
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
     # Build mutation rate distribution spec
     if len(mutation_rate_list) == 2:
@@ -196,17 +171,12 @@ def simulator(
             "mean": mutation_rate_list[2],
         }
 
-    # Build recombination rate distribution spec
-<<<<<<< HEAD
-    if len(recombination_rate_list) == 2:
-=======
     if len(recombination_rate_list) == 1:
         rho_rate = {
             "dist": "exponential",
             "mean": recombination_rate_list[0],
         }
     elif len(recombination_rate_list) == 2:
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
         rho_rate = {
             "dist": "uniform",
             "lower": recombination_rate_list[0],
@@ -221,14 +191,10 @@ def simulator(
         }
 
     # Parse time range (not directly used in this wrapper, passed to Simulator internally)
-<<<<<<< HEAD
-    time_list = parse_float_list(None, None, time)
-=======
     time_list = parse_float_list(time)
     s_list = parse_float_list(s)
     saf_list = parse_float_list(saf)
     eaf_list = parse_float_list(eaf)
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
     # Instantiate Simulator and run simulations
     simulator = fs.Simulator(
@@ -242,17 +208,13 @@ def simulator(
         num_simulations=num_simulations,
         nthreads=nthreads,
     )
-<<<<<<< HEAD
-    simulator.create_params()
-    simulator.simulate()
-=======
+
     simulator.time = time_list
     simulator.s = s_list
     simulator.f_i = saf_list
     simulator.f_t = eaf_list
     simulator.create_params()
     simulator.simulate_batch()
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
 
 @cli.command()
@@ -260,14 +222,7 @@ def simulator(
     "--simulations_path",
     type=str,
     required=True,
-    help="Directory containing neutral and sweeps discoal simulations.",
-<<<<<<< HEAD
-)
-@click.option(
-    "--nthreads", type=int, required=True, help="Number of threads for parallelization"
-)
-def fvs_discoal(simulations_path, nthreads):
-=======
+    help="Directory containing neutral and sweeps discoal simulations."
 )
 @click.option(
     "--stats",
@@ -344,7 +299,7 @@ def fvs_discoal(
     nthreads,
     only_normalize,
 ):
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
+
     """
     Estimate summary statistics from discoal simulations and build feature vectors.
 
@@ -371,139 +326,6 @@ def fvs_discoal(
     else:
         print("Estimating summary statistics")
         fs.fv.summary_statistics(
-            simulations_path,
-            stats=stats_list,
-            vcf=False,
-            nthreads=nthreads,
-            windows=[windows],
-            step=step,
-            locus_length=locus_length,
-            recombination_map=None,
-            r_bins=r_bins_list,
-            min_rate=0.0,
-            suffix=suffix,
-            func=None,
-            save_stats=save_stats,
-        )
-
-
-@cli.command()
-@click.option(
-<<<<<<< HEAD
-    "--vcf_path",
-    type=str,
-    required=True,
-    help="Directory containing vcfs folder with all the VCF files to analyze.",
-)
-@click.option(
-    "--nthreads", type=int, required=True, help="Number of threads for parallelization"
-=======
-    "--simulations_path",
-    type=str,
-    required=True,
-    help="Directory containing neutral and sweeps discoal simulations.",
-)
-@click.option(
-    "--stats",
-    type=str,
-    required=False,
-    default=None,
-    help="Comma-separated list of summary statistics to compute, e.g:dind,fay_wu_h,isafe",
-)
-@click.option(
-    "--nthreads",
-    type=int,
-    required=True,
-    default=1,
-    help="Number of thread to parallelize.",
-)
-@click.option(
-    "--windows",
-    type=float,
-    required=False,
-    default=int(1e5),
-    help="Window size to sliding windows over the simulated regions",
-)
-@click.option(
-    "--step",
-    type=float,
-    required=False,
-    default=int(1e5),
-    help="Step size to sliding windows over the simulated regions",
-)
-@click.option(
-    "--locus_length",
-    type=float,
-    required=False,
-    default=int(1.2e6),
-    help="Simulated locus size",
-)
-@click.option(
-    "--r_bins",
-    type=str,
-    required=False,
-    default=None,
-    help="Recombination bins to normalize simulations",
-)
-@click.option(
-    "--suffix",
-    type=str,
-    required=False,
-    default=None,
-    help="Custom suffix name to save feature vectors",
-)
-@click.option(
-    "--save_stats",
-    type=bool,
-    required=False,
-    default=False,
-    help="Save raw statistics.",
-)
-@click.option(
-    "--only_normalize",
-    type=bool,
-    required=False,
-    default=False,
-    help="Only normalizing raw statistics.",
-)
-def fvs_fv2_discoal(
-    simulations_path,
-    stats,
-    windows,
-    step,
-    locus_length,
-    r_bins,
-    save_stats,
-    suffix,
-    nthreads,
-    only_normalize,
-):
-    """
-    Estimate summary statistics from discoal simulations and build feature vectors.
-
-    This command processes both neutral and sweep simulations in the given directory,
-    computes a panel of summary statistics, and generates two outputs: a Parquet dataframe containing feature vectors, a Pickle dictionary containing neutral expectations and standard deviations (used for normalization during CNN training).
-    """
-    import flexsweep as fs
-
-    r_bins_list = parse_float_list(r_bins)
-
-    stats_list = stats.split(",") if stats is not None else None
-
-    if only_normalize:
-        fs.fv._normalize_raw_stats(
-            simulations_path,
-            nthreads,
-            center_list,
-            [windows],
-            step,
-            r_bins=r_bins_list,
-            suffix=suffix,
-            vcf=False,
-        )
-    else:
-        print("Estimating summary statistics")
-        fs.fv_v2.summary_statistics(
             simulations_path,
             stats=stats_list,
             vcf=False,
@@ -568,7 +390,6 @@ def fvs_fv2_discoal(
     required=False,
     default=int(1.2e6),
     help="Windows size to sliding windows over the VCF",
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 )
 @click.option(
     "--recombination_map",
@@ -577,10 +398,6 @@ def fvs_fv2_discoal(
     required=False,
     help="Recombination map. Decode CSV format: Chr,Begin,End,cMperMb,cM",
 )
-<<<<<<< HEAD
-@click.option("--pop", type=str, default="pop", required=False, help="Population ID")
-def fvs_vcf(vcf_path, recombination_map, nthreads):
-=======
 @click.option(
     "--min_rate",
     type=float,
@@ -631,7 +448,6 @@ def fvs_vcf(
     nthreads,
     only_normalize,
 ):
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     """
     Estimate summary statistics from VCF files and build feature vectors.
 
@@ -650,15 +466,6 @@ def fvs_vcf(
     """
     import flexsweep as fs
 
-<<<<<<< HEAD
-    df_fv = fs.summary_statistics(
-        vcf_path,
-        nthreads=nthreads,
-        vcf=True,
-        recombination_map=recombination_map,
-        population=pop,
-    )
-=======
     r_bins_list = parse_float_list(r_bins)
 
     stats_list = stats.split(",") if stats is not None else None
@@ -675,166 +482,6 @@ def fvs_vcf(
         )
     else:
         fs.summary_statistics(
-            vcf_path,
-            vcf=True,
-            stats=stats_list,
-            nthreads=nthreads,
-            windows=[windows],
-            step=step,
-            step_vcf=step_vcf,
-            locus_length=locus_length,
-            recombination_map=recombination_map,
-            r_bins=r_bins_list,
-            min_rate=min_rate,
-            suffix=suffix,
-            func=None,
-            save_stats=save_stats,
-        )
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
-
-
-@cli.command()
-@click.option(
-<<<<<<< HEAD
-=======
-    "--vcf_path",
-    type=str,
-    required=True,
-    help="Directory containing vcfs folder with all the VCF files to analyze.",
-)
-@click.option(
-    "--stats",
-    type=str,
-    required=False,
-    default=None,
-    help="Comma-separated list of summary statistics to compute, e.g:dind,fay_wu_h,isafe",
-)
-@click.option(
-    "--nthreads",
-    type=int,
-    required=False,
-    default=1,
-    help="Number of threads for parallelization",
-)
-@click.option(
-    "--windows",
-    type=float,
-    required=False,
-    default=int(1e5),
-    help="Window size to sliding windows over the selected region",
-)
-@click.option(
-    "--step",
-    type=int,
-    required=False,
-    default=int(1e5),
-    help="Step size to sliding windows over the selected region",
-)
-@click.option(
-    "--step_vcf",
-    type=float,
-    required=False,
-    default=int(1e4),
-    help="Step size to sliding windows over the VCF",
-)
-@click.option(
-    "--locus_length",
-    type=float,
-    required=False,
-    default=int(1.2e6),
-    help="Windows size to sliding windows over the VCF",
-)
-@click.option(
-    "--recombination_map",
-    type=str,
-    default=None,
-    required=False,
-    help="Recombination map. Decode CSV format: Chr,Begin,End,cMperMb,cM",
-)
-@click.option(
-    "--min_rate",
-    type=float,
-    required=False,
-    default=0.01,
-    help="Minimun recombination rate simulated",
-)
-@click.option(
-    "--r_bins",
-    type=str,
-    required=False,
-    default=None,
-    help="Recombination bins to normalize simulations",
-)
-@click.option(
-    "--suffix",
-    type=str,
-    required=True,
-    default=None,
-    help="Custom suffix name to save feature vectors",
-)
-@click.option(
-    "--save_stats",
-    type=bool,
-    required=False,
-    default=False,
-    help="Save raw statistics.",
-)
-@click.option(
-    "--only_normalize",
-    type=bool,
-    required=False,
-    default=False,
-    help="Only normalizing previous raw statistics.",
-)
-def fvs_vcf_v2(
-    vcf_path,
-    stats,
-    windows,
-    step,
-    step_vcf,
-    locus_length,
-    recombination_map,
-    min_rate,
-    r_bins,
-    save_stats,
-    suffix,
-    nthreads,
-    only_normalize,
-):
-    """
-    Estimate summary statistics from VCF files and build feature vectors.
-
-    This command parses VCF files in the given directory, computes summary statistics
-    per genomic window, and writes feature vectors suitable as CNN input.
-
-    \b
-    Example usage:
-        # Run summary statistics from VCFs using 8 threads, no recombination map
-        flexsweep fvs-vcf --vcf_path ./data --nthreads 8
-    \b
-        # Run with a recombination map
-        flexsweep fvs-vcf --vcf_path ./data --nthreads 8 --recombination_map recomb_map.csv
-
-    Notes: VCF files must be bgzipped and tabix-indexed.
-    """
-    import flexsweep as fs
-
-    r_bins_list = parse_float_list(r_bins)
-
-    stats_list = stats.split(",") if stats is not None else None
-    if only_normalize:
-        fs.fv._normalize_raw_stats(
-            vcf_path,
-            nthreads,
-            center_list,
-            [windows],
-            step,
-            r_bins=r_bins_list,
-            suffix=suffix,
-            vcf=True,
-        )
-    else:
-        fs.fv_v2.summary_statistics(
             vcf_path,
             vcf=True,
             stats=stats_list,
@@ -998,7 +645,6 @@ def recombination_bins(vcf_path, recombination_map, bins, window_size, step, min
 
 @cli.command()
 @click.option(
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     "--train_data",
     type=str,
     required=False,
@@ -1009,8 +655,6 @@ def recombination_bins(vcf_path, recombination_map, bins, window_size, step, min
     type=str,
     required=False,
     help="Path to feature vectors from empirical data for prediction.",
-<<<<<<< HEAD
-=======
 )
 @click.option(
     "--center",
@@ -1032,7 +676,6 @@ def recombination_bins(vcf_path, recombination_map, bins, window_size, step, min
     required=False,
     default=int(1e5),
     help="Step size to sliding windows over the regions",
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 )
 @click.option(
     "--output_folder",
@@ -1046,15 +689,9 @@ def recombination_bins(vcf_path, recombination_map, bins, window_size, step, min
     default=None,
     help="Path to a pre-trained CNN model. If provided, the CNN will only perform prediction.",
 )
-<<<<<<< HEAD
 def cnn(train_data, predict_data, output_folder, model):
     """
-    Run the Flexsweep CNN for training or prediction.
-=======
-def cnn(train_data, predict_data, output_folder, model, center, windows, step):
-    """
     Run the Flex-sweep CNN for training or prediction.
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
     Depending on the inputs the software train, predict or train/predict.
 
@@ -1074,23 +711,6 @@ def cnn(train_data, predict_data, output_folder, model, center, windows, step):
 
     os.makedirs(output_folder, exist_ok=True)
 
-<<<<<<< HEAD
-    if model is None:
-        if not train_data:
-            raise click.UsageError(
-                "--train_data is required when --model is not provided."
-            )
-        fs_cnn = fs.CNN(
-            train_data=train_data,
-            predict_data=predict_data,
-            output_folder=output_folder,
-        )
-        fs_cnn.train()
-        fs_cnn.predict()
-
-    else:
-        if not predict_data:
-=======
     center_list = parse_float_list(center)
 
     if model is None:
@@ -1112,16 +732,10 @@ def cnn(train_data, predict_data, output_folder, model, center, windows, step):
 
     else:
         if predict_data is None:
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
             raise click.UsageError(
                 "--predict_data is required when --model is provided."
             )
         fs_cnn = fs.CNN(
-<<<<<<< HEAD
-            predict_data=predict_data, output_folder=output_folder, model=model
-        )
-        fs_cnn.predict()
-=======
             predict_data=predict_data,
             output_folder=output_folder,
             model=model,
@@ -2018,189 +1632,6 @@ def scan(
     )
 
 
-@cli.command("cms")
-@click.option(
-    "--sims",
-    default=None,
-    help="Path to raw_statistics.pickle from fvs-discoal --save_stats (Option A)",
-)
-@click.option(
-    "--vcf",
-    default=None,
-    help="Path to raw_statistics.pickle from fvs-vcf --save_stats (Option A)",
-)
-@click.option(
-    "--sims-dir",
-    "sims_dir",
-    default=None,
-    help="Raw simulation directory — computes per-SNP stats on the fly (Option A2 fallback)",
-)
-@click.option(
-    "--vcf-dir",
-    "vcf_dir",
-    default=None,
-    help="Raw VCF directory — computes per-SNP stats on the fly (Option A2 fallback)",
-)
-@click.option(
-    "--stats",
-    default="ihs,delta_ihh,dind,hapdaf_o",
-    show_default=True,
-    help=(
-        "Comma-separated per-SNP stat names to include in the composite score. "
-        "Available: ihs, delta_ihh, nsl, isafe, dind, high_freq, low_freq, "
-        "s_ratio, hapdaf_o, hapdaf_s."
-    ),
-)
-@click.option(
-    "--n_bins",
-    default=60,
-    type=int,
-    show_default=True,
-    help="Histogram bins per stat per class (default 60, matching CMS C++).",
-)
-@click.option(
-    "--prior_p",
-    default=0.5,
-    type=float,
-    show_default=True,
-    help="Prior P(selection). Default 0.5 (Grossman 2010 genome-wide mode).",
-)
-@click.option(
-    "--tables",
-    default=None,
-    help="Path to prebuilt cms_tables.pickle (saves/loads to skip table building).",
-)
-@click.option(
-    "--locus_length",
-    default=int(1.2e6),
-    type=int,
-    show_default=True,
-    help="Simulation locus length in bp for interior-position filtering.",
-)
-@click.option(
-    "--recombination_map",
-    default=None,
-    help=(
-        "Recombination map TSV (optionally gzipped). "
-        "Required columns: chr, end, cm. "
-        "Used with --r_bins to stratify histograms and SNP scoring "
-        "by local recombination rate (matches fvs-discoal/fvs-vcf treatment)."
-    ),
-)
-@click.option(
-    "--r_bins",
-    default=None,
-    help=(
-        "Comma-separated recombination-rate bin breaks in cM/Mb "
-        "(e.g. '0.5,1,2,3,5'). Requires --recombination_map."
-    ),
-)
-@click.option(
-    "--out",
-    required=True,
-    help="Output file prefix. Writes {out}.cms.txt and {out}.cms.parquet.",
-)
-@click.option("--nthreads", default=1, type=int, show_default=True)
-@click.option(
-    "--local",
-    "run_local",
-    is_flag=True,
-    default=False,
-    help=(
-        "Run CMSlocal fine-mapping instead of genome-wide CMS. "
-        "Uses prior π = 1/N_SNP per region so the cms column gives "
-        "P(this SNP is causal | region). "
-        "Use --regions to restrict to specific candidate regions; "
-        "omit --regions to fine-map all VCF regions."
-    ),
-)
-@click.option(
-    "--regions",
-    default=None,
-    help=(
-        "Comma-separated candidate region keys for --local mode "
-        "(e.g. 'chr22:0-1200000,chr2:136000000-137200000'). "
-        "Region keys must match those in the VCF pickle. "
-        "Typical source: top hits from a prior flexsweep cms run "
-        "or top CNN prediction windows."
-    ),
-)
-def cms_cmd(
-    sims,
-    vcf,
-    sims_dir,
-    vcf_dir,
-    stats,
-    n_bins,
-    prior_p,
-    tables,
-    locus_length,
-    recombination_map,
-    r_bins,
-    out,
-    nthreads,
-    run_local,
-    regions,
-):
-    """Compute Composite of Multiple Signals (CMS) posterior per SNP.
-
-    \b
-    Genome-wide CMS (default):
-        flexsweep cms --sims sims/raw_statistics.pickle \\
-                      --vcf  data/raw_statistics.pickle \\
-                      --out  results/yri_gw
-
-    CMSlocal fine-mapping (--local):
-        flexsweep cms --local \\
-                      --regions chr22:0-1200000,chr2:136000000-137200000 \\
-                      --vcf   data/raw_statistics.pickle \\
-                      --tables sims/cms_tables.pickle \\
-                      --out   results/yri_local
-
-    Option A2 (compute stats from raw files):
-        flexsweep cms --sims-dir sims/ --vcf-dir data/ --out results/yri_gw
-    """
-    if run_local:
-        from flexsweep.cms import run_cms_local
-
-        candidate_regions = (
-            [r.strip() for r in regions.split(",") if r.strip()] if regions else None
-        )
-        run_cms_local(
-            candidate_regions=candidate_regions,
-            vcf_pickle=vcf,
-            vcf_dir=vcf_dir,
-            cms_tables_path=tables,
-            sims_pickle=sims,
-            sims_dir=sims_dir,
-            stats=stats.split(","),
-            n_bins=n_bins,
-            locus_length=locus_length,
-            recombination_map=recombination_map,
-            r_bins=[float(x) for x in r_bins.split(",")] if r_bins else None,
-            out_prefix=out,
-            nthreads=nthreads,
-        )
-    else:
-        from flexsweep.cms import run_cms
-
-        run_cms(
-            sims_pickle=sims,
-            vcf_pickle=vcf,
-            sims_dir=sims_dir,
-            vcf_dir=vcf_dir,
-            stats=stats.split(","),
-            n_bins=n_bins,
-            prior_p=prior_p,
-            cms_tables_path=tables,
-            locus_length=locus_length,
-            recombination_map=recombination_map,
-            r_bins=[float(x) for x in r_bins.split(",")] if r_bins else None,
-            out_prefix=out,
-            nthreads=nthreads,
-        )
-
-
 @cli.command("scan-plot")
 @click.option(
     "--stat",
@@ -2262,7 +1693,6 @@ def scan_plot(stat_files, stat_cols, pvalue, top_pct, multi, out_file):
         raise click.UsageError("Number of --stat and --col arguments must match.")
     else:
         plot_scan(stat_files, stat_cols, pvalue=pvalue, top_pct=top_pct, out=out_file)
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
 
 if __name__ == "__main__":

@@ -1,65 +1,9 @@
-<<<<<<< HEAD
-import os
-
-import subprocess
-
-from . import np, Parallel, delayed, pl
-from .data import Data
-
-from threadpoolctl import threadpool_limits
-from multiprocessing.pool import ThreadPool
-from math import comb
-from functools import partial, reduce
-import sys
-import gc
-
-
-from numba import njit, prange, float64, int64, uint64, types
-from numba.typed import List, Dict
-from typing import Tuple
-from allel import (
-    HaplotypeArray,
-    ihs,
-    nsl,
-    garud_h,
-    standardize_by_allele_count,
-    sequence_diversity,
-    mean_pairwise_difference,
-    haplotype_diversity,
-    moving_haplotype_diversity,
-    tajima_d,
-    sfs,
-    read_vcf,
-    GenotypeArray,
-    index_windows,
-)
-from allel.compat import memoryview_safe
-from allel.opt.stats import ihh01_scan, ihh_scan
-from allel.util import asarray_ndim, check_dim0_aligned, check_integer_dtype
-from allel.stats.selection import compute_ihh_gaps
-from scipy.interpolate import interp1d
-
-from copy import deepcopy
-from collections import defaultdict, namedtuple, OrderedDict
-from itertools import product, chain
-
-from warnings import filterwarnings, warn
-import pickle
-
-=======
 import glob
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 import gzip
 import heapq
 import os
 import pickle
 import re
-<<<<<<< HEAD
-import glob
-import shutil
-
-filterwarnings("ignore", message="invalid INFO header", module="allel.io.vcf_read")
-=======
 from collections import OrderedDict, defaultdict, namedtuple
 from contextlib import contextmanager
 from copy import deepcopy
@@ -88,19 +32,15 @@ filterwarnings(
     message="invalid value encountered in scalar divide",
 )
 np.seterr(divide="ignore", invalid="ignore")
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
 # Define the inner namedtuple structure
 summaries = namedtuple("summaries", ["stats", "parameters"])
 binned_stats = namedtuple("binned_stats", ["mean", "std"])
 
-from contextlib import contextmanager
 
 ################## Utils
 
 
-<<<<<<< HEAD
-=======
 def load_pickle(f):
     with open(f, "rb") as handle:
         return pickle.load(handle)
@@ -334,7 +274,6 @@ def best_window_idx_per_position_cm(
     return out
 
 
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 @contextmanager
 def omp_num_threads(n_threads: int):
     """
@@ -342,354 +281,6 @@ def omp_num_threads(n_threads: int):
 
     Args:
         n_threads (int): Number of OpenMP threads to expose inside the context.
-<<<<<<< HEAD
-
-    Usage:
-        with omp_num_threads(10):
-            # Inside this block, os.environ['OMP_NUM_THREADS'] == "10"
-            heavy_compute()
-        # On exit, the previous value (or absence) is restored.
-
-    Notes:
-        - Only affects libraries honoring OMP_NUM_THREADS (e.g., numexpr, MKL-backed numpy).
-        - This modifies process environment for the duration of the context only.
-    """
-    key = "OMP_NUM_THREADS"
-    old_val = os.environ.get(key, None)
-    os.environ[key] = str(n_threads)
-    try:
-        yield
-    finally:
-        # restore original state
-        if old_val is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = old_val
-
-
-def parse_and_filter_ms(
-    ms_file: str,
-    seq_len: int = int(1.2e6),
-    return_haplotypearray: bool = False,
-):
-    """
-    Parse the **first** ms replicate in a file and filter/deduplicate sites. ms files simulated through flexsweep.Simulator will only contain one replica
-
-    Processing steps:
-      1) Parse the first replicate section ('//').
-      2) Build haplotypes (shape: (num_sites, num_samples)).
-      3) Filter to biallelic 0/1 sites via scikit-allel (is_biallelic_01).
-      4) Drop duplicated physical positions, **keeping the first occurrence** (like Polars `~is_duplicated()`).
-      5) Build a simple recombination map array with columns [1, idx, genetic_pos, physical_pos].
-         (Here, genetic_pos == physical_pos by construction.)
-
-    Args:
-        ms_file (str): Path to '.out', '.out.gz', '.ms', or '.ms.gz' file.
-        seq_len (int, default=1_200_000): Length used to scale 'positions' from (0,1) to bp.
-        return_haplotypearray (bool, default=False):
-            If True, returns scikit-allel `HaplotypeArray`; otherwise returns underlying `np.ndarray`.
-
-    Returns:
-        tuple:
-          - hap_01 : np.ndarray(int8) or HaplotypeArray (if `return_haplotypearray=True`)
-          - rec_map_01 : np.ndarray(int64) of shape (n_kept, 4) with columns [1, idx, genetic_pos, physical_pos]
-          - ac : np.ndarray with allele counts for kept sites
-          - biallelic_mask : np.ndarray(bool) mask on all parsed sites **before** deduplication
-          - position_masked : np.ndarray(int64) physical positions retained after filtering/dedup
-          - genetic_position_masked : np.ndarray of genetic positions retained (== physical here)
-
-    Warnings:
-        - Emits a warning and returns None if the file/replicate appears malformed.
-        - If segsites == 0 for the first replicate, continues scanning for the next replicate.
-
-    Notes:
-        - Duplicates are resolved by incrementing the *next* duplicate by +1 once, then adding +1 globally
-          (matching your existing logic).
-        - Only the **first** replicate is returned even if multiple are present.
-    """
-    if not ms_file.endswith((".out", ".out.gz", ".ms", ".ms.gz")):
-        warn(f"File {ms_file} has an unexpected extension.")
-
-    open_function = gzip.open if ms_file.endswith(".gz") else open
-
-    in_rep = False
-    num_segsites = None
-    pos_arr = None
-    hap_rows = []  # one string per sample line ('0'/'1')
-
-    def finalize_and_return():
-        # Match segsites, positions, and hap rows
-        if num_segsites is None or pos_arr is None or not hap_rows:
-            warn(f"File {ms_file} is malformed.")
-            return None
-
-        # Build hap (num_samples x num_sites) and transpose
-        try:
-            n_samples = len(hap_rows)
-            n_sites = len(hap_rows[0])
-            H = np.empty((n_samples, n_sites), dtype=np.int8)
-            for i, s in enumerate(hap_rows):
-                H[i, :] = np.frombuffer(s.encode("ascii"), dtype=np.uint8) - 48
-            H = H.T  # (num_segsites, num_samples)
-        except Exception:
-            warn(f"File {ms_file} is malformed.")
-            return None
-
-        # rec_map: [chrom=1, idx, gen_pos, phys_pos]
-        n = pos_arr.size
-        rec_map = np.column_stack(
-            (np.repeat(1, n), np.arange(n, dtype=np.int64), pos_arr, pos_arr)
-        ).astype(np.int64, copy=False)
-
-        # HaplotypeArray and, biallelic_01 mask
-        hap = HaplotypeArray(H, copy=False)
-        ac = hap.count_alleles()
-        biallelic_mask = ac.is_biallelic_01()
-
-        hap_bi = hap.compress(biallelic_mask, axis=0)
-        ac_bi = ac.compress(biallelic_mask, axis=0)
-        rec_bi = rec_map[biallelic_mask]
-
-        # Remove duplicate positions, keeping first occurrence
-        phys = rec_bi[:, 3]
-        keep = np.zeros(phys.shape[0], dtype=bool)
-
-        # np.unique returns sorted unique; return_index gives index of first occurrence
-        _, first_idx = np.unique(phys, return_index=True)
-        keep[first_idx] = True
-
-        hap_kept = hap_bi.compress(keep, axis=0)
-        ac_kept = ac_bi.compress(keep, axis=0)
-        rec_kept = rec_bi[keep]
-
-        # Outputs
-        position_masked = rec_kept[:, 3].astype(np.int64, copy=False)
-        genetic_position_masked = rec_kept[:, 2]  # equals physical in this parser
-
-        hap_out = hap_kept if return_haplotypearray else hap_kept.view(np.ndarray)
-        ac_out = ac_kept.view(np.ndarray)
-
-        return (
-            hap_out,
-            rec_kept,
-            ac_out,
-            biallelic_mask,
-            position_masked,
-            genetic_position_masked,
-        )
-
-    with open_function(ms_file, "rt") as fh:
-        for raw in fh:
-            line = raw.strip()
-            if not line:
-                continue
-
-            # Start of a replicate
-            if line.startswith("//"):
-                if in_rep:
-                    out = finalize_and_return()
-                    if out is not None:
-                        return out
-                in_rep = True
-                num_segsites = None
-                pos_arr = None
-                hap_rows.clear()
-                continue
-
-            if not in_rep:
-                continue
-
-            if line.startswith("segsites"):
-                parts = line.split()
-                if len(parts) >= 2:
-                    try:
-                        num_segsites = int(parts[1])
-                        # If segsites==0: this replicate has no data; keep scanning for next
-                        if num_segsites == 0:
-                            # Reset any partial state so finalize() won't trigger
-                            pos_arr = None
-                            hap_rows.clear()
-                    except ValueError:
-                        warn(f"File {ms_file} is malformed.")
-                        return None
-                else:
-                    warn(f"File {ms_file} is malformed.")
-                    return None
-                continue
-
-            if line.startswith("positions"):
-                # "positions: 0.123 0.456 ..."
-                try:
-                    _, values = line.split(":", 1)
-                    tmp = np.fromstring(values, sep=" ", dtype=np.float64)
-                except Exception:
-                    warn(f"File {ms_file} is malformed.")
-                    return None
-                pos = np.round(tmp * seq_len).astype(np.int64, copy=False)
-                dups = np.diff(pos) == 0
-                if dups.any():
-                    idxs = np.nonzero(dups)[0]
-                    pos[idxs + 1] += 1
-                pos += 1
-                pos_arr = pos
-                continue
-
-            # haplotype line ('0'/'1')
-            c0 = line[0]
-            if c0 == "0" or c0 == "1":
-                hap_rows.append(line)
-
-        # finalize
-        if in_rep:
-            return finalize_and_return()
-
-    warn(f"File {ms_file} is malformed.")
-    return None
-
-
-def cleaning_summaries(summ_stats, params, model):
-    """
-    Cleans summary statistics by removing entries where either list in summ_stats has None.
-
-    Args:
-        data: Unused input (kept for compatibility).
-        summ_stats (list of 2 lists): Summary statistics [list1, list2].
-        params (np.ndarray): Parameter matrix.
-        model (str): Model identifier.
-
-    Returns:
-        summ_stats_filtered (list of 2 lists): Cleaned summary statistics.
-        params (np.ndarray): Filtered params.
-        malformed_files (list of str): Indices removed with reason.
-    """
-    mask = []
-    summ_stats_filtered = [[], []]
-    malformed_files = []
-    for i, (x, y) in enumerate(zip(summ_stats[0], summ_stats[1])):
-        if x is None or y is None:
-            mask.append(i)
-            malformed_files.append(f"Model {model}, index {i} is malformed.")
-        else:
-            summ_stats_filtered[0].append(x)
-            summ_stats_filtered[1].append(y)
-
-    if mask:
-        params = np.delete(params, mask, axis=0)
-
-    return summ_stats_filtered, params, malformed_files
-
-
-def genome_reader(hap_data, recombination_map=None, region=None, samples=None):
-    """
-    Read a VCF/BCF region and return haplotypes, recombination map, allel count array, biallelic masking, physical and genetic positions arrays.
-
-    Args:
-        hap_data (str): Path to VCF/BCF file.
-        recombination_map (str | None, default=None):
-            Optional TSV map with columns: chr, start, end, cm_mb, cm.
-        region (str | None, default=None): Region string 'CHR:START-END' for subsetting.
-        samples (list[str] | np.ndarray | None, default=None): Optional sample subset.
-
-    Returns:
-        dict[str, tuple]:
-            {region: (hap_int, rec_map, ac.values, biallelic_filter, position_masked, genetic_position_masked)}
-            or {region: None} if no biallelic sites are present.
-
-        Where:
-            - hap_int: (S x N) np.int8 haplotypes.
-            - rec_map: array with columns [chrom, idx, pos, cm].
-            - ac.values: allele counts (scikit-allel).
-            - biallelic_filter: boolean mask on original sites.
-            - position_masked: np.int64 physical positions after biallelic filtering.
-            - genetic_position_masked: last column of rec_map.
-
-    Notes:
-        - If `recombination_map` is None, genetic distance defaults to physical positions.
-    """
-    filterwarnings("ignore", message="invalid INFO header", module="allel.io.vcf_read")
-
-    raw_data = read_vcf(hap_data, region=region, samples=samples)
-
-    try:
-        gt = GenotypeArray(raw_data["calldata/GT"])
-    except:
-        return {region: None}
-
-    pos = raw_data["variants/POS"]
-    np_chrom = np.char.replace(raw_data["variants/CHROM"].astype(str), "chr", "")
-    try:
-        np_chrom = np_chrom.astype(int)
-    except:
-        pass
-    ac = gt.count_alleles()
-
-    # Filtering monomorphic just in case
-    biallelic_filter = ac.is_biallelic_01()
-
-    hap_int = gt.to_haplotypes().values[biallelic_filter].astype(np.int8)
-    position_masked = pos[biallelic_filter].astype(np.int64)
-    np_chrom = np_chrom[biallelic_filter]
-
-    if hap_int.shape[0] == 0:
-        return {region: None}
-
-    if region is None:
-        d_pos = dict(zip(np.arange(position_masked.size + 1), position_masked))
-    else:
-        tmp = list(map(int, region.split(":")[-1].split("-")))
-        d_pos = dict(zip(np.arange(tmp[0], tmp[1] + 1), np.arange(int(1.2e6)) + 1))
-
-    if recombination_map is None:
-        rec_map = pl.DataFrame(
-            {
-                "chrom": np_chrom,
-                "idx": np.arange(position_masked.size),
-                "pos": position_masked,
-                "cm": position_masked,
-            }
-        ).to_numpy()
-    else:
-        df_recombination_map = (
-            pl.read_csv(
-                recombination_map,
-                separator="\t",
-                comment_prefix="#",
-                schema=pl.Schema(
-                    [
-                        ("chr", pl.String),
-                        ("start", pl.Int64),
-                        ("end", pl.Int64),
-                        ("cm_mb", pl.Float64),
-                        ("cm", pl.Float64),
-                    ]
-                ),
-            )
-            .filter(pl.col("chr") == "chr" + str(np_chrom[0]))
-            .sort("start")
-        )
-        genetic_distance = get_cm(df_recombination_map, position_masked)
-
-        rec_map = pl.DataFrame(
-            [
-                np_chrom,
-                np.arange(position_masked.size),
-                position_masked,
-                genetic_distance,
-            ]
-        ).to_numpy()
-
-        if np.all(rec_map[:, -1] == 0):
-            rec_map[:, -1] = rec_map[:, -2]
-
-    genetic_position_masked = rec_map[:, -1]
-
-    return (
-        hap_int,
-        rec_map,
-        ac.values,
-        biallelic_filter,
-        position_masked,
-=======
 
     Usage:
         with omp_num_threads(10):
@@ -876,14 +467,10 @@ def parse_and_filter_ms(
         ac_bi.view(np.ndarray),
         biallelic_mask,
         np.ascontiguousarray(position_masked, dtype=np.int64),
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
         genetic_position_masked,
     )
 
 
-<<<<<<< HEAD
-def get_cm(df_rec_map, positions):
-=======
 def parse_ms_numpy(
     ms_file: str,
     seq_len: float = 1.2e6,
@@ -1156,7 +743,6 @@ def genome_reader(hap_data, recombination_map=None, region=None, samples=None):
 
 
 def get_cm(df_rec_map, positions, cm_mb=False):
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     """
     Interpolate cumulative genetic distance (cM) at given physical positions.
 
@@ -1171,55 +757,15 @@ def get_cm(df_rec_map, positions, cm_mb=False):
     Notes:
         - Uses linear interpolation with extrapolation at ends.
     """
-<<<<<<< HEAD
-    interp_func = interp1d(
-        df_rec_map.select(df_rec_map.columns[1]).to_numpy().flatten(),
-        df_rec_map.select(df_rec_map.columns[-1]).to_numpy().flatten(),
-=======
     from scipy.interpolate import interp1d
 
     interp_func = interp1d(
         df_rec_map.select("end").to_numpy().flatten(),
         df_rec_map.select("cm").to_numpy().flatten(),
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
         kind="linear",
         fill_value="extrapolate",
     )
 
-<<<<<<< HEAD
-    # Interpolate the cM values at the interval positions
-    rr1 = interp_func(positions)
-    # rr2 = interp_func(positions[:, 1])
-    rr1[rr1 < 0] = 0
-    # Calculate the recombination rate in cM/Mb
-    # rate = (rr2 - rr1) / ((positions[:, 1] - positions[:, 0]) / 1e6)
-
-    return rr1
-
-
-def get_cm_mb(df_rec_map):
-    """
-    Compute per-interval recombination rate (cM/Mb) from cumulative cM.
-
-    Args:
-        df_rec_map (polars.DataFrame): Must contain columns 'cm' (cumulative cM) and 'pos' (bp).
-
-    Returns:
-        polars.DataFrame: Input dataframe with an additional 'cm_mb' column:
-            (cm.shift(-1) - cm) / (pos.shift(-1) - pos) * 1e6
-
-    Notes:
-        - The last row will have cm_mb = null due to shift(-1).
-        - Assumes positions are sorted ascending and cm is monotonic.
-    """
-    return df_rec_map.with_columns(
-        (
-            (pl.col("cm").shift(-1) - pl.col("cm"))
-            / (pl.col("pos").shift(-1) - pl.col("pos"))
-            * 1e6
-        ).alias("cm_mb")
-    )
-=======
     if cm_mb:
         rr1 = interp_func(positions[:, 0])
         rr2 = interp_func(positions[:, 1])
@@ -1245,7 +791,6 @@ def get_cm_mb(df_rec_map):
         rr1[rr1 < 0] = 0
 
         return rr1
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
 
 def center_window_cols(df, _iter=1):
@@ -1327,21 +872,12 @@ def pivot_feature_vectors(df_fv, vcf=False):
         df_fv = df_fv.with_columns(pl.lit("neutral").alias("model"))
 
     # Determine sorting method based on iter column type
-<<<<<<< HEAD
-    sort_multi = True if df_fv["iter"].dtype == pl.Utf8 else False
-
-    # Pivot the data
-    value_columns = df_fv.columns[
-        7:-1
-    ]  # Assuming columns 7 to end-1 are the values to pivot
-=======
     # sort_multi = True if df_fv["iter"].dtype == pl.Utf8 else False
 
     # Pivot the data
     # Assuming columns 7 to end-1 are the values to pivot
     # value_columns = df_fv.columns[7:-1]
     value_columns = df_fv.columns[9:-1]
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
     if vcf:
         if df_fv["iter"].dtype == pl.Int64:
@@ -1370,11 +906,7 @@ def pivot_feature_vectors(df_fv, vcf=False):
 
     df_fv_w = df_fv.pivot(
         values=value_columns,
-<<<<<<< HEAD
-        index=["iter", "s", "t", "f_i", "f_t", "model"],
-=======
         index=["iter", "s", "t", "f_i", "f_t", "mu", "r", "model"],
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
         on=["window", "center"],
     )
 
@@ -1388,1297 +920,6 @@ def pivot_feature_vectors(df_fv, vcf=False):
 
     return df_fv_w
 
-<<<<<<< HEAD
-
-def get_closest_snps(position_array, center, N):
-    """
-    Given a list of SNP positions and a center position, return the indices of the N closest SNPs.
-
-    Args:
-        position_array (np.ndarray): 1D array of SNP positions (bp).
-        center (int | float): Central genomic coordinate.
-        N (int): Number of SNPs to select. Must be <= len(position_array).
-
-    Returns:
-        np.ndarray: Indices of the N closest SNPs (sorted by increasing distance, then by position).
-
-    Raises:
-        AssertionError: If `position_array` is not 1D or if `N` exceeds array length.
-
-    Notes:
-        - Ties are resolved by `np.argsort` stability on the distance array; if exact distances tie,relative order follows input order.
-    """
-    position_array = np.asarray(position_array)
-    assert position_array.ndim == 1, "position_array must be a 1D array"
-    assert N <= len(position_array), "N exceeds the number of SNPs in the array"
-
-    distances = np.abs(position_array - center)
-    closest_indices = np.argsort(distances)[:N]
-    return closest_indices  # sorted left to right on genome
-
-
-################## Summaries
-
-
-def _process_vcf(
-    data_dir, nthreads, center, windows, step, recombination_map, population
-):
-    """
-    Handle vcf=True: read all VCFs in data_dir/vcfs, compute and normalize stats,
-    write out per‐VCF parquet files, and return concatenated DataFrames.
-    """
-
-    # Paths and containers
-    fvs_file = {}
-    sims = {}
-    regions = {}
-    df_params = []
-
-    vcf_glob = os.path.join(data_dir, "*vcf.gz")
-    for vcf_path in sorted(glob.glob(vcf_glob)):
-        basename = os.path.basename(vcf_path)
-        key = basename.replace(".vcf", "").replace(".bcf", "").replace(".gz", "")
-        key = key.replace(".", "_").lower()
-
-        fs_data = Data(vcf_path, nthreads=nthreads)
-        sim_dict = fs_data.read_vcf()
-        # returns {"sweep": [...], "region": [...]}
-
-        # build parameter DataFrame
-        n = len(sim_dict["sweep"])
-        df_params.append(
-            pl.DataFrame(
-                {
-                    "model": np.repeat(key, n),
-                    "s": np.zeros(n),
-                    "t": np.zeros(n),
-                    "saf": np.zeros(n),
-                    "eaf": np.zeros(n),
-                }
-            )
-        )
-
-        sims[key] = sim_dict["sweep"]
-        regions[key] = sim_dict["region"]
-        fvs_file[key] = os.path.join(data_dir, "vcfs", f"fvs_{key}.parquet")
-
-    df_params = pl.concat(df_params)
-
-    results = {}
-    tmp_bins = []
-    d_centers = {}
-    malformed_files = {}
-
-    for k, vcf_file in sims.items():
-        print(k)
-        params = df_params.filter(pl.col("model") == k)[:, 1:].to_numpy()
-
-        # compute center from region strings "chr: start-end"
-        center_coords = [
-            tuple(map(int, r.split(":")[-1].split("-"))) for r in regions[k]
-        ]
-        d_centers[k] = np.array([(a + b) // 2 for a, b in center_coords])
-
-        # Open a joblib process by VCF, so not same pool slower but solve RAM issues
-        _tmp_stats = calculate_stats_vcf(
-            vcf_file,
-            region=regions[k],
-            recombination_map=recombination_map,
-            nthreads=nthreads,
-        )
-
-        raw_stats, norm_stats = _tmp_stats
-        tmp_bins.append(norm_stats)
-
-        if not np.all(params[:, 3] == 0):
-            params[:, 0] = -np.log(params[:, 0])
-        results[k] = summaries(raw_stats, params)
-
-    empirical_bins = binned_stats(*normalize_neutral(tmp_bins))
-    df_fv_cnn = {}
-    df_fv_cnn_raw = {}
-
-    # for k, stats_values in tqdm(results.items()):
-    # with Parallel(n_jobs=nthreads, backend="loky", verbose=0) as parallel:
-    for k, stats_values in results.items():
-        print(k)
-        df_w, df_w_raw = normalize_stats(
-            stats_values,
-            empirical_bins,
-            region=regions[k],
-            center=center,
-            windows=windows,
-            step=step,
-            nthreads=nthreads,
-            vcf=True,
-        )
-        df_fv_cnn[k] = df_w
-        df_fv_cnn_raw[k] = df_w_raw
-
-    df_train = pl.concat(df_fv_cnn.values(), how="vertical")
-    df_train_raw = pl.concat(df_fv_cnn_raw.values(), how="vertical")
-
-    df_train.write_parquet(f"{data_dir}/fvs_{population}.parquet")
-    df_train_raw.write_parquet(f"{data_dir}/fvs_raw_{population}.parquet")
-
-    with open(os.path.join(data_dir, "empirical_bins.pickle"), "wb") as f:
-        pickle.dump(empirical_bins, f)
-
-    return df_train, df_train_raw
-
-
-def _process_vcf_custom(
-    data_dir, nthreads, center, windows, step, recombination_map, population, func
-):
-    """
-    Process VCF/BCF inputs to compute and normalize summary statistics and
-    assemble CNN feature vectors.
-
-    This routine searches for bgzipped VCFs matching ``data_dir/*vcf.gz``, computes
-    per-window statistics, normalizes them using empirical bins estimated from the
-    data, and returns concatenated feature tables.
-
-    :param str data_dir:
-        Input directory containing VCF/BCF files. Files are discovered using the
-        glob pattern ``data_dir/*vcf.gz``. Output feature vectors are written under
-        ``data_dir/vcfs``.
-    :param int nthreads:
-        Number of parallel workers (joblib). This controls parallel VCF processing
-        and windowed statistics.
-    :param list center:
-        Two integers controlling where centers are placed for normalization steps.
-        Interpretation may be adjusted downstream. This parameter is currently
-        not directly used in this function but may be used in normalization helpers.
-    :param list windows:
-        List of window sizes (in base pairs) used by downstream normalization.
-    :param int step:
-        Window step size (in base pairs) used by downstream normalization.
-    :param str recombination_map:
-        Optional path to a recombination map used during VCF processing. If it is
-        ``None``, genetic distance is treated as proportional to physical distance
-        by downstream code.
-    :param str population:
-        Label used to name the output Parquet files.
-
-    :returns:
-        A pair of Polars DataFrames. The first is the normalized feature table,
-        and the second is the corresponding raw feature table before final scaling.
-    :rtype: tuple[polars.DataFrame, polars.DataFrame]
-
-    :raises FileNotFoundError:
-        Propagated from downstream I/O if inputs are missing.
-    :raises ValueError:
-        Propagated from downstream parsing if inputs are malformed.
-
-    .. note::
-       Side effects include writing the following files:
-       ``{data_dir}/vcfs/fvs_{population}.parquet``,
-       ``{data_dir}/vcfs/fvs_raw_{population}.parquet``, and
-       ``{data_dir}/empirical_bins.pickle``.
-    """
-
-    # Paths and containers
-    fvs_file = {}
-    sims = {}
-    regions = {}
-    df_params = []
-
-    vcf_glob = os.path.join(data_dir, "*vcf.gz")
-    for vcf_path in sorted(glob.glob(vcf_glob)):
-        basename = os.path.basename(vcf_path)
-        key = basename.replace(".vcf", "").replace(".bcf", "").replace(".gz", "")
-        key = key.replace(".", "_").lower()
-
-        fs_data = Data(vcf_path, nthreads=nthreads)
-        sim_dict = fs_data.read_vcf()
-        # returns {"sweep": [...], "region": [...]}
-
-        # build parameter DataFrame
-        n = len(sim_dict["sweep"])
-        df_params.append(
-            pl.DataFrame(
-                {
-                    "model": np.repeat(key, n),
-                    "s": np.zeros(n),
-                    "t": np.zeros(n),
-                    "saf": np.zeros(n),
-                    "eaf": np.zeros(n),
-                }
-            )
-        )
-
-        sims[key] = sim_dict["sweep"]
-        regions[key] = sim_dict["region"]
-        fvs_file[key] = os.path.join(data_dir, "vcfs", f"fvs_{key}.parquet")
-
-    df_params = pl.concat(df_params)
-
-    results = {}
-    tmp_bins = []
-    d_centers = {}
-    malformed_files = {}
-
-    for k, vcf_file in sims.items():
-        print(k)
-        params = df_params.filter(pl.col("model") == k)[:, 1:].to_numpy()
-
-        # compute center from region strings "chr: start-end"
-        center_coords = [
-            tuple(map(int, r.split(":")[-1].split("-"))) for r in regions[k]
-        ]
-        d_centers[k] = np.array([(a + b) // 2 for a, b in center_coords])
-
-        # Open a joblib process by VCF, so not same pool slower but solve RAM issues
-        _tmp_stats = func(
-            vcf_file,
-            regions[k],
-            center=center,
-            windows=windows,
-            step=step,
-            recombination_map=recombination_map,
-            nthreads=nthreads,
-        )
-        raw_stats, norm_stats = _tmp_stats
-        tmp_bins.append(norm_stats)
-
-        if not np.all(params[:, 3] == 0):
-            params[:, 0] = -np.log(params[:, 0])
-        results[k] = summaries(raw_stats, params)
-
-    empirical_bins = binned_stats(*normalize_neutral_custom(tmp_bins))
-    df_fv_cnn = {}
-    df_fv_cnn_raw = {}
-
-    for k, stats_values in results.items():
-        print(k)
-        df_w, df_w_raw = normalize_stats_custom(
-            stats_values,
-            empirical_bins,
-            region=regions[k],
-            center=center,
-            windows=windows,
-            step=step,
-            nthreads=nthreads,
-            vcf=True,
-        )
-        df_fv_cnn[k] = df_w
-        df_fv_cnn_raw[k] = df_w_raw
-
-    df_train = pl.concat(df_fv_cnn.values(), how="vertical")
-    df_train_raw = pl.concat(df_fv_cnn_raw.values(), how="vertical")
-
-    df_train.write_parquet(f"{data_dir}/fvs_{population}_custom.parquet")
-    df_train_raw.write_parquet(f"{data_dir}/fvs_raw_{population}_custom.parquet")
-
-    with open(os.path.join(data_dir, "empirical_bins.pickle"), "wb") as f:
-        pickle.dump(empirical_bins, f)
-
-    return df_train, df_train_raw
-
-
-def _process_sims(data_dir, nthreads, center, windows, step, recombination_map):
-    """
-    Process ms/discoal simulations to compute and normalize summary statistics
-    and assemble CNN feature vectors.
-
-    This routine expects two subdirectories named ``neutral`` and ``sweep`` with
-    simulation outputs, plus a ``params.txt.gz`` file in ``data_dir``. It computes
-    per-window statistics, derives neutral bins for normalization, and returns
-    concatenated feature tables.
-
-    :param str data_dir: Root directory containing simulation outputs and the
-        parameter file. Subdirectories ``neutral`` and ``sweep`` must exist and
-        be non-empty.
-    :param int nthreads: Number of parallel workers (joblib).
-    :param list center: Two integers controlling where centers are placed for
-        normalization steps; passed to downstream helpers.
-    :param list windows: Window sizes in base pairs used by downstream normalization.
-    :param int step: Window step size in base pairs used by downstream normalization.
-    :param recombination_map: Unused in this function; present for API symmetry.
-
-    :returns: A pair of DataFrames: the normalized feature table and the raw
-        feature table before final scaling.
-    :rtype: tuple[polars.DataFrame, polars.DataFrame]
-
-    :raises ValueError: If the ``neutral`` or ``sweep`` folders are missing or empty.
-    """
-
-    for folder in ("neutral", "sweep"):
-        path = os.path.join(data_dir, folder)
-        if not os.path.isdir(path):
-            raise ValueError(f"Missing folder: {path}")
-        if not glob.glob(os.path.join(path, "*")):
-            raise ValueError(f"No files in folder: {path}")
-
-    fs_data = Data(data_dir)
-    sims, df_params = fs_data.read_simulations()
-
-    results = {}
-    malformed_files = {}
-    d_centers = {}
-    binned_data = {}
-    hap_matrices = {}
-
-    with Parallel(n_jobs=nthreads, backend="loky", verbose=2) as parallel:
-        for sim_type, sim_list in sims.items():
-            print(sim_type)
-            # mask = np.random.choice(np.arange(0, 100000), 12500)
-            params = df_params.filter(pl.col("model") == sim_type)[:, 1:].to_numpy()
-            d_centers[sim_type] = center
-
-            # map each sim to calculate_stats
-            _tmp_stats = tuple(
-                zip(
-                    *parallel(
-                        delayed(calculate_stats_simplify)(
-                            hap_data,
-                            i,
-                            center=center,
-                            step=step,
-                            region=None,
-                        )
-                        for i, hap_data in enumerate(sim_list[:], 1)
-                    )
-                )
-            )
-
-            stats, params, malformed = cleaning_summaries(_tmp_stats, params, sim_type)
-            malformed_files[sim_type] = malformed
-
-            if sim_type == "neutral":
-                raw_stats, norm_stats = stats
-                binned_data["neutral"] = binned_stats(*normalize_neutral(norm_stats))
-            else:
-                raw_stats, norm_stats = stats
-
-            if not np.all(params[:, 3] == 0):
-                params[:, 0] = -np.log(params[:, 0])
-            results[sim_type] = summaries(raw_stats, params)
-
-        # df_t_m = pl.concat(t_m_l)
-        df_fv_cnn = {}
-        df_fv_cnn_raw = {}
-    with Parallel(n_jobs=nthreads, backend="loky", verbose=2) as parallel:
-        for sim_type, stats_values in results.items():
-            df_w, df_w_raw = normalize_stats(
-                stats_values,
-                binned_data["neutral"],
-                center=d_centers[sim_type],
-                windows=windows,
-                step=step,
-                parallel_manager=parallel,
-                nthreads=nthreads,
-                vcf=False,
-            )
-            df_fv_cnn[sim_type] = df_w
-            df_fv_cnn_raw[sim_type] = df_w_raw
-
-    with open(os.path.join(data_dir, "neutral_bins.pickle"), "wb") as f:
-        pickle.dump(binned_data["neutral"], f)
-
-    df_train = pl.concat(df_fv_cnn.values(), how="vertical")
-    # df_train = df_train.join(
-    #     df_t_m.select(pl.exclude("s", "t", "f_t", "f_i")), on=["iter", "model"]
-    # )
-    df_train_raw = pl.concat(df_fv_cnn_raw.values(), how="vertical")
-
-    out_base = os.path.join(data_dir, "fvs.parquet")
-    df_train.write_parquet(out_base)
-    df_train_raw.write_parquet(out_base.replace(".parquet", "_raw.parquet"))
-
-    # np.savez_compressed(
-    #     f"{data_dir}/haplotype_matrices.npz",
-    #     neutral=hap_matrices["neutral"],
-    #     sweep=hap_matrices["sweep"],
-    # )
-
-    # return df_train, df_train_raw, hap_matrices
-    return df_train, df_train_raw
-
-
-def _process_sims_custom(
-    data_dir, nthreads, center, windows, step, recombination_map, func
-):
-    """
-    Handle vcf=False: read sweep/neutral sims under data_dir,
-    compute stats in a single Parallel pool, normalize sweep vs neutral,
-    write out parquet and pickle, and return concatenated DataFrames.
-    """
-    for folder in ("neutral", "sweep"):
-        path = os.path.join(data_dir, folder)
-        if not os.path.isdir(path):
-            raise ValueError(f"Missing folder: {path}")
-        if not glob.glob(os.path.join(path, "*")):
-            raise ValueError(f"No files in folder: {path}")
-
-    fs_data = Data(data_dir)
-    sims, df_params = fs_data.read_simulations()
-
-    results = {}
-    malformed_files = {}
-    d_centers = {}
-    binned_data = {}
-
-    with Parallel(n_jobs=nthreads, backend="loky", verbose=2) as parallel:
-        for sim_type, sim_list in sims.items():
-            print(sim_type)
-            mask = np.random.choice(np.arange(0, 10000), 1000)
-            params = df_params.filter(pl.col("model") == sim_type)[:, 1:].to_numpy()
-            d_centers[sim_type] = np.array(center).astype(int)
-
-            # map each sim to calculate_stats
-            _tmp_stats = tuple(
-                zip(
-                    *parallel(
-                        delayed(func)(
-                            hap_data,
-                            i,
-                            center=center,
-                            windows=windows,
-                            step=step,
-                        )
-                        for i, hap_data in enumerate(sim_list[:], 1)
-                    )
-                )
-            )
-            stats, params, malformed = cleaning_summaries(_tmp_stats, params, sim_type)
-            malformed_files[sim_type] = malformed
-
-            if sim_type == "neutral":
-                raw_stats, norm_stats = stats
-                binned_data["neutral"] = binned_stats(
-                    *normalize_neutral_custom(norm_stats)
-                )
-            else:
-                raw_stats, norm_stats = stats
-
-            if not np.all(params[:, 3] == 0):
-                params[:, 0] = -np.log(params[:, 0])
-            results[sim_type] = summaries(raw_stats, params)
-
-        # df_t_m = pl.concat(t_m_l)
-        df_fv_cnn = {}
-        df_fv_cnn_raw = {}
-
-    with Parallel(n_jobs=nthreads, backend="loky", verbose=2) as parallel:
-        for sim_type, stats_values in results.items():
-            df_w, df_w_raw = normalize_stats_custom(
-                stats_values,
-                binned_data["neutral"],
-                center=d_centers[sim_type],
-                windows=windows,
-                step=step,
-                parallel_manager=parallel,
-                nthreads=nthreads,
-                vcf=False,
-            )
-            df_fv_cnn[sim_type] = df_w
-            df_fv_cnn_raw[sim_type] = df_w_raw
-
-    with open(os.path.join(data_dir, "neutral_bins.pickle"), "wb") as f:
-        pickle.dump(binned_data["neutral"], f)
-
-    df_train = pl.concat(df_fv_cnn.values(), how="vertical")
-
-    df_train_raw = pl.concat(df_fv_cnn_raw.values(), how="vertical")
-
-    out_base = os.path.join(data_dir, "fvs_custom.parquet")
-    df_train.write_parquet(out_base)
-    df_train_raw.write_parquet(out_base.replace(".parquet", "_raw.parquet"))
-
-    return df_train, df_train_raw
-
-
-def summary_statistics(
-    data_dir,
-    vcf=False,
-    nthreads=1,
-    center=[500000, 700000],
-    windows=[50000, 100000, 200000, 500000, 1000000],
-    step=10000,
-    recombination_map=None,
-    func=None,
-    population="pop",
-):
-    """
-    Compute summary statistics and assemble CNN feature vectors, dispatching to
-    either the VCF pipeline or the simulation pipeline.
-
-    :param str data_dir:
-        Input location. If ``vcf`` is ``False``, this is the root directory of
-        ms/discoal simulations produced by the simulator (e.g., contains
-        ``neutral/``, ``sweep/``, and ``params.txt.gz``). If ``vcf`` is
-        ``True``, this is a directory containing VCF/BCF data (see the VCF
-        pipeline for expected layout).
-
-    :param bool vcf:
-        Whether to use the VCF/BCF pipeline (``True``) or the simulation
-        pipeline (``False``). **Default:** ``False``.
-
-    :param int nthreads:
-        Number of parallel workers (joblib). **Default:** ``1``.
-
-    :param list center:
-        Two-element list ``[start, end]`` (bp) defining the range of window
-        centers to evaluate around the locus/region center. Interpretation may
-        vary slightly between the VCF and simulation pipelines. **Default:**
-        ``[500000, 700000]``.
-
-    :param list windows:
-        List of window widths (bp) over which to aggregate statistics.
-        **Default:** ``[50000, 100000, 200000, 500000, 1000000]``.
-
-    :param int step:
-        Step size (bp) between adjacent windows (sliding window stride).
-        **Default:** ``10000``.
-
-    :param str recombination_map:
-        Optional path to a recombination map. CSV maps commonly use columns
-        like ``Chr, Begin, End, cMperMb, cM``; TSV maps may use
-        ``chr, start, end, cm_mb, cm``. If ``None``, downstream code may treat
-        genetic distance as proportional to physical distance. **Default:**
-        ``None``.
-
-    :param bool full:
-        If ``True`` and ``vcf`` is ``False``, run the extended simulation workflow
-        (``_process_sims_custom``) that may compute additional or expanded features.
-        If ``False``, use the standard workflow (``_process_sims``). Ignored when
-        ``vcf`` is ``True``. **Default:** ``False``.
-
-    :param population:
-        Optional sample subset for VCF processing (e.g., population label or a
-        collection of sample IDs). Interpretation is handled downstream by the
-        VCF reader. **Default:** ``None``.
-
-    :returns:
-        Feature-vector table of summary statistics. Additional artifacts (e.g.,
-        Parquet/normalization files) may be written by downstream routines
-        depending on the chosen pipeline.
-    :rtype: polars.DataFrame
-
-    :raises FileNotFoundError:
-        Propagated from downstream routines if input files or directories are missing.
-    :raises ValueError:
-        Propagated from downstream routines on malformed inputs.
-
-    .. note::
-       This is a thin wrapper that dispatches to :func:`_process_vcf`,
-       :func:`_process_sims`, or :func:`_process_sims_custom` based on the
-       ``vcf`` and ``full`` flags.
-
-    **Examples**
-
-    .. code-block:: python
-
-       # From ms/discoal simulations
-       df = summary_statistics("./sims", nthreads=4)
-
-       # From VCFs with a recombination map
-       df = summary_statistics("./vcf_data", vcf=True, nthreads=8,
-                               recombination_map="recomb_map.csv")
-    """
-
-    assert (
-        len(center) == 2 or len(center) == 1
-    ), "Please use a single center or select [min,max] range"
-
-    if vcf:
-        if func is not None:
-            return _process_vcf_custom(
-                data_dir,
-                nthreads,
-                center,
-                windows,
-                step,
-                recombination_map,
-                population,
-                func,
-            )
-        else:
-            return _process_vcf(
-                data_dir, nthreads, center, windows, step, recombination_map, population
-            )
-    else:
-        if func is not None:
-            return _process_sims_custom(
-                data_dir, nthreads, center, windows, step, recombination_map, func
-            )
-        else:
-            return _process_sims(
-                data_dir, nthreads, center, windows, step, recombination_map
-            )
-
-
-################## Stats
-
-
-def calculate_stats_vcf(
-    vcf_file,
-    region,
-    _iter=1,
-    recombination_map=None,
-    parallel_manager=None,
-    nthreads=1,
-):
-    """
-    Compute summary statistics directly from VCF/BCF input for a list of regions.
-
-    The function reads haplotypes and positions from a VCF/BCF file, applies
-    biallelic filtering, computes per-site and windowed statistics (including
-    iHS, nSL, iSAFE, and frequency-spectrum summaries), and returns both the
-    per-metric tables and a joined DataFrame.
-
-    :param vcf_file:
-        Either a path to a VCF/BCF file or a preloaded tuple/list of arrays that
-        the downstream code expects as if produced by the VCF reader.
-    :param list region:
-        List of region strings in the form ``"CHR:START-END"``.
-    :param int _iter:
-        Iteration identifier used when adding standard columns to result tables.
-        Default is ``1``.
-    :param str recombination_map:
-        Optional path to a recombination map. If ``None``, genetic positions may
-        be treated as proportional to physical positions by downstream code.
-    :param parallel_manager:
-        Optional joblib.Parallel object to reuse a pool created by the caller.
-        If ``None``, this function may create its own pool where needed.
-    :param int nthreads:
-        Number of threads used for any internal parallel blocks when a manager is
-        not provided. Default is ``1``.
-
-    :returns:
-        A pair where the first element is a dictionary of Polars DataFrames by
-        metric name, and the second element is a joined Polars DataFrame
-        containing the normalized columns across metrics.
-    :rtype: tuple[dict, polars.DataFrame]
-
-    :raises FileNotFoundError:
-        If the VCF/BCF path cannot be read.
-    :raises ValueError:
-        Propagated from downstream parsing if inputs are malformed.
-
-    .. note::
-       When ``recombination_map`` is ``None``, genetic positions are set to
-       ``None`` for iHS and related metrics, which will then operate on
-       physical positions.
-    """
-    filterwarnings(
-        "ignore",
-        category=RuntimeWarning,
-        message="invalid value encountered in scalar divide",
-    )
-    np.seterr(divide="ignore", invalid="ignore")
-
-    if isinstance(vcf_file, list) or isinstance(vcf_file, tuple):
-        hap, rec_map, p = vcf_file
-    elif isinstance(vcf_file, str):
-        try:
-            # Biallelic filter inside
-            # hap, rec_map, p = genome_reader(
-            (
-                hap_int,
-                rec_map_01,
-                ac,
-                biallelic_mask,
-                position_masked,
-                genetic_position_masked,
-            ) = genome_reader(
-                vcf_file, recombination_map=recombination_map, region=None
-            )
-            freqs = ac[:, 1] / ac.sum(axis=1)
-        except:
-            return None
-    else:
-        return None
-
-    # If recombination is not provided, then genetic_pos == pos
-    if recombination_map is None:
-        genetic_position_masked = None
-
-    # Define variables
-    windows = [tuple(map(int, r.split(":")[-1].split("-"))) for r in region]
-
-    nchr = region[0].split(":")[0]
-    d_stats = defaultdict(dict)
-
-    # Estimate fs stats. Need (2*2)+1 threads, or remove use_threads options
-    with Parallel(n_jobs=3, backend="loky") as parallel_snps:
-        snps_results = parallel_snps(
-            [
-                delayed(run_fs_stats)(hap_int, ac, rec_map_01),
-                delayed(ihs_ihh)(
-                    hap_int,
-                    position_masked,
-                    map_pos=genetic_position_masked,
-                    min_ehh=0.05,
-                    min_maf=0.05,
-                    include_edges=False,
-                    use_threads=True,
-                ),
-                delayed(nsl)(hap_int[freqs >= 0.05], use_threads=True),
-            ]
-        )
-
-    df_dind_high_low, df_s_ratio, df_hapdaf_s, df_hapdaf_o = snps_results[0]
-    df_dind_high_low = center_window_cols(df_dind_high_low, _iter=_iter)
-    df_s_ratio = center_window_cols(df_s_ratio, _iter=_iter)
-    df_hapdaf_o = center_window_cols(df_hapdaf_o, _iter=_iter)
-    df_hapdaf_s = center_window_cols(df_hapdaf_s, _iter=_iter)
-
-    # Estimate iHS and nSL
-    df_ihs = snps_results[1]
-    df_ihs = center_window_cols(df_ihs, _iter=_iter)
-
-    nsl_v = snps_results[2]
-    df_nsl = pl.DataFrame(
-        {
-            "positions": position_masked[freqs >= 0.05],
-            "daf": freqs[freqs >= 0.05],
-            "nsl": nsl_v,
-        }
-    ).fill_nan(None)
-
-    df_nsl = center_window_cols(df_nsl, _iter=_iter)
-
-    # Estimate windowed (h12,haf,isafe) stats
-    with Parallel(n_jobs=nthreads, backend="loky", verbose=2) as parallel:
-        out_h12_haf, out_isafe = zip(
-            *parallel(
-                delayed(run_windowed_stats)(
-                    hap_int[
-                        (position_masked >= window[0]) & (position_masked <= window[1])
-                    ],
-                    position_masked[
-                        (position_masked >= window[0]) & (position_masked <= window[1])
-                    ],
-                    window,
-                )
-                for _iter, (window) in enumerate(windows[:], 1)
-            )
-        )
-
-    df_window = pl.concat(out_h12_haf, how="vertical")
-
-    # Because of random shuffle in iSAFE it will output different values for same snps
-    # in contigous windows, get the max value or the mean
-    # df_isafe = pl.concat(out_isafe, how="vertical")
-    df_isafe = (
-        pl.concat(out_isafe, how="vertical")
-        .group_by(["iter", "positions", "daf"], maintain_order=True)
-        # .group_by(["iter", "center", "window", "positions", "daf"], maintain_order=True)
-        .agg(pl.col("isafe").mean().alias("isafe"))
-        .sort("positions")
-    )
-
-    # Save estimations in dict
-    d_stats["dind_high_low"] = df_dind_high_low
-    d_stats["s_ratio"] = df_s_ratio
-    d_stats["hapdaf_o"] = df_hapdaf_o
-    d_stats["hapdaf_s"] = df_hapdaf_s
-    d_stats["ihs"] = df_ihs
-    d_stats["nsl"] = df_nsl
-    d_stats["isafe"] = df_isafe
-    d_stats["window"] = df_window
-
-    if region is not None:
-        for k, df in d_stats.items():
-            d_stats[k] = df.with_columns([pl.lit(nchr).cast(pl.Utf8).alias("iter")])
-
-    ####### if neutral:
-
-    df_stats_norm = (
-        reduce(
-            lambda left, right: left.join(
-                right,
-                # on=["iter", "center", "window", "positions", "daf"],
-                on=["iter", "positions", "daf"],
-                how="full",
-                coalesce=True,
-            ),
-            [
-                df_nsl.lazy(),
-                df_ihs.lazy(),
-                df_isafe.lazy(),
-                df_dind_high_low.lazy(),
-                df_s_ratio.lazy(),
-                df_hapdaf_o.lazy(),
-                df_hapdaf_s.lazy(),
-                df_window.lazy(),
-            ],
-        )
-        .sort("positions")
-        .collect()
-    )
-
-    if region is not None:
-        df_stats_norm = df_stats_norm.with_columns(
-            [pl.lit(nchr).cast(pl.Utf8).alias("iter")]
-        )
-
-    return d_stats, df_stats_norm
-
-
-def calculate_stats_vcf_custom(
-    vcf_file,
-    region,
-    _iter=1,
-    center=[5e5, 7e5],
-    windows=[50000, 100000, 200000, 500000, 1000000],
-    step=1e4,
-    recombination_map=None,
-    parallel_manager=None,
-    nthreads=1,
-):
-    """
-    Compute summary statistics directly from VCF/BCF input for a list of regions.
-
-    The function reads haplotypes and positions from a VCF/BCF file, applies
-    biallelic filtering, computes per-site and windowed statistics (including
-    iHS, nSL, iSAFE, and frequency-spectrum summaries), and returns both the
-    per-metric tables and a joined DataFrame.
-
-    :param vcf_file:
-        Either a path to a VCF/BCF file or a preloaded tuple/list of arrays that
-        the downstream code expects as if produced by the VCF reader.
-    :param list region:
-        List of region strings in the form ``"CHR:START-END"``.
-    :param int _iter:
-        Iteration identifier used when adding standard columns to result tables.
-        Default is ``1``.
-    :param str recombination_map:
-        Optional path to a recombination map. If ``None``, genetic positions may
-        be treated as proportional to physical positions by downstream code.
-    :param parallel_manager:
-        Optional joblib.Parallel object to reuse a pool created by the caller.
-        If ``None``, this function may create its own pool where needed.
-    :param int nthreads:
-        Number of threads used for any internal parallel blocks when a manager is
-        not provided. Default is ``1``.
-
-    :returns:
-        A pair where the first element is a dictionary of Polars DataFrames by
-        metric name, and the second element is a joined Polars DataFrame
-        containing the normalized columns across metrics.
-    :rtype: tuple[dict, polars.DataFrame]
-
-    :raises FileNotFoundError:
-        If the VCF/BCF path cannot be read.
-    :raises ValueError:
-        Propagated from downstream parsing if inputs are malformed.
-
-    .. note::
-       When ``recombination_map`` is ``None``, genetic positions are set to
-       ``None`` for iHS and related metrics, which will then operate on
-       physical positions.
-    """
-    filterwarnings(
-        "ignore",
-        category=RuntimeWarning,
-        message="invalid value encountered in scalar divide",
-    )
-    np.seterr(divide="ignore", invalid="ignore")
-
-    if isinstance(vcf_file, list) or isinstance(vcf_file, tuple):
-        hap, rec_map, p = vcf_file
-    elif isinstance(vcf_file, str):
-        try:
-            # Biallelic filter inside
-            (
-                hap_int,
-                rec_map_01,
-                ac,
-                biallelic_mask,
-                position_masked,
-                genetic_position_masked,
-            ) = genome_reader(
-                vcf_file, recombination_map=recombination_map, region=None
-            )
-            freqs = ac[:, 1] / ac.sum(axis=1)
-        except:
-            return None
-    else:
-        return None
-
-    # If recombination is not provided, then genetic_pos == pos
-    if recombination_map is None:
-        genetic_position_masked = None
-
-    # Define variables
-    windows = [tuple(map(int, r.split(":")[-1].split("-"))) for r in region]
-
-    nchr = region[0].split(":")[0]
-    d_stats = defaultdict(dict)
-
-    # Estimate fs stats
-    df_dind_high_low, df_s_ratio, df_hapdaf_s, df_hapdaf_o = run_fs_stats(
-        hap_int, ac, rec_map_01
-    )
-
-    df_dind_high_low = center_window_cols(df_dind_high_low, _iter=_iter)
-    df_s_ratio = center_window_cols(df_s_ratio, _iter=_iter)
-    df_hapdaf_o = center_window_cols(df_hapdaf_o, _iter=_iter)
-    df_hapdaf_s = center_window_cols(df_hapdaf_s, _iter=_iter)
-
-    # Estimate iHS and nSL
-    df_ihs = ihs_ihh(
-        hap_int,
-        position_masked,
-        map_pos=genetic_position_masked,
-        min_ehh=0.05,
-        min_maf=0.05,
-        include_edges=False,
-        use_threads=True,
-    )
-    df_ihs = center_window_cols(df_ihs, _iter=_iter)
-
-    nsl_v = nsl(hap_int[freqs >= 0.05], use_threads=True)
-    df_nsl = pl.DataFrame(
-        {
-            "positions": position_masked[freqs >= 0.05],
-            "daf": freqs[freqs >= 0.05],
-            "nsl": nsl_v,
-        }
-    ).fill_nan(None)
-
-    df_ihs = center_window_cols(df_ihs, _iter=_iter)
-    df_nsl = center_window_cols(df_nsl, _iter=_iter)
-
-    # Estimate windowed (h12,haf,isafe) stats
-    if parallel_manager is None:
-        with Parallel(n_jobs=nthreads, backend="loky", verbose=2) as parallel:
-            out_h12_haf, out_isafe = zip(
-                *parallel(
-                    delayed(run_windowed_stats)(
-                        hap_int[
-                            (position_masked >= window[0])
-                            & (position_masked <= window[1])
-                        ],
-                        position_masked[
-                            (position_masked >= window[0])
-                            & (position_masked <= window[1])
-                        ],
-                        window,
-                    )
-                    for _iter, (window) in enumerate(windows[:], 1)
-                )
-            )
-    else:
-        out_h12_haf, out_isafe = zip(
-            *parallel_manager(
-                delayed(run_windowed_stats)(
-                    hap_int[
-                        (position_masked >= window[0]) & (position_masked <= window[1])
-                    ],
-                    position_masked[
-                        (position_masked >= window[0]) & (position_masked <= window[1])
-                    ],
-                    window,
-                )
-                for _iter, window in enumerate(windows[:], 1)
-            )
-        )
-
-    df_window = pl.concat(out_h12_haf, how="vertical")
-
-    # Because of random shuffle in iSAFE it will output different values for same snps
-    # in contigous windows, get the max value or the mean
-    # df_isafe = pl.concat(out_isafe, how="vertical")
-    df_isafe = (
-        pl.concat(out_isafe, how="vertical")
-        .group_by(["iter", "positions", "daf"], maintain_order=True)
-        # .group_by(["iter", "center", "window", "positions", "daf"], maintain_order=True)
-        .agg(pl.col("isafe").mean().alias("isafe"))
-        .sort("positions")
-    )
-
-    # Save estimations in dict
-    d_stats["dind_high_low"] = df_dind_high_low
-    d_stats["s_ratio"] = df_s_ratio
-    d_stats["hapdaf_o"] = df_hapdaf_o
-    d_stats["hapdaf_s"] = df_hapdaf_s
-    d_stats["ihs"] = df_ihs
-    d_stats["nsl"] = df_nsl
-    d_stats["isafe"] = df_isafe
-    d_stats["window"] = df_window
-
-    if region is not None:
-        for k, df in d_stats.items():
-            d_stats[k] = df.with_columns([pl.lit(nchr).cast(pl.Utf8).alias("iter")])
-
-    ####### if neutral:
-
-    df_stats_norm = (
-        reduce(
-            lambda left, right: left.join(
-                right,
-                # on=["iter", "center", "window", "positions", "daf"],
-                on=["iter", "positions", "daf"],
-                how="full",
-                coalesce=True,
-            ),
-            [
-                df_nsl.lazy(),
-                df_ihs.lazy(),
-                df_isafe.lazy(),
-                df_dind_high_low.lazy(),
-                df_s_ratio.lazy(),
-                df_hapdaf_o.lazy(),
-                df_hapdaf_s.lazy(),
-                df_window.lazy(),
-            ],
-        )
-        .sort("positions")
-        .collect()
-    )
-
-    if region is not None:
-        df_stats_norm = df_stats_norm.with_columns(
-            [pl.lit(nchr).cast(pl.Utf8).alias("iter")]
-        )
-
-    return d_stats, df_stats_norm
-
-
-def calculate_stats_simplify(
-    hap_data,
-    _iter=1,
-    center=[5e5, 7e5],
-    windows=[50000, 100000, 200000, 500000, 1000000],
-    step=1e4,
-    region=None,
-):
-    """
-    Compute summary statistics from ms/discoal outputs or pre-parsed haplotypes.
-
-    This function parses or consumes haplotypes and positions, filters to
-    biallelic sites, computes per-site and windowed statistics (including iHS,
-    nSL, iSAFE, H12/H2/H1, HAF), and returns both the per-metric tables and a
-    joined DataFrame.
-
-    :param hap_data:
-        Either a path to an ms/discoal gzipped output file (``.ms``, ``.ms.gz``,
-        ``.out``, ``.out.gz``) or a preloaded tuple/list of arrays compatible with
-        downstream helpers.
-    :param int _iter:
-        Iteration identifier used when adding standard columns to result tables.
-        Default is ``1``.
-    :param list center:
-        Two integers controlling where centers are placed for normalization steps.
-        Default is ``[5e5, 7e5]``.
-    :param list windows:
-        List of window sizes (in base pairs) used by downstream normalization.
-        Default is ``[50000, 100000, 200000, 500000, 1000000]``.
-    :param float step:
-        Window step size (in base pairs) used by downstream normalization.
-        Default is ``1e4``.
-    :param region:
-        Optional region string used when some helpers attach region labels to outputs.
-
-    :returns:
-        A pair where the first element is a dictionary of Polars DataFrames by
-        metric name, and the second element is a joined Polars DataFrame
-        containing the normalized columns across metrics.
-    :rtype: tuple[dict, polars.DataFrame]
-
-    :raises FileNotFoundError:
-        If an input file path cannot be read.
-    :raises ValueError:
-        Propagated from downstream parsing if inputs are malformed.
-
-    .. note::
-       Large intermediates are explicitly released before return (``gc.collect()``).
-    """
-    filterwarnings(
-        "ignore",
-        category=RuntimeWarning,
-        message="invalid value encountered in scalar divide",
-    )
-    np.seterr(divide="ignore", invalid="ignore")
-
-    if isinstance(hap_data, list) or isinstance(hap_data, tuple):
-        hap, rec_map, p = hap_data
-    elif isinstance(hap_data, str):
-        try:
-            # hap, rec_map, p = ms_parser(hap_data)
-            # hap, rec_map, p = ms_parser_np(hap_data)
-            (
-                hap_int,
-                rec_map_01,
-                ac,
-                biallelic_mask,
-                position_masked,
-                genetic_position_masked,
-            ) = parse_and_filter_ms(hap_data)
-            freqs = ac[:, 1] / ac.sum(axis=1)
-
-            if hap_int.shape[0] != rec_map_01.shape[0]:
-                return None, None
-        except:
-            try:
-                hap, rec_map, p = genome_reader(hap_data, region)
-            except:
-                return None, None
-    else:
-        return None, None
-
-    # Open and filtering data
-    # (
-    #     hap_int,
-    #     rec_map_01,
-    #     ac,
-    #     biallelic_mask,
-    #     position_masked,
-    #     genetic_position_masked,
-    # ) = filter_gt(hap, rec_map, region=region)
-    # freqs = ac[:, 1] / ac.sum(axis=1)
-
-    # if len(center) == 1:
-    #     centers = np.arange(center[0], center[0] + step, step).astype(int)
-    # else:
-    # centers = np.arange(center[0], center[1] + step, step).astype(int)
-    # Estimate fs stats
-    df_dind_high_low, df_s_ratio, df_hapdaf_s, df_hapdaf_o = run_fs_stats(
-        hap_int, ac, rec_map_01
-    )
-
-    d_stats = defaultdict(dict)
-
-    df_dind_high_low = center_window_cols(df_dind_high_low, _iter=_iter)
-    df_s_ratio = center_window_cols(df_s_ratio, _iter=_iter)
-    df_hapdaf_o = center_window_cols(df_hapdaf_o, _iter=_iter)
-    df_hapdaf_s = center_window_cols(df_hapdaf_s, _iter=_iter)
-
-    # iSAFE
-    df_isafe = run_isafe(hap_int, position_masked)
-    df_isafe = center_window_cols(df_isafe, _iter=_iter)
-
-    # iHS and nSL
-    df_ihs = ihs_ihh(
-        hap_int,
-        position_masked,
-        map_pos=genetic_position_masked,
-        min_ehh=0.05,
-        min_maf=0.05,
-        include_edges=False,
-    )
-
-    df_ihs = center_window_cols(df_ihs, _iter=_iter)
-
-    nsl_v = nsl(hap_int[freqs >= 0.05], use_threads=False)
-    df_nsl = pl.DataFrame(
-        {
-            "positions": position_masked[freqs >= 0.05],
-            "daf": freqs[freqs >= 0.05],
-            "nsl": nsl_v,
-        }
-    ).fill_nan(None)
-    df_nsl = center_window_cols(df_nsl, _iter=_iter)
-
-    try:
-        # h12_v, h2_h1 = h12_enard(
-        #     hap_int,
-        #     position_masked,
-        #     window_size=int(1e5),
-        # )
-        h12_v, h2_h1, h2_v = h12_enard(
-            hap_int,
-            position_masked
-            # , window_size=int(1e5)
-        )
-    except:
-        h12_v, h2_h1, h2_v = np.nan, np.nan
-
-    haf_v = haf_top(
-        hap_int.astype(np.float64),
-        position_masked,
-        # window_size=int(1e5),
-    )
-
-    daf_w = 1.0
-    pos_w = int(6e5)
-    if 6e5 in position_masked:
-        daf_w = freqs[position_masked == 6e5][0]
-
-    df_window = pl.DataFrame(
-        {
-            "iter": pl.Series([_iter], dtype=pl.Int64),
-            # "center": pl.Series([int(6e5)], dtype=pl.Int64),
-            # "window": pl.Series([int(1e6)], dtype=pl.Int64),
-            "positions": pl.Series([pos_w], dtype=pl.Int64),
-            "daf": pl.Series([daf_w], dtype=pl.Float64),
-            "h12": pl.Series([h12_v], dtype=pl.Float64),
-            "h2_h1": pl.Series([h2_h1], dtype=pl.Float64),
-            "haf": pl.Series([haf_v], dtype=pl.Float64),
-        }
-    )
-
-    d_stats["dind_high_low"] = df_dind_high_low
-    d_stats["s_ratio"] = df_s_ratio
-    d_stats["hapdaf_o"] = df_hapdaf_o
-    d_stats["hapdaf_s"] = df_hapdaf_s
-    d_stats["ihs"] = df_ihs
-    d_stats["isafe"] = df_isafe
-    d_stats["nsl"] = df_nsl
-    d_stats["window"] = df_window
-
-    if region is not None:
-        for k, df in d_stats.items():
-            d_stats[k] = df.with_columns(pl.lit(region).alias("iter"))
-
-    ####### if neutral:
-
-    df_stats_norm = (
-        reduce(
-            lambda left, right: left.join(
-                right,
-                # on=["iter", "center", "window", "positions", "daf"],
-                on=["iter", "positions", "daf"],
-                how="full",
-                coalesce=True,
-            ),
-            [
-                df_nsl.lazy(),
-                df_ihs.lazy(),
-                df_isafe.lazy(),
-                df_dind_high_low.lazy(),
-                df_s_ratio.lazy(),
-                df_hapdaf_o.lazy(),
-                df_hapdaf_s.lazy(),
-                df_window.lazy(),
-            ],
-        )
-        .sort("positions")
-        .collect()
-    )
-
-    if region is not None:
-        df_stats_norm = df_stats_norm.with_columns(pl.lit(region).alias("iter"))
-    del hap_int, rec_map_01, ac, biallelic_mask
-    del position_masked, genetic_position_masked, freqs
-    del df_dind_high_low, df_s_ratio, df_hapdaf_o, df_hapdaf_s
-    del df_isafe, df_ihs, df_nsl, df_window
-    gc.collect()
-    # sys.stdout.flush()
-
-    # return d_stats, df_stats_norm, hap_sorted_corr_daf
-    return d_stats, df_stats_norm
-
-
-def calculate_stats_simplify_custom(
-    hap_data,
-    _iter=1,
-    center=[5e5, 7e5],
-    windows=[50000, 100000, 200000, 500000, 1000000],
-    step=1e4,
-    region=None,
-):
-    filterwarnings(
-        "ignore",
-        category=RuntimeWarning,
-        message="invalid value encountered in scalar divide",
-    )
-    np.seterr(divide="ignore", invalid="ignore")
-=======
 
 def get_closest_snps(position_array, center, N):
     """
@@ -3541,7 +1782,6 @@ def calculate_stats_simulations(
 
     # ── resolve which stats to compute ──────────────────────────────
     window_cols, snp_groups, compute_isafe, snp_cols = resolve_stats(stats)
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
     try:
         (
@@ -3551,14 +1791,6 @@ def calculate_stats_simulations(
             biallelic_mask,
             position_masked,
             genetic_position_masked,
-<<<<<<< HEAD
-        ) = parse_and_filter_ms(hap_data)
-        freqs = ac[:, 1] / ac.sum(axis=1)
-        if hap_int.shape[0] != rec_map_01.shape[0]:
-            return None, None, None
-    except:
-        return None, None, None
-=======
         ) = parse_ms_numpy(hap_data, seq_len=locus_length)
         freqs = np.ascontiguousarray(ac[:, 1] / ac.sum(axis=1), dtype=np.float64)
         if hap_int.shape[0] != rec_map_01.shape[0]:
@@ -4168,314 +2400,12 @@ def calculate_stats_vcf_flat(
         [tuple(map(int, r.split(":")[-1].split("-"))) for r in region]
     )
     nchr = region[0].split(":")[0]
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
     if len(center) == 1:
         centers = np.arange(center[0], center[0] + step, step).astype(int)
     else:
         centers = np.arange(center[0], center[1] + step, step).astype(int)
 
-<<<<<<< HEAD
-    # Estimate fs stats
-    df_dind_high_low, df_s_ratio, df_hapdaf_o, df_hapdaf_s = run_fs_stats(
-        hap_int[:, :], ac[:, :], rec_map_01[:, :]
-    )
-
-    d_stats = defaultdict(dict)
-
-    df_dind_high_low = center_window_cols(df_dind_high_low, _iter=_iter)
-    df_s_ratio = center_window_cols(df_s_ratio, _iter=_iter)
-    df_hapdaf_o = center_window_cols(df_hapdaf_o, _iter=_iter)
-    df_hapdaf_s = center_window_cols(df_hapdaf_s, _iter=_iter)
-
-    # iSAFE
-    df_isafe = run_isafe(hap_int, position_masked)
-    df_isafe = center_window_cols(df_isafe, _iter=_iter)
-    # iHS and nSL
-    df_ihs = ihs_ihh(
-        hap_int,
-        position_masked,
-        map_pos=genetic_position_masked,
-        min_ehh=0.05,
-        min_maf=0.05,
-        include_edges=False,
-    )
-
-    df_ihs = center_window_cols(df_ihs, _iter=_iter)
-
-    nsl_v = nsl(hap_int[freqs >= 0.05], use_threads=False)
-    df_nsl = pl.DataFrame(
-        {
-            "positions": position_masked[freqs >= 0.05],
-            "daf": freqs[freqs >= 0.05],
-            "nsl": nsl_v,
-        }
-    ).fill_nan(None)
-    df_nsl = center_window_cols(df_nsl, _iter=_iter)
-
-    # raisd mu
-    _r2 = compute_r2_matrix_upper(hap_int)
-    # zns_v, omega_max = Ld(_r2)
-
-    df_mu = mu_stat(hap_int, position_masked, _r2)
-
-    # windowed stats
-    _tmp_window = []
-    for c, w in product(centers, windows):
-        lower = c - w // 2
-        upper = c + w // 2
-        mask = (position_masked >= lower) & (position_masked <= upper)
-
-        _tmp_hap = hap_int[mask]
-        _tmp_pos = position_masked[mask]
-        _ac = ac[mask]
-        if _tmp_hap.size == 0:
-            h12_v = (
-                h2_h1
-            ) = (
-                haf_v
-            ) = (
-                _pos
-            ) = (
-                mu_var
-            ) = (
-                mu_sfs
-            ) = (
-                mu_ld
-            ) = (
-                mu_total
-            ) = (
-                zns_v
-            ) = (
-                omega_max
-            ) = (
-                tmp_pi
-            ) = tmp_fay = tmp_tajd = tmp_y = tmp_e = tmp_fulid = tmp_fulif = np.nan
-        else:
-            try:
-                #     h12_v, h2_h1 = h12_enard(
-                #         hap_int[mask], position_masked[mask], window_size=int(5e5)
-                #     )
-
-                h12_v, h2_h1, h2_v = h12_enard(
-                    _tmp_hap,
-                    _tmp_pos
-                    # , window_size=int(5e5)
-                )
-                # h12_v, h2_h1 = garud_h_numba(_tmp_hap)[:2]
-            except:
-                h12_v, h2_h1, h2_v = np.nan, np.nan, np.nan
-
-            haf_v = haf_top(
-                _tmp_hap.astype(float),
-                _tmp_pos,
-                # window_size=int(5e5),
-            )
-            _pos, mu_var, mu_sfs, mu_ld, mu_total = (
-                df_mu.filter(
-                    (pl.col("positions") >= lower) & (pl.col("positions") <= upper)
-                )
-                .mean()
-                .to_numpy()
-                .flatten()
-            )
-
-            zns_v, omega_max = Ld(_r2, mask)
-
-            tmp_pi = theta_pi(_ac).sum() / (upper - lower + 1)
-            tmp_fay = fay_wu_h_norm(_ac)[-1]
-            tmp_tajd = tajima_d(_ac)
-            tmp_y = achaz_y(sfs_nb(_ac[:, -1], _ac.sum(axis=1)[0]))
-            tmp_e = zeng_e(_ac)
-            tmp_fulid = fuli_d(_ac)
-            tmp_fulif = fuli_f(_ac)
-
-        _tmp_window.append(
-            np.array(
-                [
-                    int(_iter),
-                    int(c),
-                    int(w),
-                    h12_v,
-                    h2_h1,
-                    haf_v,
-                    tmp_pi,
-                    tmp_fay,
-                    omega_max,
-                    zns_v,
-                    mu_var,
-                    mu_sfs,
-                    mu_ld,
-                    mu_total,
-                    tmp_tajd,
-                    tmp_y,
-                    tmp_e,
-                    tmp_fulid,
-                    tmp_fulif,
-                ]
-            )
-        )
-
-    df_window_new = pl.DataFrame(
-        np.vstack(_tmp_window),
-        schema=pl.Schema(
-            [
-                ("iter", pl.Int64),
-                ("center", pl.Int64),
-                ("window", pl.Int64),
-                ("h12", pl.Float64),
-                ("h2_h1", pl.Float64),
-                ("haf", pl.Float64),
-                ("pi", pl.Float64),
-                ("fay_wu_h", pl.Float64),
-                ("omega_max", pl.Float64),
-                ("zns", pl.Float64),
-                ("mu_var", pl.Float64),
-                ("mu_sfs", pl.Float64),
-                ("mu_ld", pl.Float64),
-                ("mu_total", pl.Float64),
-                ("tajima_d", pl.Float64),
-                ("achaz_y", pl.Float64),
-                ("zeng_e", pl.Float64),
-                ("fuli_d", pl.Float64),
-                ("fuli_f", pl.Float64),
-            ]
-        ),
-    )
-
-    d_stats["dind_high_low"] = df_dind_high_low
-    d_stats["s_ratio"] = df_s_ratio
-    d_stats["hapdaf_o"] = df_hapdaf_o
-    d_stats["hapdaf_s"] = df_hapdaf_s
-    d_stats["ihs"] = df_ihs
-    d_stats["isafe"] = df_isafe
-    d_stats["nsl"] = df_nsl
-    d_stats["window"] = df_window_new
-    # d_stats["neutral_stats"] = df_window_new
-
-    if region is not None:
-        for k, df in d_stats.items():
-            d_stats[k] = df.with_columns(pl.lit(region).alias("iter"))
-
-    ####### if neutral:
-    df_stats_norm = (
-        reduce(
-            lambda left, right: left.join(
-                right,
-                on=["iter", "positions", "daf"],
-                how="full",
-                coalesce=True,
-            ),
-            # [df_nsl, df_ihs_n, df_isafe],
-            [
-                df_nsl,
-                df_ihs,
-                df_isafe,
-                df_dind_high_low,
-                df_s_ratio,
-                df_hapdaf_o,
-                df_hapdaf_s,
-            ],
-        )
-        # .with_columns(pl.lit(1200000).alias("window"))
-        .sort(["iter", "positions"])
-        # .sort(["iter", "center", "window", "positions"])
-    )
-
-    if region is not None:
-        df_stats_norm = df_stats_norm.with_columns(pl.lit(region).alias("iter"))
-
-    return d_stats, {"snps": df_stats_norm, "windows": df_window_new}
-
-
-@njit
-def relative_position(positions, window):
-    window_start = window[0]
-    # masked_positions = positions[mask]
-    positions_relative = np.empty(positions.shape[0], dtype=np.int32)
-
-    for i in range(positions.shape[0]):
-        positions_relative[i] = positions[i] - window_start + 1
-
-    return positions_relative
-
-
-def run_windowed_stats(hap, positions, window):
-    # mask = (positions >= window[0]) & (positions <= window[1])
-
-    if hap.size != 0:
-        # positions_relative = relative_position(positions, window, mask)
-        # d_pos = {k: i for i, k in zip(range(1, int(1.2e6) + 1), range(window[0], window[1] + 1))}
-        # positions_relative = np.array([d_pos[i] for i in positions[mask]])
-        # df_isafe = run_isafe(hap[mask, :].astype(float), positions[mask]).fill_nan(None)
-
-        # with numba_thread_control(nthreads):
-
-        # Use 6e5 as actual center, change windows positions to range 1-1.2e6
-        # Concordance with summary statistic simulation estimation
-        positions_relative = relative_position(positions, window)
-        df_isafe = run_isafe(hap.astype(float), positions).fill_nan(None)
-
-        try:
-            # h12_v, h2_h1 = h12_enard(hap[mask, :],positions_relative,window_size=int(5e5))
-            h12_v, h2_h1, h2_v = h12_enard(
-                hap,
-                positions_relative,
-                # window_size=int(1e5)
-                # hap[mask, :], positions_relative, window_size=int(1e5)
-            )
-        except:
-            h12_v, h2_h1, h2_v = np.nan, np.nan, np.nan
-
-        haf_v = haf_top(
-            hap.astype(np.float64),
-            # hap.astype(np.float64)[mask, :],
-            positions_relative,
-            # window_size=int(1e5),
-            # window_size=int(5e5),
-        )
-
-        df_isafe = center_window_cols(df_isafe)
-
-        # Middle point window as position
-        df_h12_haf = pl.DataFrame(
-            {
-                "iter": pl.Series([1], dtype=pl.Int64),
-                # "center": pl.Series([int(6e5)], dtype=pl.Int64),
-                # "window": pl.Series([int(1.2e6)], dtype=pl.Int64),
-                "positions": pl.Series([(window[0] + window[-1]) // 2], dtype=pl.Int64),
-                "daf": pl.Series([1], dtype=pl.Float64),
-                "h12": pl.Series([h12_v], dtype=pl.Float64),
-                "h2_h1": pl.Series([h2_h1], dtype=pl.Float64),
-                "haf": pl.Series([haf_v], dtype=pl.Float64),
-            }
-        ).fill_nan(None)
-    else:
-        df_h12_haf = pl.DataFrame(
-            schema={
-                "iter": pl.Int64,
-                # "center": pl.Int64,
-                # "window": pl.Int64,
-                "positions": pl.Int64,
-                "daf": pl.Float64,
-                "h12": pl.Float64,
-                "h2_h1": pl.Float64,
-                "haf": pl.Float64,
-            }
-        )
-        df_isafe = pl.DataFrame(
-            schema={
-                "iter": pl.Int64,
-                # "center": pl.Int64,
-                # "window": pl.Int64,
-                "positions": pl.Int64,
-                "daf": pl.Float64,
-                "isafe": pl.Float64,
-            }
-        )
-
-    return df_h12_haf, df_isafe
-=======
     # build joblib tasks
     tasks = []
     snp_task_keys = []
@@ -4699,87 +2629,17 @@ def run_windowed_stats(hap, positions, window):
         df_stats_norm = None
 
     return df_stats_norm, df_window_new
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
 
 ################## Normalization
 
 
-<<<<<<< HEAD
-def normalize_stats(
-    stats_values,
-    bins,
-    center=[5e5, 7e5],
-    windows=[50000, 100000, 200000, 500000, 1000000],
-    step=1e4,
-    region=None,
-    parallel_manager=None,
-    nthreads=1,
-    vcf=False,
-):
-    df_fv, df_fv_raw = normalization_raw(
-        deepcopy(stats_values),
-        bins,
-        center=center,
-        windows=windows,
-        step=step,
-        region=region,
-        parallel_manager=None,
-        nthreads=nthreads,
-        vcf=vcf,
-    )
-
-    df_fv_w = pivot_feature_vectors(df_fv, vcf=vcf)
-    df_fv_w_raw = pivot_feature_vectors(df_fv_raw, vcf=vcf)
-
-    # dump fvs with more than 10% nans
-    df_fv_w = df_fv_w.fill_nan(None)
-    num_nans = (
-        df_fv_w.select(
-            pl.exclude(["iter", "s", "t", "f_i", "f_t", "model", "^.*flip.*$"])
-        )
-        .transpose()
-        .null_count()
-        .to_numpy()
-        .flatten()
-    )
-    df_fv_w = df_fv_w.filter(
-        num_nans
-        < int(
-            df_fv_w.select(
-                pl.exclude(["iter", "s", "t", "f_i", "f_t", "model", "^.*flip.*$"])
-            ).shape[1]
-            * 0.1
-        )
-    ).fill_null(0)
-
-    if not vcf:
-        df_fv_w.sort(["iter", "model"])
-
-    df_fv_w_raw = df_fv_w_raw.fill_nan(None)
-
-    return df_fv_w, df_fv_w_raw
-
-
-def normalization_raw(
-    stats_values,
-    bins,
-    center=[5e5, 7e5],
-    windows=[50000, 100000, 200000, 500000, 1000000],
-    step=1e4,
-    region=None,
-    vcf=False,
-    nthreads=1,
-    parallel_manager=None,
-):
-=======
 @njit(cache=True)
 def relative_position(positions, window):
     return positions - window[0] + 1
 
 
 def cut_snps(df, centers, windows, stats_names, fixed_center=None, iter_value=1):
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     """
     Processes data within windows across multiple centers and window sizes.
 
@@ -4808,332 +2668,6 @@ def cut_snps(df, centers, windows, stats_names, fixed_center=None, iter_value=1)
     polars.DataFrame
         DataFrame with aggregated statistics for each center and window.
     """
-<<<<<<< HEAD
-    df_stats, params = deepcopy(stats_values)
-
-    if vcf:
-        nchr = region[0].split(":")[0]
-        center_coords = [tuple(map(int, r.split(":")[-1].split("-"))) for r in region]
-        center_g = np.array([(a + b) // 2 for a, b in center_coords])
-
-        if len(center) > 1:
-            centers = np.arange(center[0], center[1] + step, step).astype(int)
-        else:
-            centers = center
-
-        df_h12_haf = df_stats.pop("window")
-        snps_genome = reduce(
-            lambda left, right: left.join(
-                right,
-                on=["iter", "positions", "daf"],
-                how="full",
-                coalesce=True,
-            ),
-            list(df_stats.values()),
-        ).sort(["iter", "positions"])
-
-        # Overwrite snps_values
-        snps_values = snps_genome.select(pl.exclude(["h12", "haf"]))
-
-        stats_names = snps_values.select(snps_values.columns[3:]).columns
-
-        binned_values = bin_values(snps_values)
-
-        normalized_df = normalize_snps_statistics(
-            binned_values, bins, stats_names
-        ).sort("positions")
-
-        left_idxs = np.searchsorted(
-            normalized_df["positions"].to_numpy(), center_g - 6e5, side="left"
-        )
-        right_idxs = np.searchsorted(
-            normalized_df["positions"].to_numpy(), center_g + 6e5, side="right"
-        )
-        tmp_normalized = [
-            normalized_df.slice(start, end - start)
-            for start, end in zip(left_idxs, right_idxs)
-        ]
-        tmp_raw = [
-            binned_values.slice(start, end - start)
-            for start, end in zip(left_idxs, right_idxs)
-        ]
-
-        if parallel_manager is None:
-            df_fv_n = pl.concat(
-                Parallel(n_jobs=nthreads, verbose=1)(
-                    delayed(cut_snps)(
-                        df,
-                        centers,
-                        windows,
-                        stats_names,
-                        fixed_center=coord,
-                        iter_value=coord,
-                        # vcf=True,
-                    )
-                    for df, coord in zip(tmp_normalized, center_g)
-                )
-            )
-            df_fv_n_raw = pl.concat(
-                Parallel(n_jobs=nthreads, verbose=1)(
-                    delayed(cut_snps)(
-                        df,
-                        centers,
-                        windows,
-                        stats_names,
-                        fixed_center=coord,
-                        iter_value=coord,
-                    )
-                    for df, coord in zip(tmp_raw, center_g)
-                )
-            )
-        else:
-            df_fv_n = pl.concat(
-                parallel_manager(
-                    delayed(cut_snps)(
-                        df,
-                        center,
-                        windows,
-                        stats_names,
-                        fixed_center=coord,
-                        iter_value=coord,
-                    )
-                    for df, coord in zip(tmp_normalized, center)
-                )
-            )
-            df_fv_n_raw = pl.concat(
-                parallel_manager(
-                    delayed(cut_snps)(
-                        df,
-                        center,
-                        windows,
-                        stats_names,
-                        fixed_center=coord,
-                        iter_value=coord,
-                    )
-                    for df, coord in zip(tmp_raw, center)
-                )
-            )
-
-        window_values = (
-            df_h12_haf.with_columns(pl.col("positions").alias("iter"))
-            .filter(pl.col("positions").is_in(df_fv_n["iter"].unique().to_numpy()))
-            .select(pl.exclude(["center", "window", "positions", "daf"]))
-        )
-        df_fv_n = df_fv_n.join(
-            window_values,
-            on=["iter"],
-            how="full",
-            coalesce=True,
-        )
-        df_fv_n_raw = df_fv_n_raw.join(
-            window_values,
-            on=["iter"],
-            how="full",
-            coalesce=True,
-        )
-
-        df_params_unpack = pl.DataFrame(
-            np.repeat(
-                np.zeros((1, 4)),
-                df_fv_n.shape[0],
-                axis=0,
-            ),
-            schema=["s", "t", "f_i", "f_t"],
-        )
-        df_fv_n = df_fv_n.with_columns(
-            pl.lit(snps_genome["iter"].unique().first()).alias("nchr")
-        )
-        df_fv_n_raw = df_fv_n_raw.with_columns(
-            pl.lit(snps_genome["iter"].unique().first()).alias("nchr")
-        )
-    else:
-        if parallel_manager is None:
-            df_fv_n_l, df_fv_n_l_raw = zip(
-                *Parallel(n_jobs=nthreads, verbose=1)(
-                    delayed(normalize_cut_raw)(
-                        snps_values,
-                        bins,
-                        center=center,
-                        windows=windows,
-                        step=step,
-                    )
-                    for _iter, snps_values in enumerate(df_stats, 1)
-                )
-            )
-        else:
-            df_fv_n_l, df_fv_n_l_raw = zip(
-                *parallel_manager(
-                    delayed(normalize_cut_raw)(
-                        snps_values,
-                        bins,
-                        center=center,
-                        windows=windows,
-                        step=step,
-                    )
-                    for _iter, snps_values in enumerate(df_stats, 1)
-                )
-            )
-
-        df_fv_n = pl.concat(df_fv_n_l).with_columns(
-            pl.col(["iter", "window", "center"]).cast(pl.Int64)
-        )
-        df_fv_n_raw = pl.concat(df_fv_n_l_raw).with_columns(
-            pl.col(["iter", "window", "center"]).cast(pl.Int64)
-        )
-
-        df_window = pl.concat([df["window"] for df in df_stats]).select(
-            pl.exclude(["center", "window", "positions", "daf"])
-        )
-
-        df_fv_n = df_fv_n.join(df_window, on=["iter"], how="full", coalesce=True)
-        df_fv_n_raw = df_fv_n_raw.join(
-            df_window, on=["iter"], how="full", coalesce=True
-        )
-
-        # params = params[:, [0, 1, 3, 4, ]]
-        df_params_unpack = pl.DataFrame(
-            np.repeat(
-                params,
-                df_fv_n.select(["center", "window"])
-                .unique()
-                .sort(["center", "window"])
-                .shape[0],
-                axis=0,
-            ),
-            schema=["s", "t", "f_i", "f_t"],
-        )
-
-    df_fv_n = pl.concat(
-        [df_params_unpack, df_fv_n],
-        how="horizontal",
-    )
-    df_fv_n_raw = pl.concat(
-        [df_params_unpack, df_fv_n_raw],
-        how="horizontal",
-    )
-
-    force_order = ["iter"] + [col for col in df_fv_n.columns if col != "iter"]
-    df_fv_n = df_fv_n.select(force_order)
-    df_fv_n_raw = df_fv_n_raw.select(force_order)
-
-    return df_fv_n, df_fv_n_raw
-
-
-def vectorized_cut_vcf(
-    normalized_df: pl.DataFrame,
-    centers: np.ndarray,
-    windows: list[int],
-    stats_names: list[str],
-) -> pl.DataFrame:
-    """
-    For each genomic center in `centers`, this function examines
-    21 sub-centers evenly spaced ±100kb around it, and for each
-    window size in `windows` computes the mean of each column in
-    `stats_names` over that sub-interval.
-
-    It does so in O(N) + O(len(centers)*21*len(windows)) time by:
-
-      • building zero-prepended prefix sums (and count arrays)
-        for each stat to allow O(1) range-sum queries;
-      • using two global searchsorted calls to locate all
-        window boundaries at once;
-      • performing all mean computations via vectorized NumPy
-        arithmetic; and
-      • constructing one big Polars DataFrame at the end.
-
-    Parameters
-    ----------
-    normalized_df
-        Polars DataFrame with a sorted "positions" column (i64)
-        plus the numeric columns in `stats_names` (f64).
-    centers
-        1D NumPy array of genomic center positions to query.
-    windows
-        List of integer window sizes (e.g. [50000,100000,…]).
-    stats_names
-        List of column names in `normalized_df` to average.
-
-    Returns
-    -------
-    Polars DataFrame
-        Rows = len(centers) * 21 * len(windows). Columns:
-        "iter"  (outer center),
-        "center" (sub-center = iter + offset),
-        "window" (window size),
-        plus one column per entry in `stats_names`.
-    """
-
-    # Extract positions as a NumPy array for fast searchsorted
-    positions = normalized_df["positions"].to_numpy()
-    n = positions.size
-
-    # Build prefix-sums and counts for each stat, with a leading zero
-    ps0, pc0 = {}, {}
-    for stat in stats_names:
-        arr = normalized_df[stat].to_numpy()
-        valid = ~np.isnan(arr)
-        csum = np.cumsum(np.where(valid, arr, 0.0))
-        cnt = np.cumsum(valid.astype(np.int64))
-
-        # Prepend zero so that sum over [i:j] is ps0[j] - ps0[i]
-        ps0[stat] = np.concatenate(([0.0], csum))
-        pc0[stat] = np.concatenate(([0], cnt))
-
-    # Prepare the 21 inner offsets (±100kb) and tile with each window
-    inner_offsets = np.linspace(-100_000, +100_000, 21, dtype=np.int64)
-    W = len(windows)
-    inner_base = np.repeat(inner_offsets, W)  # repeat each offset for all windows
-    window_base = np.tile(
-        windows, inner_offsets.size
-    )  # repeat all windows for each offset
-    M = inner_base.size  # total sub-queries per center (21 * W)
-
-    # Tile the base arrays for every center
-    C = centers.size
-    iter_col = np.repeat(centers, M)  # each center repeated M times
-    inner_col = iter_col + np.tile(inner_base, C)  # absolute sub-center positions
-    window_col = np.tile(window_base, C)  # window sizes aligned per sub-center
-
-    # Compute lower/upper bounds for each sub-window and lookup indices
-    lowers = inner_col - (window_col // 2)
-    uppers = inner_col + (window_col // 2)
-    start_idx = np.searchsorted(positions, lowers, side="left")
-    end_idx = np.searchsorted(positions, uppers, side="right")
-
-    # Allocate output dict with the iter/center/window columns
-    out = {
-        "iter": iter_col,
-        "center": inner_col,
-        "window": window_col,
-    }
-
-    # Compute means using prefix-sum differences and safe division
-    for stat in stats_names:
-        sb = ps0[stat]
-        cb = pc0[stat]
-
-        # Total sum and count in each interval
-        svals = sb[end_idx] - sb[start_idx]
-        cvals = cb[end_idx] - cb[start_idx]
-
-        # Initialize result array with NaN for empty windows
-        mean_vals = np.full_like(svals, np.nan, dtype=np.float64)
-        # Divide only where count>0, avoids divide-by-zero warnings
-        np.divide(svals, cvals, out=mean_vals, where=(cvals > 0))
-
-        out[stat] = mean_vals
-
-    # Build and return the final Polars DataFrame in one shot
-    return pl.DataFrame(out)
-
-
-def normalize_cut_raw(
-    snps_values,
-    bins,
-    center=[5e5, 7e5],
-    windows=[50000, 100000, 200000, 500000, 1000000],
-    step=int(1e4),
-=======
     # If stats_names not provided, use all appropriate columns
 
     # reset centers
@@ -5261,7 +2795,6 @@ def snps_to_r_bins(
     snps_df,
     df_r_bins_windows,
     mode="nearest_center",
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 ):
     """
     Returns snps_df with added columns: cm_mb, r_bins (then you can drop cm_mb if you want).
@@ -5398,93 +2931,6 @@ def normalize_neutral(d_stats_neutral, vcf=False, df_r_bins=None):
     - The summary statistics processed exclude window-specific statistics such as "h12" and "haf."
 
     """
-<<<<<<< HEAD
-    df_out = []
-    df_out_raw = []
-    _iter = np.unique([i.select("iter").unique() for i in snps_values.values()])
-
-    if len(center) == 2:
-        centers = np.arange(center[0], center[1] + step, step).astype(int)
-    else:
-        centers = center
-
-    df = reduce(
-        lambda left, right: left.join(
-            right,
-            # on=["iter", "center", "window", "positions", "daf"],
-            on=["iter", "positions", "daf"],
-            how="full",
-            coalesce=True,
-        ),
-        [v for k, v in snps_values.items() if k != "window"],
-    )
-
-    df_window = snps_values["window"]
-
-    stats_names = df[:, 3:].columns
-
-    binned_values = bin_values(df)
-    normalized_df = normalize_snps_statistics(binned_values, bins, stats_names)
-
-    df_out = cut_snps(
-        normalized_df,
-        centers,
-        windows,
-        stats_names,
-        fixed_center=None,
-        iter_value=_iter,
-    )
-    df_out_raw = cut_snps(
-        df,
-        centers,
-        windows,
-        stats_names,
-        fixed_center=None,
-        iter_value=_iter,
-    )
-
-    return df_out, df_out_raw
-
-
-def normalize_snps_statistics(df_snps, bins, stats_names, norm_type=1):
-    """
-    Normalizes SNP-level statistics by comparing them to neutral expectations.
-
-    Parameters
-    ----------
-    df_snps : polars.DataFrame
-        DataFrame containing SNP-level statistics with binned frequency values.
-    binned_stats : dict or bins
-        Neutral and empirical statistics, either as a dictionary with 'neutral' and 'empirical'
-        keys (containing mean and std) or a bins object.
-    stats_names : list
-        List of statistical measure column names to normalize.
-
-    Returns
-    -------
-    polars.DataFrame
-        DataFrame with normalized statistics.
-    """
-    if not stats_names:
-        raise ValueError("stats_names cannot be empty")
-
-    if norm_type not in [1, 2, 3, 4]:
-        raise ValueError(f"Unsupported normalization type: {norm_type}")
-
-    # Handle dictionary or defaultdict case
-    if isinstance(bins, (dict, defaultdict)):
-        # Extract statistics dataframes
-        neutral_means = bins["neutral"].mean.select(["freq_bins"] + stats_names)
-        neutral_stds = bins["neutral"].std.select(["freq_bins"] + stats_names)
-        empirical_means = bins["empirical"].mean.select(["freq_bins"] + stats_names)
-        empirical_stds = bins["empirical"].std.select(["freq_bins"] + stats_names)
-
-        # Join all statistics to the input dataframe
-        normalized_df = (
-            df_snps.join(
-                neutral_means,
-                on="freq_bins",
-=======
 
     snps_list = [d["snps"] for d in d_stats_neutral if d["snps"] is not None]
     windows_list = [d["windows"] for d in d_stats_neutral if d["windows"] is not None]
@@ -6229,117 +3675,8 @@ def normalize_snps_statistics(df_snps, df_window, bins, stats_names, dps_shape=F
             df_snps.join(
                 neutral_means,
                 on=snp_join,
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
-                how="left",
-                suffix="_mean_neutral",
-                coalesce=True,
-<<<<<<< HEAD
-            )
-            .join(
-                neutral_stds,
-                on="freq_bins",
-                how="left",
-                suffix="_std_neutral",
-                coalesce=True,
-            )
-            .join(
-                empirical_means,
-                on="freq_bins",
-                how="left",
-                suffix="_mean_empirical",
-                coalesce=True,
-            )
-            .join(
-                empirical_stds,
-                on="freq_bins",
-                how="left",
-                suffix="_std_empirical",
-                coalesce=True,
-            )
-        )
-
-        # Apply normalization based on type
-        if norm_type == 1:
-            normalized_cols = [
-                (
-                    (pl.col(s) - pl.col(f"{s}_mean_empirical"))
-                    / pl.col(f"{s}_std_empirical")
-                ).alias(s)
-                for s in stats_names
-            ]
-        elif norm_type == 2:
-            normalized_cols = [
-                (
-                    (
-                        (pl.col(s) - pl.col(f"{s}_mean_empirical"))
-                        / pl.col(f"{s}_std_empirical")
-                    )
-                    * (
-                        (pl.col(f"{s}_mean_empirical") - pl.col(f"{s}_mean_neutral"))
-                        / pl.col(f"{s}_std_neutral")
-                    )
-                ).alias(s)
-                for s in stats_names
-            ]
-        elif norm_type == 3:
-            normalized_cols = [
-                (
-                    (
-                        (pl.col(s) - pl.col(f"{s}_mean_empirical"))
-                        / pl.col(f"{s}_std_empirical")
-                    )
-                    * (
-                        1
-                        + (
-                            (
-                                pl.col(f"{s}_mean_empirical")
-                                - pl.col(f"{s}_mean_neutral")
-                            )
-                            / pl.col(f"{s}_std_neutral")
-                        ).abs()
-                    )
-                ).alias(s)
-                for s in stats_names
-            ]
-        elif norm_type == 4:
-            normalized_cols = [
-                (
-                    (
-                        (pl.col(s) - pl.col(f"{s}_mean_empirical"))
-                        / pl.col(f"{s}_std_empirical")
-                    )
-                    * (
-                        1
-                        + (
-                            (
-                                pl.col(f"{s}_mean_empirical")
-                                - pl.col(f"{s}_mean_neutral")
-                            )
-                            / pl.col(f"{s}_std_neutral")
-                        )
-                    )
-                ).alias(s)
-                for s in stats_names
-            ]
-
-    elif isinstance(bins, binned_stats):
-        neutral_means = bins.mean.select(["freq_bins"] + stats_names)
-        neutral_stds = bins.std.select(["freq_bins"] + stats_names)
-
-        normalized_df = (
-            df_snps.join(
-                neutral_means,
-                on="freq_bins",
                 how="left",
                 coalesce=True,
-                suffix="_mean_neutral",
-            )
-            .join(
-                neutral_stds,
-                on="freq_bins",
-                how="left",
-                coalesce=True,
-=======
                 suffix="_mean_neutral",
             )
             .join(
@@ -6347,100 +3684,11 @@ def normalize_snps_statistics(df_snps, df_window, bins, stats_names, dps_shape=F
                 on=snp_join,
                 how="left",
                 coalesce=True,
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
                 suffix="_std_neutral",
             )
             .fill_nan(None)
         )
 
-<<<<<<< HEAD
-        # Normalize with empirical statistics (assumed provided elsewhere)
-        normalized_cols = [
-            (
-                (pl.col(s) - pl.col(f"{s}_mean_neutral")) / pl.col(f"{s}_std_neutral")
-            ).alias(s)
-            for s in stats_names
-        ]
-
-    # Perform normalization and return the final DataFrame
-    return (
-        normalized_df.with_columns(normalized_cols)
-        .select(["positions"] + stats_names)
-        .sort(["positions"])
-        # normalized_df.with_columns(normalized_cols).select(["positions", "center", "window"] + stats_names).sort(["positions", "center", "window"])
-    )
-
-
-def cut_snps(df, centers, windows, stats_names, fixed_center=None, iter_value=1):
-    """
-    Processes data within windows across multiple centers and window sizes.
-
-    Parameters
-    ----------
-    normalized_df : polars.DataFrame
-        DataFrame containing the positions and statistics.
-    iter_value : int
-        Iteration or replicate number.
-    centers : list
-        List of center positions to analyze.
-    windows : list
-        List of window sizes to use.
-    stats_names : list, optional
-        Names of statistical columns to compute means for.
-        If None, all columns except position-related ones will be used.
-    position_col : str, optional
-        Name of the column containing position values.
-    center_col : str, optional
-        Name of the column containing center values.
-    fixed_center : int, optional
-        If provided, use this fixed center value instead of the ones in centers list.
-
-    Returns
-    -------
-    polars.DataFrame
-        DataFrame with aggregated statistics for each center and window.
-    """
-    # If stats_names not provided, use all appropriate columns
-
-    # reset centers
-
-    if centers is None:
-        centers = np.arange(5e5, 7e5 + 1e4, 1e4).astype(int)
-
-    centers = np.asarray(centers).astype(int)
-
-    sim_mid = 6e5
-    if fixed_center is not None:
-        centers_abs = np.array([fixed_center + c - sim_mid for c in centers]).astype(
-            int
-        )
-    else:
-        centers_abs = centers
-
-    results = []
-    out = []
-    for c, w in list(product(centers_abs, windows)):
-        query = df.lazy()
-
-        # HUGE BUG, REPEATING ACTUAL CENTER/WINDOW VALUES BASED ON ALL CENTERS SIZE
-        # 1.2MB simulations derives into 21 center/windows combinations
-        # if fixed_center is not None:
-        #     c_fix = fixed_center - c
-        # else:
-        #     c_fix = c
-        if fixed_center is not None:
-            c_sim = int(c - fixed_center + sim_mid)
-        else:
-            c_sim = int(c)
-
-        # Filter data by center and window boundaries
-        # Define window boundaries
-        lower = c - (w // 2)
-        upper = c + (w // 2)
-
-        window_data = query.filter(
-            (pl.col("positions") >= lower) & (pl.col("positions") <= upper)
-=======
         normalized_df = normalized_df.with_columns(
             [
                 # pl.when(
@@ -6488,7 +3736,6 @@ def cut_snps(df, centers, windows, stats_names, fixed_center=None, iter_value=1)
             on=win_join,
             how="left",
             suffix="_std",
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
         )
     ).with_columns(
         [
@@ -6500,940 +3747,18 @@ def cut_snps(df, centers, windows, stats_names, fixed_center=None, iter_value=1)
         ]
     )
 
-<<<<<<< HEAD
-        # Calculate mean statistics for window
-        window_stats = window_data.select(stats_names).fill_nan(None).mean().collect()
-
-        # Add metadata columns
-        metadata_cols = [
-            pl.lit(iter_value).alias("iter"),
-            pl.lit(c_sim).alias("center"),
-            pl.lit(w).alias("window"),
-        ]
-
-        results.append(window_stats.with_columns(metadata_cols))
-
-    return (
-        pl.concat(results, how="vertical").select(
-            ["iter", "center", "window"] + stats_names
-        )
-        if results
-        else None
-    )
-
-
-def normalize_neutral(df_stats_neutral, mask=False):
-    """
-    Calculates the expected mean and standard deviation of summary statistics
-    from neutral simulations, used for normalization in downstream analyses.
-
-    This function processes a DataFrame of neutral simulation statistics, bins the
-    values based on frequency, and computes the mean (expected) and standard deviation
-    for each bin. These statistics are used as a baseline to normalize sweep or neutral simulations
-
-    Parameters
-    ----------
-    df_stats_neutral : list or pandas.DataFrame
-        A list or concatenated pandas DataFrame containing the neutral simulation statistics.
-        The DataFrame should contain frequency data and various summary statistics,
-        including H12 and HAF, across multiple windows and bins.
-
-    Returns
-    -------
-    expected : pandas.DataFrame
-        A DataFrame containing the mean (expected) values of the summary statistics
-        for each frequency bin. The frequency bins are the index, and the columns
-        are the summary statistics.
-
-    stdev : pandas.DataFrame
-        A DataFrame containing the standard deviation of the summary statistics
-        for each frequency bin. The frequency bins are the index, and the columns
-        are the summary statistics.
-
-    Notes
-    -----
-    - The function first concatenates the neutral statistics, if provided as a list,
-      and bins the values by frequency using the `bin_values` function.
-    - It computes both the mean and standard deviation for each frequency bin, which
-      can later be used to normalize observed statistics (e.g., from sweeps).
-    - The summary statistics processed exclude window-specific statistics such as "h12" and "haf."
-
-    """
-    # df_snps, df_window = df_stats_neutral
-
-    window_stats = ["h12", "haf"]
-
-    if mask:
-        tmp = []
-        for df in df_stats:
-            centromeres = {
-                1: 125,
-                2: 93.3,
-                3: 91,
-                4: 50.4,
-                5: 48.4,
-                6: 61,
-                7: 59.9,
-                8: 45.6,
-                9: 49,
-                10: 40.2,
-                11: 53.7,
-                12: 35.8,
-                13: 17.9,
-                14: 17.6,
-                15: 19,
-                16: 36.6,
-                17: 24,
-                18: 17.2,
-                19: 26.5,
-                20: 27.5,
-                21: 13.2,
-                22: 14.7,
-            }
-            chr_l = {
-                1: 247.2,
-                2: 242.8,
-                3: 199.4,
-                4: 191.3,
-                5: 180.8,
-                6: 170.9,
-                7: 158.8,
-                8: 146.3,
-                9: 140.4,
-                10: 135.4,
-                11: 134.5,
-                12: 132.3,
-                13: 114.1,
-                14: 106.3,
-                15: 100.3,
-                16: 88.8,
-                17: 78.7,
-                18: 76.1,
-                19: 63.8,
-                20: 62.4,
-                21: 46.9,
-                22: 49.5,
-            }
-            nchr = df["iter"].unique().first()
-
-            centromer_window = (2.5e-6 - centromeres[nchr], centromeres[nchr] + 2.5e-6)
-            telomer_window = (2.5e-6, chr_l[nchr] - 2.5e-6)
-            pos = df["positions"].to_numpy()
-            centromer_mask = (pos < centromer_window[0]) & (pos > centromer_window[1])
-            telomer_mask = (pos > telomer_window[0]) & (pos < telomer_window[1])
-            mask = centromer_mask & telomer_mask
-
-            tmp.append(df.filter(mask))
-        tmp_neutral = pl.concat(tmp)
-    else:
-        # Get std and mean values from dataframe
-        tmp_neutral = pl.concat(df_stats_neutral).fill_nan(None)
-
-    df_binned = bin_values(tmp_neutral.select(pl.exclude(window_stats)))
-
-    # get expected value (mean) and standard deviation
-    expected = (
-        df_binned.select(df_binned.columns[3:])
-        .group_by("freq_bins")
-        .mean()
-        .sort("freq_bins")
-        .fill_nan(None)
-    )
-    stdev = (
-        df_binned.select(df_binned.columns[3:])
-        .group_by("freq_bins")
-        .agg([pl.all().exclude("freq_bins").std()])
-        .sort("freq_bins")
-        .fill_nan(None)
-    )
-
-    # expected.index = expected.index.astype(str)
-    # stdev.index = stdev.index.astype(str)
-
-    return expected, stdev
-
-
-def bin_values(values, freq=0.02):
-    """
-    Bins allele frequency data into discrete frequency intervals (bins) for further analysis.
-
-    This function takes a DataFrame containing a column of derived allele frequencies ("daf")
-    and bins these values into specified frequency intervals. The resulting DataFrame will
-    contain a new column, "freq_bins", which indicates the frequency bin for each data point.
-
-    Parameters
-    ----------
-    values : pandas.DataFrame
-        A DataFrame containing at least a column labeled "daf", which represents the derived
-        allele frequency for each variant.
-
-    freq : float, optional (default=0.02)
-        The width of the frequency bins. This value determines how the frequency range (0, 1)
-        is divided into discrete bins. For example, a value of 0.02 will create bins
-        such as [0, 0.02], (0.02, 0.04], ..., [0.98, 1.0].
-
-    Returns
-    -------
-    values_copy : pandas.DataFrame
-        A copy of the original DataFrame, with an additional column "freq_bins" that contains
-        the frequency bin label for each variant. The "freq_bins" are categorical values based
-        on the derived allele frequencies.
-
-    Notes
-    -----
-    - The `pd.cut` function is used to bin the derived allele frequencies into intervals.
-    - The bins are inclusive of the lowest boundary (`include_lowest=True`) to ensure that
-      values exactly at the boundary are included in the corresponding bin.
-    - The resulting bins are labeled as strings with a precision of two decimal places.
-    """
-    # Modify the copy
-    values_copy = pl.concat(
-        [
-            values,
-            values["daf"]
-            .cut(np.arange(0, 1 + freq, freq))
-            .to_frame()
-            .rename({"daf": "freq_bins"}),
-        ],
-        how="horizontal",
-    )
-
-    return values_copy.sort("iter", "positions")
-
-
-def normalize_stats_custom(
-    stats_values,
-    bins,
-    region=None,
-    center=[5e5, 7e5],
-    windows=[50000, 100000, 200000, 500000, 1000000],
-    step=1e4,
-    parallel_manager=None,
-    nthreads=1,
-    vcf=False,
-):
-    df_fv, df_fv_raw = normalization_raw_custom(
-        deepcopy(stats_values),
-        bins,
-        region=region,
-        center=center,
-        windows=windows,
-        step=step,
-        parallel_manager=parallel_manager,
-        nthreads=nthreads,
-        vcf=vcf,
-    )
-
-    df_fv_w = pivot_feature_vectors(df_fv, vcf=vcf)
-    df_fv_w_raw = pivot_feature_vectors(df_fv_raw, vcf=vcf)
-
-    # dump fvs with more than 10% nans
-    df_fv_w = df_fv_w.fill_nan(None)
-    num_nans = (
-        df_fv_w.select(pl.exclude(["iter", "s", "t", "f_i", "f_t", "model"]))
-        .transpose()
-        .null_count()
-        .to_numpy()
-        .flatten()
-    )
-    df_fv_w = df_fv_w.filter(
-        num_nans
-        < int(
-            df_fv_w.select(pl.exclude(["iter", "s", "t", "f_i", "f_t", "model"])).shape[
-                1
-            ]
-            * 0.1
-        )
-    ).fill_null(0)
-
-    if not vcf:
-        df_fv_w.sort(["iter", "model"])
-
-    df_fv_w_raw = df_fv_w_raw.fill_nan(None)
-
-    return df_fv_w, df_fv_w_raw
-
-
-def normalization_raw_custom(
-    stats_values,
-    bins,
-    region=None,
-    center=[5e5, 7e5],
-    step=1e4,
-    windows=[50000, 100000, 200000, 500000, 1000000],
-    vcf=False,
-    nthreads=1,
-    parallel_manager=None,
-):
-    """
-    Normalizes sweep statistics using neutral expectations or optionally using precomputed neutral normalized values.
-    The function applies normalization across different genomic windows and supports multi-threading.
-
-    Parameters
-    ----------
-    sweeps_stats : namedtuple
-        A Namedtuple containing the statistics for genomic sweeps and sweep parameters across
-        different genomic windows.
-
-    neutral_stats_norm : namedtuple
-        A Namedtuple containing the statistics for neutral region and neutral parameters across
-        different genomic windows, used as the baselinefor normalizing the sweep statistics.
-        This allows comparison of sweeps against neutral expectations.
-
-    norm_values : dict or None, optional (default=None)
-        A dictionary of precomputed neutral normalizated values. If provided, these values are
-        used to directly normalize the statistics. If None, the function computes
-        normalization values from the neutral statistics.
-
-    center : list of float, optional (default=[5e5, 7e5])
-        A list specifying the center positions (in base pairs) for the analysis windows.
-        If a single center value is provided, normalization is centered around that value.
-        Otherwise, it will calculate normalization for a range of positions between the two provided centers.
-
-    windows : list of int, optional (default=[50000, 100000, 200000, 500000, 1000000])
-        A list of window sizes (in base pairs) for which the normalization will be applied.
-        The function performs normalization for each of the specified window sizes.
-
-    nthreads : int, optional (default=1)
-        The number of threads to use for parallel processing. If set to 1, the function
-        runs in single-threaded mode. Higher values enable multi-threaded execution for
-        faster computation.
-
-    Returns
-    -------
-    normalized_stats : pandas.DataFrame
-        A DataFrame containing the normalized sweep statistics across the specified
-        windows and genomic regions. The sweep statistics are scaled relative to
-        neutral expectations.
-    """
-    df_stats, params = deepcopy(stats_values)
-
-    center = np.asarray(center).astype(int)
-    windows = np.asarray(windows).astype(int)
-    if vcf:
-        nchr = region[0].split(":")[0]
-        center_coords = [tuple(map(int, r.split(":")[-1].split("-"))) for r in region]
-        center_g = np.array([(a + b) // 2 for a, b in center_coords])
-
-        try:
-            df_window = df_stats.pop("window").fill_nan(None)
-        except:
-            df_window = None
-
-        try:
-            snps_genome = reduce(
-                lambda left, right: left.join(
-                    right,
-                    on=["iter", "positions", "daf"],
-                    how="full",
-                    coalesce=True,
-                ),
-                list(df_stats.values()),
-            ).sort(["iter", "positions"])
-
-            # Overwrite snps_values
-            # snps_genome = snps_genome.select(pl.exclude(["h12", "haf"]))
-            snps_values = snps_genome.select(pl.exclude(["h12", "haf"]))
-
-            stats_names = snps_values.select(snps_values.columns[3:]).columns
-
-            binned_values = bin_values(snps_values)
-
-        except:
-            stats_names = None
-            binned_values = None
-
-        normalized_df, normalized_window = normalize_snps_statistics_custom(
-            binned_values, df_window, bins, stats_names
-        )
-
-        try:
-            if len(center) == 2:
-                centers = np.arange(center[0], center[1] + step, step).astype(int)
-            else:
-                centers = center
-
-            left_idxs = np.searchsorted(
-                normalized_df["positions"].to_numpy(), center_g - 6e5, side="left"
-            )
-            right_idxs = np.searchsorted(
-                normalized_df["positions"].to_numpy(), center_g + 6e5, side="right"
-            )
-            tmp_normalized = [
-                normalized_df.slice(start, end - start)
-                for start, end in zip(left_idxs, right_idxs)
-            ]
-            tmp_raw = [
-                binned_values.slice(start, end - start)
-                for start, end in zip(left_idxs, right_idxs)
-            ]
-
-            df_fv_n = pl.concat(
-                Parallel(n_jobs=nthreads, verbose=1)(
-                    delayed(cut_snps)(
-                        df,
-                        centers,
-                        windows,
-                        stats_names,
-                        fixed_center=coord,
-                        iter_value=coord,
-                    )
-                    for df, coord in zip(tmp_normalized, center_g)
-                )
-            )
-            df_fv_n_raw = pl.concat(
-                Parallel(n_jobs=nthreads, verbose=1)(
-                    delayed(cut_snps)(
-                        df,
-                        centers,
-                        windows,
-                        stats_names,
-                        fixed_center=coord,
-                        iter_value=coord,
-                    )
-                    for df, coord in zip(tmp_raw, center_g)
-                )
-            )
-
-            df_fv_n = df_fv_n.with_columns(
-                (
-                    f"{nchr}:"
-                    + (pl.col("iter") - 6e5 + 1).cast(int).cast(str)
-                    + "-"
-                    + (pl.col("iter") + 6e5).cast(int).cast(str)
-                ).alias("iter")
-            )
-            df_fv_n_raw = df_fv_n_raw.with_columns(
-                (
-                    f"{nchr}:"
-                    + (pl.col("iter") - 6e5 + 1).cast(int).cast(str)
-                    + "-"
-                    + (pl.col("iter") + 6e5).cast(int).cast(str)
-                ).alias("iter")
-            )
-        except:
-            df_fv_n = None
-            df_fv_n_raw = None
-
-        try:
-            df_fv_n = df_fv_n.join(
-                normalized_window,
-                on=["iter", "center", "window"],
-                how="full",
-                coalesce=True,
-            )
-            df_fv_n_raw = df_fv_n_raw.join(
-                df_window,
-                on=["iter", "center", "window"],
-                how="full",
-                coalesce=True,
-            )
-        except:
-            if df_fv_n is None:
-                df_fv_n = normalized_window
-                df_fv_n_raw = df_window
-            else:
-                next
-
-        df_params_unpack = pl.DataFrame(
-            np.repeat(
-                np.zeros((1, 4)),
-                df_fv_n.shape[0],
-                axis=0,
-            ),
-            schema=["s", "t", "f_i", "f_t"],
-        )
-
-    else:
-        if parallel_manager is None:
-            df_fv_n_l, df_fv_n_l_raw = zip(
-                *Parallel(n_jobs=nthreads, verbose=1)(
-                    delayed(normalize_cut_raw_custom)(
-                        snps_values, bins, center=center, windows=windows, step=step
-                    )
-                    for _iter, snps_values in enumerate(df_stats, 1)
-                )
-            )
-        else:
-            df_fv_n_l, df_fv_n_l_raw = zip(
-                *parallel_manager(
-                    delayed(normalize_cut_raw_custom)(
-                        snps_values, bins, center=center, windows=windows, step=step
-                    )
-                    for _iter, snps_values in enumerate(df_stats, 1)
-                )
-            )
-
-        df_fv_n = pl.concat(df_fv_n_l).with_columns(
-            pl.col(["iter", "window", "center"]).cast(pl.Int64)
-        )
-        df_fv_n_raw = pl.concat(df_fv_n_l_raw).with_columns(
-            pl.col(["iter", "window", "center"]).cast(pl.Int64)
-        )
-
-        # params = params[:, [0, 1, 3, 4, ]]
-        df_params_unpack = pl.DataFrame(
-            np.repeat(
-                params,
-                df_fv_n.select(["center", "window"])
-                .unique()
-                .sort(["center", "window"])
-                .shape[0],
-                axis=0,
-            ),
-            schema=["s", "t", "f_i", "f_t"],
-        )
-
-    df_fv_n = pl.concat(
-        [df_params_unpack, df_fv_n],
-        how="horizontal",
-    )
-    df_fv_n_raw = pl.concat(
-        [df_params_unpack, df_fv_n_raw],
-        how="horizontal",
-    )
-
-    force_order = ["iter"] + [col for col in df_fv_n.columns if col != "iter"]
-    df_fv_n = df_fv_n.select(force_order)
-    df_fv_n_raw = df_fv_n_raw.select(force_order)
-
-    return df_fv_n, df_fv_n_raw
-
-
-def normalize_cut_raw_custom(
-    snps_values,
-    bins,
-    center=[5e5, 7e5],
-    windows=[50000, 100000, 200000, 500000, 1000000],
-    step=int(1e4),
-):
-    """
-    Normalizes SNP-level statistics by comparing them to neutral expectations, and aggregates
-    the statistics within sliding windows around specified genomic centers.
-
-    This function takes SNP statistics, normalizes them based on the expected mean and standard
-    deviation from neutral simulations, and computes the average values within windows
-    centered on specific genomic positions. It returns a DataFrame with the normalized values
-    for each window across the genome.
-
-    Parameters
-    ----------
-    _iter : int
-        The iteration or replicate number associated with the current set of SNP statistics.
-
-    snps_values : pandas.DataFrame
-        A DataFrame containing SNP-level statistics such as iHS, nSL, and iSAFE. The DataFrame
-        should contain derived allele frequencies ("daf") and other statistics to be normalized.
-
-    expected : pandas.DataFrame
-        A DataFrame containing the expected mean values of the SNP statistics for each frequency bin,
-        computed from neutral simulations.
-
-    stdev : pandas.DataFrame
-        A DataFrame containing the standard deviation of the SNP statistics for each frequency bin,
-        computed from neutral simulations.
-
-    center : list of float, optional (default=[5e5, 7e5])
-        A list specifying the center positions (in base pairs) for the analysis. Normalization is
-        performed around these genomic centers using the specified window sizes.
-
-    windows : list of int, optional (default=[50000, 100000, 200000, 500000, 1000000])
-        A list of window sizes (in base pairs) over which the SNP statistics will be aggregated
-        and normalized. The function performs normalization for each specified window size.
-
-    Returns
-    -------
-    out : pandas.DataFrame
-        A DataFrame containing the normalized SNP statistics for each genomic center and window.
-        The columns include the iteration number, center, window size, and the average values
-        of normalized statistics iSAFE within the window.
-
-    Notes
-    -----
-    - The function first bins the SNP statistics based on derived allele frequencies using the
-      `bin_values` function. The statistics are then normalized by subtracting the expected mean
-      and dividing by the standard deviation for each frequency bin.
-    - After normalization, SNPs are aggregated into windows centered on specified genomic positions.
-      The average values of the normalized statistics are calculated for each window.
-    - The window size determines how far upstream and downstream of the center position the SNPs
-      will be aggregated.
-
-    """
-    df_out = []
-    df_out_raw = []
-    _iter = np.unique([i.select("iter").unique() for i in snps_values.values()])
-
-    if len(center) == 2:
-        centers = np.arange(center[0], center[1] + step, step).astype(int)
-    else:
-        centers = center
-
-    try:
-        df = reduce(
-            lambda left, right: left.join(
-                right,
-                on=["iter", "positions", "daf"],
-                how="full",
-                coalesce=True,
-            ),
-            [v for k, v in snps_values.items() if k != "window"],
-        )
-        stats_names = df[:, 3:].columns
-        binned_values = bin_values(df)
-    except:
-        binned_values, stats_names = None, None
-
-    try:
-        df_window = snps_values["window"].select(pl.exclude("positions"))
-    except:
-        df_window = None
-
-    normalized_df, normalized_window = normalize_snps_statistics_custom(
-        binned_values, df_window, bins, stats_names
-    )
-
-    if normalized_df is not None and normalized_window is not None:
-        df_out = cut_snps(
-            normalized_df,
-            centers,
-            windows,
-            stats_names,
-            fixed_center=None,
-            iter_value=_iter,
-        )
-        df_out_raw = cut_snps(
-            df,
-            centers,
-            windows,
-            stats_names,
-            fixed_center=None,
-            iter_value=_iter,
-        )
-
-        df_out = df_out.join(
-            normalized_window,
-            on=["iter", "center", "window"],
-            how="full",
-            coalesce=True,
-        )
-        df_out_raw = df_out_raw.join(
-            df_window, on=["iter", "center", "window"], how="full", coalesce=True
-        )
-    elif normalized_df is not None and normalized_window is None:
-        df_out = cut_snps(
-            normalized_df,
-            centers,
-            windows,
-            stats_names,
-            fixed_center=None,
-            iter_value=_iter,
-        )
-        df_out_raw = cut_snps(
-            df,
-            centers,
-            windows,
-            stats_names,
-            fixed_center=None,
-            iter_value=_iter,
-        )
-    elif normalized_df is None and normalized_window is not None:
-        df_out = normalized_window
-        df_out_raw = df_window
-
-    return df_out, df_out_raw
-
-
-def normalize_snps_statistics_custom(df_snps, df_window, bins, stats_names):
-    """
-    Normalizes SNP-level statistics by comparing them to neutral expectations.
-
-    Parameters
-    ----------
-    df_snps : polars.DataFrame
-        DataFrame containing SNP-level statistics with binned frequency values.
-    binned_stats : dict or bins
-        Neutral and empirical statistics, either as a dictionary with 'neutral' and 'empirical'
-        keys (containing mean and std) or a bins object.
-    stats_names : list
-        List of statistical measure column names to normalize.
-
-    Returns
-    -------
-    polars.DataFrame
-        DataFrame with normalized statistics.
-    """
-    if df_snps is not None:
-        neutral_means = bins.mean[0].select(["freq_bins"] + stats_names)
-        neutral_stds = bins.std[0].select(["freq_bins"] + stats_names)
-
-        normalized_df = (
-            df_snps.join(
-                neutral_means,
-                on="freq_bins",
-                how="left",
-                coalesce=True,
-                suffix="_mean_neutral",
-            )
-            .join(
-                neutral_stds,
-                on="freq_bins",
-                how="left",
-                coalesce=True,
-                suffix="_std_neutral",
-            )
-            .fill_nan(None)
-        )
-
-        # Normalize with empirical statistics (assumed provided elsewhere)
-        normalized_cols = [
-            (
-                (pl.col(s) - pl.col(f"{s}_mean_neutral")) / pl.col(f"{s}_std_neutral")
-            ).alias(s)
-            for s in stats_names
-        ]
-        normalized_df = normalized_df.with_columns(normalized_cols).select(
-            ["positions"]
-            + stats_names
-            # ["positions", "center", "window"] + stats_names
-        )
-    else:
-        normalized_df = None
-
-    if df_window is not None:
-        # For VCF, df_window all windows, need to group by
-        if df_window.shape[0] > bins.mean[1].shape[0]:
-            stats_windowed = df_window.columns[3:]
-            df_window_normalized = (
-                df_window.join(
-                    bins.mean[1].select(pl.exclude("iter")),
-                    on=["center", "window"],
-                    how="left",
-                    suffix="_mean",
-                ).join(
-                    bins.std[1].select(pl.exclude("iter")),
-                    on=["center", "window"],
-                    how="left",
-                    suffix="_std",
-                )
-            ).with_columns(
-                [
-                    ((pl.col(c) - pl.col(f"{c}_mean")) / (pl.col(f"{c}_std"))).alias(
-                        f"{c}"
-                    )
-                    for c in stats_windowed
-                ]
-            )
-            df_window_normalized = df_window_normalized.select(
-                ["iter", "center", "window"] + stats_windowed
-            )
-        else:
-            df_window_normalized = pl.concat(
-                [
-                    df_window[:, :3],
-                    (df_window[:, 3:] - bins.mean[1][:, 3:]) / bins.std[1][:, 3:],
-                ],
-                how="horizontal",
-            )
-    else:
-        df_window_normalized = None
-    # Perform normalization and return the final DataFrame
-    return (normalized_df, df_window_normalized)
-
-
-def normalize_neutral_custom(d_stats_neutral, vcf=False):
-    """
-    Calculates the expected mean and standard deviation of summary statistics
-    from neutral simulations, used for normalization in downstream analyses.
-
-    This function processes a DataFrame of neutral simulation statistics, bins the
-    values based on frequency, and computes the mean (expected) and standard deviation
-    for each bin. These statistics are used as a baseline to normalize sweep or neutral simulations
-
-    Parameters
-    ----------
-    df_stats_neutral : list or pandas.DataFrame
-        A list or concatenated pandas DataFrame containing the neutral simulation statistics.
-        The DataFrame should contain frequency data and various summary statistics,
-        including H12 and HAF, across multiple windows and bins.
-
-    Returns
-    -------
-    expected : pandas.DataFrame
-        A DataFrame containing the mean (expected) values of the summary statistics
-        for each frequency bin. The frequency bins are the index, and the columns
-        are the summary statistics.
-
-    stdev : pandas.DataFrame
-        A DataFrame containing the standard deviation of the summary statistics
-        for each frequency bin. The frequency bins are the index, and the columns
-        are the summary statistics.
-
-    Notes
-    -----
-    - The function first concatenates the neutral statistics, if provided as a list,
-      and bins the values by frequency using the `bin_values` function.
-    - It computes both the mean and standard deviation for each frequency bin, which
-      can later be used to normalize observed statistics (e.g., from sweeps).
-    - The summary statistics processed exclude window-specific statistics such as "h12" and "haf."
-
-    """
-    # df_snps, df_window = df_stats_neutral
-
-    if vcf:
-        snps_list, windows_list = [], []
-        for d in d_stats_neutral:
-            snps_list.append(d["snps"])
-            windows_list.append(d["windows"])
-    else:
-        snps_list, windows_list = zip(
-            *((d["snps"], d["windows"]) for d in d_stats_neutral)
-        )
-
-    try:
-        tmp_neutral_snps = pl.concat(snps_list, how="vertical").fill_nan(None)
-
-        df_binned = bin_values(tmp_neutral_snps)
-
-        # get expected value (mean) and standard deviation
-        expected = (
-            df_binned.select(df_binned.columns[3:])
-            # df_binned.select(df_binned.columns[5:])
-            .group_by("freq_bins")
-            .mean()
-            .sort("freq_bins")
-            .fill_nan(None)
-        )
-        stdev = (
-            df_binned.select(df_binned.columns[3:])
-            # df_binned.select(df_binned.columns[5:])
-            .group_by("freq_bins")
-            .agg([pl.all().exclude("freq_bins").std()])
-            .sort("freq_bins")
-            .fill_nan(None)
-        )
-
-    except:
-        expected, stdev = None, None
-
-    try:
-        df_window = pl.concat(windows_list, how="vertical").fill_nan(None).drop_nulls()
-
-        df_window_mean = (
-            df_window.group_by(["center", "window"])
-            .agg(pl.all().mean())
-            .sort(["center", "window"])
-        )
-
-        df_window_std = (
-            df_window.group_by(["center", "window"])
-            .agg(pl.all().std())
-            .sort(["center", "window"])
-        )
-    except:
-        df_window_mean = None
-        df_window_std = None
-
-    return ([expected, df_window_mean], [stdev, df_window_std])
-=======
     keep_base = ["iter", "center", "window"] + (
         ["r_bins"] if "r_bins" in df_window.columns else []
     )
     df_window_z = df_window_z.select(keep_base + stats_windowed_all)
 
     return (normalized_df, df_window_z.select(pl.exclude("r_bins")))
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
-
 
 
 ################## Haplotype structure stats
 
 
-def run_hapbin(
-    hap,
-    rec_map,
-    _iter=1,
-    min_ehh=0.05,
-    min_maf=0.05,
-    gap_scale=20000,
-    max_extend=1000000,
-    binom=False,
-    ihsbin=None,
-):
-    if ihsbin is None:
-        ihsbin = shutil.which("ihsbin")
-    df_hap = pl.DataFrame(hap)
-    df_rec_map = pl.DataFrame(
-        rec_map,
-        pl.Schema(
-            [
-                ("chr", pl.Int64),
-                ("location", pl.Int64),
-                ("cm_mb", pl.Float64),
-                ("cm", pl.Float64),
-            ]
-        ),
-    )
-    hap_file = "/tmp/tmp_" + str(_iter) + ".hap"
-    map_file = "/tmp/tmp_" + str(_iter) + ".map"
-
-    df_hap.write_csv(hap_file, separator=" ", include_header=False)
-
-    # with open(hap_file, "w") as f:
-    #     for row in df_hap.iter_rows():
-    #         f.write("".join(str(value) for value in row) + "\n")
-
-    df_rec_map.write_csv(map_file, include_header=False, separator=" ")
-
-    out_file = f"/tmp/tmp_{_iter}.out"
-    cmd_hapbin = f"{ihsbin} --hap {hap_file} --map {map_file} --cutoff {min_ehh} --minmaf {min_maf} --out {out_file}"
-
-    if gap_scale > 0:
-        cmd_hapbin += f" -s {gap_scale}"
-
-    if max_extend > 0:
-        cmd_hapbin += f" -e {max_extend}"
-
-    if binom:
-        cmd_hapbin += " --binom"
-
-    ihs_output = subprocess.run(cmd_hapbin, shell=True, capture_output=True, text=True)
-
-    tmp_ihs = pl.read_csv(
-        out_file,
-        separator="\t",
-        schema=pl.Schema(
-            [
-                ("location", pl.Int64),
-                ("ihh_0", pl.Float64),
-                ("ihh_1", pl.Float64),
-                ("ihs", pl.Float64),
-                ("std_ihs", pl.Float64),
-            ]
-        ),
-    )
-
-    r_pos = dict(zip(rec_map[:, 1], rec_map[:, -1]))
-    _p = np.array([r_pos[i] for i in tmp_ihs["location"]])
-    df_daf = pl.DataFrame(
-        {"positions": rec_map[:, -1].astype(int), "daf": hap.sum(axis=1) / hap.shape[1]}
-    )
-    df_ihs = (
-        tmp_ihs.with_columns(pl.lit(_p).cast(pl.Int64).alias("positions"))
-        .join(df_daf, on="positions", coalesce=True)
-        .with_columns(
-            (pl.col("ihh_1") - pl.col("ihh_0"))
-            .abs()
-            .cast(pl.Float64)
-            .alias("delta_ihh")
-        )
-        .select(["positions", "daf", "ihs", "delta_ihh"])
-    ).fill_nan(None)
-
-    os.remove(hap_file)
-    os.remove(map_file)
-    os.remove(out_file)
-
-    return df_ihs
+################## Haplotype structure stats
 
 
 def ihs_ihh(
@@ -7575,11 +3900,7 @@ def ihs_ihh(
     return df_ihs
 
 
-<<<<<<< HEAD
-def haf_top(hap, pos, cutoff=0.1, start=None, stop=None, window_size=None, n_snps=1001):
-=======
 def haf_top(hap, pos, cutoff=0.1, start=None, stop=None, window_size=None, n_snps=None):
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     """
     Compute the upper-tail HAF (Haplotype Allele Frequency) summary in a region.
 
@@ -7658,101 +3979,13 @@ def haf_top(hap, pos, cutoff=0.1, start=None, stop=None, window_size=None, n_snp
 
     if cutoff <= 0 or cutoff >= 1:
         cutoff = 1
-<<<<<<< HEAD
-    idx_low = int(cutoff * haf.size)
-=======
     # idx_low = int(cutoff * haf.size)
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     idx_high = int((1 - cutoff) * haf.size)
 
     # 10% higher
     return np.nansum(haf[idx_high:])
 
 
-<<<<<<< HEAD
-@njit
-def garud_h_numba(h):
-    """
-    Compute Garud’s haplotype homozygosity statistics in Numba.
-
-    The input is a binary haplotype matrix with shape ``(L, n)``, where ``L`` is
-    the number of variant sites (rows) and ``n`` is the number of haplotypes
-    (columns). The function counts distinct haplotypes (columns), converts those
-    counts to frequencies :math:`p_i`, sorts them descending to obtain
-    :math:`p_1 \\ge p_2 \\ge p_3 \\ge \\dots`, and computes:
-
-    - :math:`H1 = \\sum_i p_i^2`
-    - :math:`H12 = (p_1 + p_2)^2 + \\sum_{i\\ge 3} p_i^2`
-    - :math:`H123 = (p_1 + p_2 + p_3)^2 + \\sum_{i\\ge 4} p_i^2`
-    - :math:`H2/H1 = (H1 - p_1^2) / H1`
-
-    :param numpy.ndarray h:
-        2D array of dtype ``uint8`` with values in ``{0, 1}`` and shape
-        ``(n_variants, n_haplotypes)``.
-    :returns:
-        Tuple ``(H12, H2_H1, H1, H123)`` as floats.
-    :rtype: tuple[float, float, float, float]
-
-    """
-    L, n = h.shape
-
-    # 1) rolling uint64 hash to count distinct columns
-    counts = Dict.empty(key_type=uint64, value_type=int64)
-    for j in range(n):
-        hsh = np.uint64(146527)
-        for i in range(L):
-            hsh = (hsh * np.uint64(1000003)) ^ np.uint64(h[i, j])
-        counts[hsh] = counts.get(hsh, 0) + 1
-
-    # 2) collect counts into an array
-    m = len(counts)
-    cnts = np.empty(m, np.int64)
-    idx = 0
-    for k in counts:
-        cnts[idx] = counts[k]
-        idx += 1
-
-    # 3) to frequencies & sort descending
-    freqs = cnts.astype(np.float64) / n
-    freqs = np.sort(freqs)[::-1]
-
-    # 4) pad top‐3
-    p1 = freqs[0] if freqs.size > 0 else 0.0
-    p2 = freqs[1] if freqs.size > 1 else 0.0
-    p3 = freqs[2] if freqs.size > 2 else 0.0
-
-    # 5) compute H1, H12, H123, H2/H1
-    H1 = 0.0
-    for i in range(freqs.size):
-        H1 += freqs[i] * freqs[i]
-
-    H12 = (p1 + p2) ** 2
-    for i in range(2, freqs.size):
-        H12 += freqs[i] * freqs[i]
-
-    H123 = (p1 + p2 + p3) ** 2
-    for i in range(3, freqs.size):
-        H123 += freqs[i] * freqs[i]
-
-    H2 = H1 - p1**2
-    H2_H1 = H2 / H1
-
-    return H12, H2_H1, H1, H123
-
-
-def h12_enard_og(hap, positions, focal_coord=600000, window_size=1200000):
-    coords, haplos, true_coords, count_coords = process_hap_map(hap, positions)
-
-    keep_haplo_freq = {}
-
-    key_001 = focal_coord
-    coord = key_001
-    int_coord = (coord // 100) * 100
-    inf = int_coord - window_size // 2
-    sup = int_coord + window_size // 2
-    hap_line = "1" * hap.shape[1]
-    hap = list(hap_line)
-=======
 @njit(cache=True)
 def fast_skew_kurt(data, bias=False):
     """Single-pass numba variance/skew/kurtosis.
@@ -7801,7 +4034,6 @@ def fast_skew_kurt(data, bias=False):
 #     - :math:`H12 = (p_1 + p_2)^2 + \\sum_{i\\ge 3} p_i^2`
 #     - :math:`H123 = (p_1 + p_2 + p_3)^2 + \\sum_{i\\ge 4} p_i^2`
 #     - :math:`H2/H1 = (H1 - p_1^2) / H1`
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
 #     :param numpy.ndarray h:
 #         2D array of dtype ``uint8`` with values in ``{0, 1}`` and shape
@@ -7810,14 +4042,8 @@ def fast_skew_kurt(data, bias=False):
 #         Tuple ``(H12, H2_H1, H1, H123)`` as floats.
 #     :rtype: tuple[float, float, float, float]
 
-<<<<<<< HEAD
-    for i in range(1, (window_size // 200) + 1):
-        inf_i = int_coord - i * 100
-        low_bound = inf_i
-=======
 #     """
 #     L, n = h.shape
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
 #     # rolling uint64 hash to count distinct columns
 #     counts = Dict.empty(key_type=uint64, value_type=int64)
@@ -7839,16 +4065,10 @@ def fast_skew_kurt(data, bias=False):
 #     freqs = cnts.astype(np.float64) / n
 #     freqs = np.sort(freqs)[::-1]
 
-<<<<<<< HEAD
-    for i in range(1, (window_size // 200) + 1):
-        sup_i = int_coord + i * 100
-        up_bound = sup_i
-=======
 #     # pad top‐3
 #     p1 = freqs[0] if freqs.size > 0 else 0.0
 #     p2 = freqs[1] if freqs.size > 1 else 0.0
 #     p3 = freqs[2] if freqs.size > 2 else 0.0
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
 #     # compute H1, H12, H123, H2/H1
 #     H1 = 0.0
@@ -7866,178 +4086,6 @@ def fast_skew_kurt(data, bias=False):
 #     H2 = H1 - p1**2
 #     H2_H1 = H2 / H1
 
-<<<<<<< HEAD
-    # print("ORIG haplos_number:", dict(haplos_number), "toto:", len(ongoing_haplos))
-    best_haplos = {}
-    revert_number = defaultdict(str)
-
-    # Populate revert_number dictionary
-    for key_numb in sorted(haplos_number.keys()):
-        number = haplos_number[key_numb]
-        # revert_number[number] += f"{key_numb}"
-        revert_number[number] += f"{key_numb}_"
-
-    counter_rev = 0
-    done_rev = 0
-
-    # Sort revert_number keys in descending order and process
-    for key_rev in sorted(revert_number.keys(), reverse=True):
-        chain = revert_number[key_rev].rstrip("_")
-        splitter_chain = chain.split("_")
-        for f, haplo in enumerate(splitter_chain):
-            if haplo:  # Check if the haplo is not empty
-                done_rev += 1
-                best_haplos[done_rev] = haplo
-                keep_haplo_freq[done_rev] = key_rev
-
-        counter_rev += done_rev
-
-        if counter_rev >= 10:
-            break
-
-    similar_pairs = defaultdict(str)
-    done = {}
-
-    # Ensure best_haplos has string keys
-    best_haplos = {str(k): v for k, v in best_haplos.items()}
-
-    # Initialize similar_pairs
-    for key_compf in sorted(best_haplos.keys(), key=int):
-        similar_pairs[key_compf] = ""
-
-    sorted_keys = sorted(best_haplos.keys(), key=int)  # Sort keys only once
-
-    # Pre-split haplotypes to avoid calling split() multiple times
-    # split_haplos = {key: best_haplos[key].split() for key in sorted_keys}
-    split_haplos = {
-        key: np.array(best_haplos[key].split(), dtype=np.uint8) for key in sorted_keys
-    }
-    for i, key_comp in enumerate(sorted_keys):
-        haplo_1 = split_haplos[key_comp]
-
-        for key_comp2 in sorted_keys:
-            # Only compare each pair once (key_comp < key_comp2)
-            if key_comp != key_comp2:
-                pair_key_1_2 = f"{key_comp} {key_comp2}"
-
-                if pair_key_1_2 not in done:
-                    # print(pair_key_1_2)
-                    haplo_2 = split_haplos[key_comp2]
-
-                    # Compare the two haplotypes using optimized compare_haplos
-                    identical, different, total = compare_haplos_optimized(
-                        haplo_1, haplo_2
-                    )
-
-                    if total > 0 and different / total <= 0.2:
-                        similar_pairs[key_comp] += f"{key_comp2} "
-                        done[pair_key_1_2] = "yes"
-                        done[f"{key_comp2} {key_comp}"] = "yes"
-
-    #  Extend to all haplotypes
-    exclude = {}
-    counter_rev2 = 0
-    # max_haplo = ""
-    # second_haplo = ""
-    # third_haplo = ""
-    # four_haplo=""
-    # five_haplo=""
-    pairs_keys = sorted(similar_pairs, key=int)
-
-    haplo_counter = dict(zip(pairs_keys, [""] * len(pairs_keys)))
-
-    for key_rev2 in pairs_keys:
-        if key_rev2 not in exclude:
-            chain = best_haplos[key_rev2]
-            similar = similar_pairs[key_rev2]
-            if similar != "":
-                splitter_similar = similar.split()
-                for cur_rev in splitter_similar:
-                    exclude[cur_rev] = "yes"
-                    chain += "_" + best_haplos[cur_rev]
-
-            counter_rev2 += 1
-            haplo_counter[str(counter_rev2)] = chain
-            # if counter_rev2 == 1:
-            #     max_haplo = chain
-            # elif counter_rev2 == 2:
-            #     second_haplo = chain
-            # elif counter_rev2 == 3:
-            #     third_haplo = chain
-            # elif counter_rev2 == 4:
-            #     four_haplo = chain
-            # elif counter_rev2 == 5:
-            #     five_haplo = chain
-
-    freq_counts = {i: 0 for i in haplo_counter}  # {1:0, 2:0, 3:0, …}
-    toto = 0
-
-    for key_ongo2 in sorted(ongoing_haplos):
-        ongoing = ongoing_haplos[key_ongo2]
-        toto += 1
-
-        for idx, chain in haplo_counter.items():
-            if ongoing in chain:
-                freq_counts[str(idx)] += 1
-                break
-
-    # print("ORIG freq_counts:", freq_counts, "toto:", toto)
-
-    # freqs = np.sort([count / toto for i, count in freq_counts.items()])[::-1]
-    # Probably bugged code on David's version, not ordered properly
-    freqs = np.array([count / toto for i, count in freq_counts.items()])
-
-    # David og's H12
-    H12 = np.sum(freqs[:2]) ** 2
-    H1 = np.sum(freqs[:] ** 2)
-    H2 = H1 - freqs[0] ** 2
-    H2_H1 = H2 / H1
-
-    return H12, H2_H1, H2
-
-
-@njit
-def process_hap_map(hap, positions):
-    derived_freq = hap.sum(1) / hap.shape[1]
-    okfreq_indices = np.where((derived_freq >= 0.05) & (derived_freq <= 1))[0] + 1
-    coord = positions[okfreq_indices - 1].astype(np.int64)
-    int_coord = (coord // 100) * 100
-
-    # numba Dict with explicit types
-    coords = Dict.empty(
-        key_type=types.int64,
-        value_type=types.unicode_type,
-    )
-    haplos = Dict.empty(
-        key_type=types.int64,
-        value_type=types.unicode_type,
-    )
-    true_coords = Dict.empty(
-        key_type=types.int64,
-        value_type=types.int64,
-    )
-    count_coords = Dict.empty(
-        key_type=types.int64,
-        value_type=types.int64,
-    )
-
-    # Initialize coords with empty strings
-    for v in int_coord:
-        coords[v] = ""
-
-    for i, v in enumerate(int_coord):
-        coord_index = okfreq_indices[i]
-        coords[v] += f"{coord[i]} "
-        true_coords[coord[i]] = coord_index
-        count_coords[coord_index] = coord[i]
-        haplos[coord[i]] = "".join(map(str, hap[coord_index - 1]))
-
-    return coords, haplos, true_coords, count_coords
-
-
-@njit
-def compare_haplos_optimized(haplo1, haplo2):
-=======
 #     return H12, H2_H1, H1, H123, m
 
 
@@ -8151,7 +4199,6 @@ def garud_h(h):
 
 @njit(cache=True)
 def comparen_haplos_optimized(haplo1, haplo2):
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     identical = 0
     different = 0
     for i in range(len(haplo1)):
@@ -8298,129 +4345,6 @@ def _legacy_row_order_indices(hap, positions, focal_coord, window_size, min_freq
 
 
 @njit(cache=True)
-<<<<<<< HEAD
-def _legacy_row_order_indices(hap, positions, focal_coord, num_snps, min_freq):
-    """
-    Count-based SNP window centered at `focal_coord`:
-      - Select variants passing derived-frequency filter in [min_freq, 1.0]
-      - Exclude the focal site itself (pos == focal_coord) from the output
-      - Choose ~half from the left (pos < focal) and ~half from the right (pos > focal),
-        by nearest genomic distance to the focal coord. If one side lacks enough SNPs,
-        fill the remainder from the other side.
-      - Return indices ordered as: left (nearest -> farther), then right (nearest -> farther)
-
-    Parameters
-    ----------
-    hap : uint8[:, :]   (L_total, n) 0/1 matrix
-    positions : int64[:]  (L_total,) genomic coords
-    focal_coord : int64
-    num_snps : int       desired total SNPs in the window (including focal if present)
-    min_freq : float64   derived allele frequency lower bound (inclusive)
-
-    Returns
-    -------
-    out : int64[:]   indices of selected SNP rows, excluding the focal site
-                     length = min(num_snps - 1 if focal exists else num_snps, available)
-    """
-    L_total, n = hap.shape
-
-    # Preallocate arrays for left/right candidates
-    left_idx = np.empty(L_total, dtype=int64)
-    left_dist = np.empty(L_total, dtype=int64)
-    right_idx = np.empty(L_total, dtype=int64)
-    right_dist = np.empty(L_total, dtype=int64)
-
-    left_k = 0
-    right_k = 0
-    has_focal = False
-
-    # Pass 1: frequency filter and split by side relative to focal
-    for i in range(L_total):
-        pos = positions[i]
-
-        # Derived frequency at row i
-        s = 0
-        for j in range(n):
-            s += hap[i, j]
-        f = s / n
-
-        if (f < min_freq) or (f > 1.0):
-            continue
-
-        if pos == focal_coord:
-            has_focal = True
-            continue
-        elif pos < focal_coord:
-            left_idx[left_k] = i
-            left_dist[left_k] = focal_coord - pos  # distance to focal
-            left_k += 1
-        else:  # pos > focal_coord
-            right_idx[right_k] = i
-            right_dist[right_k] = pos - focal_coord
-            right_k += 1
-
-    available = left_k + right_k
-    if available == 0 or num_snps <= 0:
-        return np.empty(0, dtype=int64)
-
-    # Target total excludes focal if the focal site exists
-    target_total = num_snps - 1 if has_focal else num_snps
-    if target_total <= 0:
-        return np.empty(0, dtype=int64)
-
-    # Order candidates by proximity (ascending distance)
-    if left_k > 0:
-        left_ord = np.argsort(left_dist[:left_k])
-    else:
-        left_ord = np.empty(0, dtype=int64)
-
-    if right_k > 0:
-        right_ord = np.argsort(right_dist[:right_k])
-    else:
-        right_ord = np.empty(0, dtype=int64)
-
-    # Split roughly evenly; fill shortfall from the other side
-    left_need = target_total // 2
-    right_need = target_total - left_need
-
-    left_take = left_need if left_need < left_k else left_k
-    right_take = right_need if right_need < right_k else right_k
-
-    remaining = target_total - (left_take + right_take)
-    if remaining > 0:
-        # Try to take extra from right
-        extra_right = right_k - right_take
-        take = remaining if remaining < extra_right else extra_right
-        right_take += take
-        remaining = target_total - (left_take + right_take)
-
-    if remaining > 0:
-        # Take any remaining from left
-        extra_left = left_k - left_take
-        take = remaining if remaining < extra_left else extra_left
-        left_take += take
-        remaining = target_total - (left_take + right_take)
-
-    take_total = left_take + right_take
-    if take_total == 0:
-        return np.empty(0, dtype=int64)
-
-    # Build output: left (nearest→farther), then right (nearest→farther)
-    out = np.empty(take_total, dtype=int64)
-    w = 0
-    for t in range(left_take):
-        out[w] = left_idx[left_ord[t]]
-        w += 1
-    for t in range(right_take):
-        out[w] = right_idx[right_ord[t]]
-        w += 1
-
-    return out
-
-
-@njit(cache=True)
-=======
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 def _unique_hash_counts_reprs_and_assign(H):
     """
     H: (L, n) uint8
@@ -8521,12 +4445,8 @@ def h12_enard(
     hap,
     positions,
     focal_coord=600000,
-<<<<<<< HEAD
-    n_snps=1001,
-=======
     n_snps=None,
     window_size=int(5e5),
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     min_derived_freq=0.05,
     similarity_threshold=0.8,
     top_k=10,
@@ -8611,21 +4531,12 @@ def h12_enard(
         hap,
         positions,
         np.int64(focal_coord),
-<<<<<<< HEAD
-        np.int64(n_snps),
-        # np.int64(window_size),
-        np.float64(min_derived_freq),
-    )
-    if rows.size == 0:
-        return 0.0, 0.0, 0.0
-=======
         # np.int64(n_snps),
         np.int64(window_size),
         np.float64(min_derived_freq),
     )
     if rows.size == 0:
         return 0.0, 0.0, 0.0, 0.0
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
     # 2) window matrix in exact order
     L = rows.size
@@ -8639,11 +4550,7 @@ def h12_enard(
     cnts, reprj, assign = _unique_hash_counts_reprs_and_assign(H)
     m = cnts.size
     if m == 0:
-<<<<<<< HEAD
-        return 0.0, 0.0, 0.0
-=======
         return 0.0, 0.0, 0.0, 0.0
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
     # 4) global order by (count desc, lex asc) and apply legacy accumulator
     order = _argsort_by_count_then_lex(cnts, H, reprj)  # length m
@@ -8711,11 +4618,7 @@ def h12_enard(
 
     # 7) count only selected uids; denominator is n
     if groups == 0:
-<<<<<<< HEAD
-        return 0.0, 0.0, 0.0
-=======
         return 0.0, 0.0, 0.0, 0.0
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     freq_counts = np.zeros(groups, dtype=int64)
     for j in range(n):
         uid = assign[j]
@@ -8736,9 +4639,6 @@ def h12_enard(
     H12 = (p1 + p2) * (p1 + p2)
     H2 = H1 - p1 * p1
     H2_H1 = (H2 / H1) if H1 != 0.0 else 0.0
-<<<<<<< HEAD
-    return H12, H2_H1, H2
-=======
     return H12, H2_H1, H1, H2
 
 
@@ -8871,130 +4771,11 @@ def hscan(
 
     h_means = _hscan_all(hap, pos, indices, int64(max_gap), dist_mode)
     return pos[indices], h_means
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
 
 ################## FS stats
 
 
-<<<<<<< HEAD
-@njit(parallel=True)
-def fast_sq_freq_pairs(
-    hap,
-    ac,
-    rec_map,
-    min_focal_freq=0.25,
-    max_focal_freq=0.95,
-    window_size=50000,
-    # genetic_distance=False,
-):
-    """
-    Compute per-focal-SNP frequency-pair summaries within a sliding window.
-
-    For each focal SNP whose derived allele frequency is within
-    ``[min_focal_freq, max_focal_freq]``, the function scans neighboring SNPs
-    within ``window_size`` centered at the focal SNP physical coordinate , and computes:
-
-    * ``f_d``: frequency of the neighbor SNP among haplotypes carrying the
-      **derived** allele at the focal SNP.
-    * ``f_a``: frequency of the neighbor SNP among haplotypes carrying the
-      **ancestral** allele at the focal SNP.
-    * ``f_tot``: total derived allele frequency of the neighbor SNP.
-
-    :param numpy.ndarray hap:
-        Haplotype matrix of shape ``(n_snps, n_samples)`` with values in ``{0, 1}``
-        (dtype compatible with Numba arithmetic).
-    :param numpy.ndarray ac:
-        Allele counts of shape ``(n_snps, 2)`` where column 0 is ancestral count
-        and column 1 is derived count.
-    :param numpy.ndarray rec_map:
-        Mapping array whose penultimate column is used as the coordinate for
-        windowing (e.g., genetic or physical position). Must have at least two
-        trailing numeric columns.
-    :param float min_focal_freq:
-        Minimum derived allele frequency for a SNP to be considered focal.
-        Default is ``0.25``.
-    :param float max_focal_freq:
-        Maximum derived allele frequency for a SNP to be considered focal.
-        Default is ``0.95``.
-    :param int window_size:
-        Window size (same units as ``rec_map[:, -2]``). Default is ``50000``.
-
-    :returns:
-        A tuple of three elements contaning all the information needed to run DIND,
-        hapDAF-o/s, Sratio, highfreq and lowfreq:
-
-        - ``sq_out_list``: list of length ``n_focal``; each element is a
-          ``(k, 3)`` float array with columns ``[f_d, f_a, f_tot]`` for the
-          neighbors of that focal SNP.
-        - ``info``: ``(n_focal, 4)`` float array with columns
-          ``[position, daf_focal, focal_derived_count, focal_ancestral_count]``,
-          where ``position`` is physical postion from `rec_map[focal_idx, -2]`` and
-          ``daf_focal`` is derived allele frequency at the focal SNP.
-        - ``snp_indices_list``: list of length ``n_focal``; each element is a
-          1D int array of neighbor SNP indices aligned with the corresponding
-          rows in ``sq_out_list[j]``.
-
-    :rtype: tuple[list[numpy.ndarray], numpy.ndarray, list[numpy.ndarray]]
-    """
-
-    # Direct calculations - no intermediate arrays
-    n_snps, n_samples = hap.shape
-    derived_count = ac[:, 1]
-    ancestral_count = ac[:, 0]
-    total_count = derived_count + ancestral_count
-
-    # Pre-allocate frequency array once
-    freqs = np.empty(n_snps, dtype=np.float64)
-    for i in range(n_snps):
-        freqs[i] = derived_count[i] / total_count[i]
-
-    # Get positions directly
-    # Stuck if rec_pos is physical position, need to checked with genetic position
-    # if genetic_distance is False:
-    # rec_pos = rec_map[:, -2]
-
-    rec_pos = rec_map[:, -2]
-    half_window = window_size * 0.5
-
-    # Find focal SNPs without creating boolean mask
-    focal_indices = np.empty(n_snps, dtype=np.int64)
-    n_focal = 0
-    for i in range(n_snps):
-        if min_focal_freq <= freqs[i] <= max_focal_freq:
-            focal_indices[n_focal] = i
-            n_focal += 1
-
-    focal_indices = focal_indices[:n_focal]
-
-    # Pre-compute window bounds only for focal SNPs
-    window_bounds = np.empty((n_focal, 2), dtype=np.int64)
-    for j in range(n_focal):
-        i = focal_indices[j]
-        center = rec_pos[i]
-        window_bounds[j, 0] = np.searchsorted(
-            rec_pos, center - half_window, side="left"
-        )
-        window_bounds[j, 1] = (
-            np.searchsorted(rec_pos, center + half_window, side="right") - 1
-        )
-
-    # Initialize output lists
-    sq_out_list = [np.empty((1, 3), dtype=np.float64) for _ in range(n_focal)]
-    snp_indices_list = [np.empty(1, dtype=np.int64) for _ in range(n_focal)]
-    info = np.zeros((n_focal, 4), dtype=np.float64)
-
-    # Main processing loop
-    for j in prange(n_focal):
-        focal_idx = focal_indices[j]
-
-        # Get window bounds
-        x_l, y_r = window_bounds[j, 0], window_bounds[j, 1]
-        y_l = focal_idx - 1
-        x_r = focal_idx + 1
-
-        # Calculate lengths
-=======
 ################## FS stats
 
 
@@ -9049,46 +4830,11 @@ def fast_sq_freq_pairs(
         info[j, 2] = np.float64(focal_d_count)
         info[j, 3] = np.float64(focal_a_count)
 
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
         len_l = max(0, y_l - x_l + 1)
         len_r = max(0, y_r - x_r + 1)
         total_len = len_l + len_r
 
         if total_len == 0:
-<<<<<<< HEAD
-            sq_out_list[j] = np.empty((0, 3), dtype=np.float64)
-            snp_indices_list[j] = np.empty(0, dtype=np.int64)
-            info[j, 0] = rec_map[focal_idx, -2]
-            info[j, 1] = freqs[focal_idx]
-            continue
-
-        # Allocate output arrays
-        out = np.empty((total_len, 3), dtype=np.float64)
-        indices_out = np.empty(total_len, dtype=np.int64)
-
-        # Get focal SNP counts once
-        focal_d_count = derived_count[focal_idx]
-        focal_a_count = ancestral_count[focal_idx]
-
-        # Process LEFT window (reversed order)
-        out_idx = 0
-        for k in range(y_l, x_l - 1, -1):  # Reverse iteration
-            # Compute overlaps
-            overlap_d = 0
-            overlap_a = 0
-            for m in range(n_samples):
-                hap_focal = hap[focal_idx, m]
-                hap_k = hap[k, m]
-                overlap_d += hap_focal * hap_k
-                overlap_a += (1 - hap_focal) * hap_k
-
-            # Compute frequencies
-            f_d = overlap_d / focal_d_count if focal_d_count > 0 else 0.0
-            f_a = overlap_a / focal_a_count if focal_a_count > 0 else 0.0
-
-            out[out_idx, 0] = f_d
-            out[out_idx, 1] = f_a
-=======
             continue  # sentinels already set above
 
         out = np.empty((total_len, 3), dtype=np.float64)
@@ -9109,30 +4855,10 @@ def fast_sq_freq_pairs(
                 sum_k += hk
             out[out_idx, 0] = overlap_d * inv_d
             out[out_idx, 1] = (sum_k - overlap_d) * inv_a
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
             out[out_idx, 2] = freqs[k]
             indices_out[out_idx] = k
             out_idx += 1
 
-<<<<<<< HEAD
-        # Process RIGHT window (forward order)
-        for k in range(x_r, y_r + 1):
-            # Compute overlaps
-            overlap_d = 0
-            overlap_a = 0
-            for m in range(n_samples):
-                hap_focal = hap[focal_idx, m]
-                hap_k = hap[k, m]
-                overlap_d += hap_focal * hap_k
-                overlap_a += (1 - hap_focal) * hap_k
-
-            # Compute frequencies
-            f_d = overlap_d / focal_d_count if focal_d_count > 0 else 0.0
-            f_a = overlap_a / focal_a_count if focal_a_count > 0 else 0.0
-
-            out[out_idx, 0] = f_d
-            out[out_idx, 1] = f_a
-=======
         # RIGHT window (forward)
         for k in range(x_r, y_r + 1):
             hap_k = hap[k]
@@ -9144,28 +4870,13 @@ def fast_sq_freq_pairs(
                 sum_k += hk
             out[out_idx, 0] = overlap_d * inv_d
             out[out_idx, 1] = (sum_k - overlap_d) * inv_a
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
             out[out_idx, 2] = freqs[k]
             indices_out[out_idx] = k
             out_idx += 1
 
         sq_out_list[j] = out
         snp_indices_list[j] = indices_out
-<<<<<<< HEAD
-        # info[j, 0] = rec_map[focal_idx, -1]
-        # info[j, 1] = freqs[focal_idx]
-        # info[j] = freqs[focal_idx]
-        info[j] = np.array(
-            [
-                rec_map[focal_idx, -2],
-                freqs[focal_idx],
-                float64(focal_d_count),
-                float64(focal_a_count),
-            ]
-        )
-=======
 
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     return sq_out_list, info, snp_indices_list
 
 
@@ -9239,11 +4950,7 @@ def s_ratio(
         # out = np.hstack([info[:,:2], np.array(results)])
         df_out = pl.DataFrame(out, schema=tmp_schema)
         # df_out = pl.DataFrame([out[:, 0], out[:, 1], out[:, 4], out[:, 5]], schema=tmp_schema)
-<<<<<<< HEAD
-    except:
-=======
     except Exception:
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
         df_out = pl.DataFrame([[], [], []], schema=tmp_schema)
 
     return df_out
@@ -9286,11 +4993,7 @@ def hapdaf_o(
     n_rows = len(sq_freqs)
     results = np.empty((n_rows, 1), dtype=np.float64)
 
-<<<<<<< HEAD
-    nan_index = []
-=======
     # nan_index = []
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
     for i, v in enumerate(sq_freqs):
         f_d = v[:, 0]
@@ -9341,11 +5044,7 @@ def hapdaf_o(
         )
         df_out = pl.DataFrame(out, schema=tmp_schema)
         # df_out = pl.DataFrame([out[:, 0], out[:, 1], out[:, 4], out[:, 5]], schema=tmp_schema)
-<<<<<<< HEAD
-    except:
-=======
     except Exception:
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
         df_out = pl.DataFrame([[], [], []], schema=tmp_schema)
 
     return df_out
@@ -9387,11 +5086,7 @@ def hapdaf_s(
 
     n_rows = len(sq_freqs)
     results = np.empty((n_rows, 1), dtype=np.float64)
-<<<<<<< HEAD
-    nan_index = []
-=======
     # nan_index = []
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     for i, v in enumerate(sq_freqs):
         f_d = v[:, 0]
         f_a = v[:, 1]
@@ -9443,11 +5138,7 @@ def hapdaf_s(
         df_out = pl.DataFrame(out, schema=tmp_schema)
 
         # df_out = pl.DataFrame([out[:, 0], out[:, 1], out[:, 4], out[:, 5]], schema=tmp_schema)
-<<<<<<< HEAD
-    except:
-=======
     except Exception:
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
         df_out = pl.DataFrame([[], [], [], []], schema=tmp_schema)
 
     return df_out
@@ -9560,418 +5251,11 @@ def dind_high_low(
         out = np.hstack([info[:, :2], results_dind, results_high, results_low])
         df_out = pl.DataFrame(out, schema=tmp_schema)
         # df_out = pl.DataFrame([out[:, 0],out[:, 1],out[:, 4],out[:, 5],out[:, 6],out[:, 7],out[:, 8],out[:, 9],],schema=tmp_schema,)
-<<<<<<< HEAD
-
-    except:
-        df_out = pl.DataFrame([[], [], [], [], [], [], [], []], schema=tmp_schema)
-
-    return df_out
-
-
-def run_fs_stats(
-    hap,
-    ac,
-    rec_map,
-    min_focal_freq=0.25,
-    max_focal_freq=0.95,
-    window_size=50000,
-    # genetic_distance=False,
-):
-    """
-
-    Wrapper to extracts per-focal-SNP neighbor pairs via
-    :func:`fast_sq_freq_pairs`, then estimate DIND, hapDAF-o/s, Sratio, highfreq and lowfreq
-    statistics. Results are returned as four Polars DataFrames.
-
-    :param numpy.ndarray hap: Haplotype matrix ``(n_snps, n_samples)`` with 0/1 values.
-    :param numpy.ndarray ac: Allele counts ``(n_snps, 2)`` as ``[ancestral, derived]``.
-    :param numpy.ndarray rec_map: Map array; penultimate column is the window coordinate.
-    :param float min_focal_freq: Minimum focal derived frequency. Default ``0.25``.
-    :param float max_focal_freq: Maximum focal derived frequency. Default ``0.95``.
-    :param int window_size: Window size in coordinate physicial units extracted from ``rec_map[:, -2]``. Default ``50000``.
-
-    :returns:
-        Four DataFrames in order: ``df_dind_high_low``, ``df_s_ratio``,
-        ``df_hapdaf_s``, ``df_hapdaf_o``.
-    :rtype: tuple[polars.DataFrame, polars.DataFrame, polars.DataFrame, polars.DataFrame]
-    """
-    sq_freqs, info, snps_indices = fast_sq_freq_pairs(
-        hap,
-        ac,
-        rec_map,
-        min_focal_freq=min_focal_freq,
-        max_focal_freq=max_focal_freq,
-        window_size=window_size,
-        # genetic_distance=genetic_distance,
-    )
-
-    if info.shape[0] == 0:
-        return fs_stats_dataframe(info, [], [], [], [], [], [])
-
-    results_dind, results_high, results_low = dind_high_low_from_pairs(sq_freqs, info)
-    results_s_ratio = s_ratio_from_pairs(sq_freqs)
-    results_hapdaf_o = hapdaf_o_from_pairs(hap, sq_freqs, snps_indices)
-    results_hapdaf_s = hapdaf_s_from_pairs(sq_freqs)
-
-    df_dind_high_low, df_s_ratio, df_hapdaf_o, df_hapdaf_s = fs_stats_dataframe(
-        info,
-        results_dind,
-        results_high,
-        results_low,
-        results_s_ratio,
-        results_hapdaf_o,
-        results_hapdaf_s,
-    )
-
-    return df_dind_high_low, df_s_ratio, df_hapdaf_o, df_hapdaf_s
-
-
-# def s_ratio_from_pairs(sq_freqs, max_ancest_freq=1, min_tot_freq=0):
-@njit(parallel=True)
-def s_ratio_from_pairs(sq_freqs, max_ancest_freq=1, min_tot_freq=0):
-    n_rows = len(sq_freqs)
-    results = np.zeros((n_rows, 1))
-
-    for i in prange(len(sq_freqs)):
-        f_d = sq_freqs[i][:, 0]
-        f_a = sq_freqs[i][:, 1]
-
-        f_d2 = np.zeros(f_d.shape)
-        f_a2 = np.zeros(f_a.shape)
-
-        f_d2[(f_d > 0.0000001) & (f_d < 1)] = 1
-        f_a2[(f_a > 0.0000001) & (f_a < 1)] = 1
-
-        num = (f_d2 - f_d2 + f_a2 + 1).sum()
-        den = (f_a2 - f_a2 + f_d2 + 1).sum()
-        # redefine to add one to get rid of blowup issue introduced by adding 0.001 to denominator
-
-        # Add error checking before division
-        if den == 0:
-            s_ratio_v = np.nan
-        else:
-            s_ratio_v = num / den
-
-        # if num == 0:
-        #     s_ratio_v_flip = np.nan
-        # else:
-        #     s_ratio_v_flip = den / num
-        # s_ratio_v = num / den
-        # s_ratio_v_flip = den / num
-        # results[i] = s_ratio_v, s_ratio_v_flip
-        results[i] = s_ratio_v
-
-    return results
-
-
-# def hapdaf_o_from_pairs(sq_freqs, max_ancest_freq=0.35, min_tot_freq=0.25):
-@njit(parallel=True)
-def hapdaf_o_from_pairs(
-    hap, sq_freqs, snps_indices, max_ancest_freq=0.25, min_tot_freq=0.25
-):
-    n_rows = len(sq_freqs)
-    results = np.zeros((n_rows, 1))
-    # results = np.zeros((n_rows, 2))
-
-    for i in prange(len(sq_freqs)):
-        f_d = sq_freqs[i][:, 0]
-        f_a = sq_freqs[i][:, 1]
-        f_tot = sq_freqs[i][:, 2]
-
-        f_d2 = (
-            f_d[(f_d > f_a) & (f_a <= max_ancest_freq) & (f_tot >= min_tot_freq)] ** 2
-        )
-        f_a2 = (
-            f_a[(f_d > f_a) & (f_a <= max_ancest_freq) & (f_tot >= min_tot_freq)] ** 2
-        )
-
-        if len(f_d2) != 0 and len(f_a2) != 0:
-            hapdaf = (f_d2 - f_a2).sum() / f_d2.shape[0]
-        else:
-            hapdaf = np.nan
-
-        # # Flipping derived to ancestral, ancestral to derived
-        # f_d2f = (
-        #     f_a[(f_a > f_d) & (f_d <= max_ancest_freq) & (f_tot >= min_tot_freq)] ** 2
-        # )
-        # f_a2f = (
-        #     f_d[(f_a > f_d) & (f_d <= max_ancest_freq) & (f_tot >= min_tot_freq)] ** 2
-        # )
-        # if len(f_d2f) != 0 and len(f_a2f) != 0:
-        #     hapdaf_flip = (f_d2f - f_a2f).sum() / f_d2f.shape[0]
-        # else:
-        #     hapdaf_flip = np.nan
-
-        # # Derived haplotype LD (omega_deriv)
-        # omega_mask_deriv = snps_indices[i][
-        #     (f_d > f_a) & (f_a <= max_ancest_freq) & (f_tot >= min_tot_freq)
-        # ]
-        # omega_mask_ancest = snps_indices[i][
-        #     (f_a > f_d) & (f_d <= max_ancest_freq) & (f_tot >= min_tot_freq)
-        # ]
-        # # need ≥3 SNPs
-        # if omega_mask_deriv.shape[0] >= 3:
-        #     _r2_deriv = compute_r2_matrix_upper(hap[omega_mask_deriv])
-        #     omega_deriv = omega_linear_correct_mask(_r2_deriv)
-        # else:
-        #     omega_deriv = np.nan
-
-        # # # Ancestral haplotype LD (omega_ancest)
-        # if omega_mask_ancest.shape[0] >= 3:
-        #     _r2_ancest = compute_r2_matrix_upper(hap[omega_mask_ancest])
-        #     omega_ancest = omega_linear_correct_mask(_r2_ancest)
-        # else:
-        #     omega_ancest = np.nan
-
-        # if not np.isnan(omega_deriv) and not np.isnan(omega_ancest):
-        #     omega_diff = omega_deriv - omega_ancest
-        # else:
-        #     omega_diff = np.nan
-
-        # _r2 = compute_r2_matrix_upper(hap_int[omega_mask])
-        # _zns,_omega = Ld(_r2)
-
-        results[i] = hapdaf
-        # results[i] = (hapdaf, hapdaf_flip)
-        # results[i] = (hapdaf, omega_diff)
-    return results
-
-
-@njit(parallel=True)
-def hapdaf_s_from_pairs(sq_freqs, max_ancest_freq=0.1, min_tot_freq=0.1):
-    n_rows = len(sq_freqs)
-    results = np.zeros((n_rows, 1))
-    # results = np.zeros((n_rows, 2))
-
-    for i in prange(len(sq_freqs)):
-        f_d = sq_freqs[i][:, 0]
-        f_a = sq_freqs[i][:, 1]
-        f_tot = sq_freqs[i][:, 2]
-
-        f_d2 = (
-            f_d[(f_d > f_a) & (f_a <= max_ancest_freq) & (f_tot >= min_tot_freq)] ** 2
-        )
-        f_a2 = (
-            f_a[(f_d > f_a) & (f_a <= max_ancest_freq) & (f_tot >= min_tot_freq)] ** 2
-        )
-
-        if len(f_d2) != 0 and len(f_a2) != 0:
-            hapdaf = (f_d2 - f_a2).sum() / f_d2.shape[0]
-        else:
-            hapdaf = np.nan
-
-        # # Flipping derived to ancestral, ancestral to derived
-        # f_d2f = (
-        #     f_a[(f_a > f_d) & (f_d <= max_ancest_freq) & (f_tot >= min_tot_freq)] ** 2
-        # )
-        # f_a2f = (
-        #     f_d[(f_a > f_d) & (f_d <= max_ancest_freq) & (f_tot >= min_tot_freq)] ** 2
-        # )
-        # if len(f_d2f) != 0 and len(f_a2f) != 0:
-        #     hapdaf_flip = (f_d2f - f_a2f).sum() / f_d2f.shape[0]
-        # else:
-        #     hapdaf_flip = np.nan
-
-        # results[i] = [hapdaf, hapdaf_flip]
-        results[i] = hapdaf
-
-    return results
-
-
-# def dind_high_low_from_pairs(sq_freqs, info, max_ancest_freq=0.25, min_tot_freq=0.1):
-@njit(parallel=True)
-def dind_high_low_from_pairs(sq_freqs, info, max_ancest_freq=0.25, min_tot_freq=0):
-    # Pre-allocate arrays for results to avoid growing lists
-    n_rows = len(sq_freqs)
-    results_dind = np.zeros((n_rows, 1))
-    results_high = np.zeros((n_rows, 1))
-    results_low = np.zeros((n_rows, 1))
-    # results_dind = np.zeros((n_rows, 2))
-    # results_high = np.zeros((n_rows, 2))
-    # results_low = np.zeros((n_rows, 2))
-
-    # Main computation loop
-    for i in prange(len(sq_freqs)):
-        f_d = sq_freqs[i][:, 0]
-        f_a = sq_freqs[i][:, 1]
-        f_tot = sq_freqs[i][:, 2]
-
-        focal_derived_count = info[i][-2]
-        focal_ancestral_count = info[i][-1]
-
-        # Calculate derived and ancestral components
-        f_d2 = f_d * (1 - f_d) * focal_derived_count / (focal_derived_count - 1)
-        f_a2 = (
-            f_a
-            * (1 - f_a)
-            * focal_ancestral_count
-            / (focal_ancestral_count - 1 + 0.001)
-        )
-
-        # Calculate dind values
-        num = (f_d2 - f_d2 + f_a2).sum()
-        den = (f_a2 - f_a2 + f_d2).sum() + 0.001
-        if den != 0.0:
-            dind_v = num / den
-        else:
-            dind_v = np.nan
-
-        # if num != 0.0:
-        #     dind_v_flip = den / num
-        # else:
-        #     dind_v_flip = np.nan
-
-        # results_dind[i] = [dind_v, dind_v_flip]
-        results_dind[i] = dind_v
-
-        # Calculate high and low frequency values
-        fd_h_mask = (f_d > max_ancest_freq) & (f_tot >= min_tot_freq)
-        fa_h_mask = (f_a > max_ancest_freq) & (f_tot >= min_tot_freq)
-        fd_l_mask = (f_d < max_ancest_freq) & (f_tot >= min_tot_freq)
-        fa_l_mask = (f_a < max_ancest_freq) & (f_tot >= min_tot_freq)
-
-        fd_l_mask = ((f_d > max_ancest_freq) & (f_d < 0.8)) & (f_tot >= min_tot_freq)
-        fd_l_mask = (f_d > max_ancest_freq) & (f_tot >= min_tot_freq)
-        # fa_l_mask = ((f_a > 0.25) & (f_a < 0.8)) & (f_tot >= min_tot_freq)
-
-        hf_v = (f_d[fd_h_mask] ** 2).sum() / max(len(f_d[fd_h_mask]), 1)
-        # hf_v_flip = (f_a[fa_h_mask] ** 2).sum() / max(len(f_a[fa_h_mask]), 1)
-        # results_high[i] = [hf_v, hf_v_flip]
-        results_high[i] = hf_v
-
-        lf_v = ((1 - f_d[fd_l_mask]) ** 2).sum() / max(len(f_d[fd_l_mask]), 1)
-        # lf_v_flip = ((1 - f_a[fa_l_mask]) ** 2).sum() / max(len(f_a[fa_l_mask]), 1)
-        # results_low[i] = [lf_v, lf_v_flip]
-        results_low[i] = lf_v
-
-    return results_dind, results_high, results_low
-
-
-def fs_stats_dataframe(
-    info,
-    results_dind,
-    results_high,
-    results_low,
-    results_s_ratio,
-    results_hapdaf_o,
-    results_hapdaf_s,
-):
-    try:
-        out_dind_high_low = np.hstack(
-            [info[:, :2], results_dind, results_high, results_low]
-        )
-        df_dind_high_low = pl.DataFrame(
-            out_dind_high_low,
-            schema={
-                "positions": pl.Int64,
-                "daf": pl.Float64,
-                "dind": pl.Float64,
-                # "dind_flip": pl.Float64,
-                "high_freq": pl.Float64,
-                # "high_freq_flip": pl.Float64,
-                "low_freq": pl.Float64,
-                # "low_freq_flip": pl.Float64,
-            },
-        )
-
-    except:
-        df_dind_high_low = pl.DataFrame(
-            # [[], [], [], [], [], [], [], []],
-            [[], [], [], [], []],
-            schema={
-                "positions": pl.Int64,
-                "daf": pl.Float64,
-                "dind": pl.Float64,
-                # "dind_flip": pl.Float64,
-                "high_freq": pl.Float64,
-                # "high_freq_flip": pl.Float64,
-                "low_freq": pl.Float64,
-                # "low_freq_flip": pl.Float64,
-            },
-        )
-=======
 
     except Exception:
         df_out = pl.DataFrame([[], [], [], [], [], [], [], []], schema=tmp_schema)
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
-    try:
-        out_s_ratio = np.hstack([info[:, :2], results_s_ratio])
-        df_s_ratio = pl.DataFrame(
-            out_s_ratio,
-            schema={
-                "positions": pl.Int64,
-                "daf": pl.Float64,
-                "s_ratio": pl.Float64,
-                # "s_ratio_flip": pl.Float64,
-            },
-        )
-    except:
-        df_s_ratio = pl.DataFrame(
-            # [[], [], [], []],
-            [[], [], []],
-            schema={
-                "positions": pl.Int64,
-                "daf": pl.Float64,
-                "s_ratio": pl.Float64,
-                # "s_ratio_flip": pl.Float64,
-            },
-        )
-
-    try:
-        out_hapdaf_s = np.hstack([info[:, :2], np.array(results_hapdaf_s)])
-        df_hapdaf_s = pl.DataFrame(
-            out_hapdaf_s,
-            schema={
-                "positions": pl.Int64,
-                "daf": pl.Float64,
-                "hapdaf_s": pl.Float64,
-                # "hapdaf_s_flip": pl.Float64,
-            },
-        )
-    except:
-        df_hapdaf_s = pl.DataFrame(
-            [[], [], []],
-            # [[], [], [], []],
-            schema={
-                "positions": pl.Int64,
-                "daf": pl.Float64,
-                "hapdaf_s": pl.Float64,
-                # "hapdaf_s_flip": pl.Float64,
-            },
-        )
-
-    try:
-        out_hapdaf_o = np.hstack([info[:, :2], np.array(results_hapdaf_o)])
-        df_hapdaf_o = pl.DataFrame(
-            out_hapdaf_o,
-            schema={
-                "positions": pl.Int64,
-                "daf": pl.Float64,
-                "hapdaf_o": pl.Float64,
-                # "hapdaf_o_flip": pl.Float64,
-                # "omega_diff": pl.Float64,
-            },
-        )
-    except:
-        df_hapdaf_o = pl.DataFrame(
-            [[], [], []],
-            # [[], [], [], []],
-            schema={
-                "positions": pl.Int64,
-                "daf": pl.Float64,
-                "hapdaf_o": pl.Float64,
-                # "hapdaf_o_flip": pl.Float64,
-                # "omega_diff": pl.Float64,
-            },
-        )
-
-    return (
-        df_dind_high_low.fill_nan(None),
-        df_s_ratio.fill_nan(None),
-        df_hapdaf_o.fill_nan(None),
-        df_hapdaf_s.fill_nan(None),
-    )
+    return df_out
 
 
 @njit(parallel=False, cache=True)
@@ -10271,11 +5555,7 @@ def dot_nb(hap):
     return np.dot(hap.T, hap)
 
 
-<<<<<<< HEAD
-@njit
-=======
 @njit(cache=True)
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 def neutrality_divergence_proxy(kappa, phi, freq, method=3):
     sigma1 = (kappa) * (1 - kappa)
     sigma1[sigma1 == 0] = 1.0
@@ -10583,11 +5863,7 @@ def isafe_kernel_nb(haf, snp):
     return p
 
 
-<<<<<<< HEAD
-@njit
-=======
 @njit(cache=True)
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 def creat_matrix_Psi_k_nb(hap, hafs, Ifp):
     """Further optimized version with pre-computed unique values"""
     P = np.zeros((len(Ifp), len(hafs)))
@@ -10649,63 +5925,10 @@ def get_top_k_snps_in_each_window(df_snps, k=1):
 ################## LD stats
 
 
-<<<<<<< HEAD
-def Ld(r_2, mask=None) -> tuple:
-    """
-    Compute **Kelly's ZnS** (mean pairwise :math:`r^2`) and **omega\\_max** from an LD matrix.
-
-    The input ``r_2`` is a square matrix of pairwise linkage disequilibrium
-    values :math:`r^2` among SNPs within a window. If ``mask`` is provided,
-    the computation is restricted to the subset of indices where ``mask`` is
-    ``True``.
-
-    ZnS is defined as:
-
-    .. math::
-
-       \\mathrm{ZnS} = \\frac{\\sum_{i<j} r^2_{ij}}{\\binom{S}{2}},
-
-    where :math:`S` is the number of SNPs after masking.
-
-    The function also returns ``omega_max`` (Kim & Nielsen, 2004), computed via
-    :func:`omega_linear_correct_mask`, which scans split points and compares the
-    average LD within versus between the two partitions.
-
-    :param numpy.ndarray r_2:
-        Square matrix (``S`` × ``S``) of pairwise :math:`r^2` values. The routine
-        treats it as symmetric; values on and below the diagonal are ignored for ZnS.
-    :param numpy.ndarray mask:
-        Optional boolean vector of length ``S`` to select a subset of SNPs. Default ``None``.
-
-    :returns:
-        Tuple ``(zns, omega_max)`` as floats.
-    :rtype: tuple[float, float]
-    """
-
-    # r2_matrix = r2_torch(hap_filter)
-    if mask is not None:
-        idx = np.flatnonzero(mask)
-        _r_2 = r_2[np.ix_(idx, idx)]
-    else:
-        _r_2 = r_2
-
-    S = _r_2.shape[0]
-    with np.errstate(divide="ignore", invalid="ignore"):
-        zns = _r_2.sum() / comb(S, 2)
-    # Index combination to iter
-    omega_max = omega_linear_correct_mask(np.asarray(_r_2))
-
-    # return zns, 0
-    return zns, omega_max
-
-
-@njit("float64(int8[:], int8[:])", parallel=False)
-=======
 ################## LD stats
 
 
 @njit(parallel=False, cache=True)
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 def r2(locus_A: np.ndarray, locus_B: np.ndarray) -> float:
     """
     Compute the squared correlation coefficient :math:`r^2` between two biallelic loci.
@@ -10754,128 +5977,6 @@ def r2(locus_A: np.ndarray, locus_B: np.ndarray) -> float:
     return r_squared
 
 
-<<<<<<< HEAD
-def compute_r2_matrix_upper_og(hap):
-    """
-    Computes the pairwise linkage disequilibrium (LD) measure r² between all pairs of SNPs,
-    using a vectorized implementation. Only the strict upper triangle of the r² matrix is returned,
-    where r²[i, j] is defined only for i < j (i.e., no redundancy).
-
-    This function assumes biallelic haplotype data and computes r² as:
-
-        r²_ij = (P_ij - p_i * p_j)^2 / [p_i(1 - p_i) * p_j(1 - p_j)]
-
-    where:
-        - P_ij: empirical joint frequency that SNP i and SNP j are both 1
-        - p_i: allele frequency (of 1s) at SNP i
-        - p_j: allele frequency (of 1s) at SNP j
-
-    Parameters
-    ----------
-    hap : ndarray of shape (S, N)
-        Integer haplotype matrix with S SNPs (rows) and N haplotypes (columns).
-        Values should be 0 or 1. Input dtype may be int8 or bool.
-
-    Returns
-    -------
-    r2_upper : ndarray of shape (S, S)
-        Float64 matrix of r² values with only the upper triangle (i < j) filled in.
-        All values where i >= j are zero.
-    """
-    # Convert haplotype data to float64 for dot product operations
-    X = hap.astype(np.float64)
-    S, N = X.shape
-
-    # Allele frequency at each SNP
-    p = X.mean(axis=1)
-
-    # Joint frequency matrix: E[h_i * h_j]
-    P = (X @ X.T) / N
-
-    # Covariance between SNPs: D_ij = P_ij - p_i * p_j
-    D = P - p[:, None] * p[None, :]
-
-    # Denominator matrix denom_i * denom_j
-    denom = p * (1.0 - p)
-    den_outer = denom[:, None] * denom[None, :]
-
-    # Compute r^2 matrix, checking zero division at monomorphic sites
-    with np.errstate(divide="ignore", invalid="ignore"):
-        r2 = (D * D) / den_outer
-        r2[den_outer == 0.0] = 0.0
-
-    # Retain only the upper triangle (i < j), zero elsewhere
-    r2_upper = np.triu(r2, k=1)
-
-    return r2_upper
-
-
-@njit(parallel=False)
-def compute_r2_matrix_upper(hap):
-    """
-    Compute pairwise LD :math:`r^2` for all SNP pairs and return the strict upper triangle.
-
-    The input is a biallelic haplotype matrix with rows as SNPs and columns as haplotypes.
-    For SNPs :math:`i` and :math:`j`, the statistic is:
-
-    .. math::
-
-       r^2_{ij} = \\frac{\\left(P_{ij} - p_i p_j\\right)^2}{p_i(1-p_i)\\,p_j(1-p_j)},
-
-    where :math:`p_i` is the allele-1 frequency at SNP :math:`i` and
-    :math:`P_{ij}` is the joint frequency of both SNPs being 1 across samples.
-
-    :param numpy.ndarray hap:
-        Integer matrix of shape ``(S, N)`` with values in ``{0,1}`` (SNPs × haplotypes).
-        Dtype may be ``int8``/``bool``; the computation is performed in ``float64``.
-
-    :returns:
-        A ``(S, S)`` float64 matrix whose **upper triangle** (``i < j``) contains the
-        :math:`r^2` values and zeros elsewhere (diagonal and lower triangle are zero).
-    :rtype: numpy.ndarray
-    """
-    S, N = hap.shape
-    X = hap.astype(np.float64)
-
-    # Allele frequencies
-    p = np.empty(S, dtype=np.float64)
-    for i in range(S):
-        s = 0.0
-        for n in range(N):
-            s += X[i, n]
-        p[i] = s / N
-
-    denom = p * (1.0 - p)
-
-    # Joint frequency matrix using efficient dot product
-    P = (X @ X.T) / N
-
-    r2_upper = np.zeros((S, S), dtype=np.float64)
-
-    for i in range(S):
-        for j in range(i + 1, S):
-            D = P[i, j] - p[i] * p[j]
-            denom_ij = denom[i] * denom[j]
-            if denom_ij == 0.0:
-                r2_upper[i, j] = 0.0
-            else:
-                r2_upper[i, j] = (D * D) / denom_ij
-
-    return r2_upper
-
-
-@njit(parallel=False)
-def omega_linear_correct(r2_matrix):
-    """
-    Compute :math:`\\omega_\\text{max}` (Kim & Nielsen, 2004) from an :math:`r^2` matrix.
-
-    The statistic compares the average LD within two partitions (left/right of a split)
-    to the average LD between the partitions. For a split index :math:`\\ell` on a
-    sequence of length :math:`S`, define:
-
-    .. math::
-
-=======
 def compute_r2_matrix_upper(hap, as_float32=False):
     """
     r² via pre-scaled BLAS matmul. Avoids the outer-product subtraction step
@@ -10912,198 +6013,11 @@ def omega_linear_correct(r2_matrix):
 
     .. math::
 
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
        \\begin{aligned}
        &\\text{within-left}   &&= \\sum_{0 \\le i < j < \\ell} r^2_{ij},\\\\
        &\\text{within-right}  &&= \\sum_{\\ell \\le i < j < S} r^2_{ij},\\\\
        &\\text{between}       &&= \\sum_{0 \\le i < \\ell} \\sum_{\\ell \\le j < S} r^2_{ij},
        \\end{aligned}
-<<<<<<< HEAD
-
-    and the means are obtained by dividing by the corresponding pair counts
-    :math:`\\binom{\\ell}{2}`, :math:`\\binom{S-\\ell}{2}`, and :math:`\\ell(S-\\ell)`.
-    The omega score at :math:`\\ell` is:
-
-    .. math::
-
-       \\omega(\\ell) = \\frac{\\dfrac{\\text{within-left}}{\\binom{\\ell}{2}}
-                          + \\dfrac{\\text{within-right}}{\\binom{S-\\ell}{2}}}
-                         {\\dfrac{\\text{between}}{\\ell(S-\\ell)}}.
-
-    This function scans admissible :math:`\\ell` and returns the maximum value.
-
-    :param numpy.ndarray _r2:
-        Square matrix (``S`` × ``S``) of pairwise :math:`r^2` values. Only the
-        upper triangle (``i < j``) is required to hold valid values.
-    :param numpy.ndarray mask:
-        Optional boolean vector selecting a subset of SNP indices to consider.
-        Default ``None`` (use all SNPs).
-
-    :returns:
-        The maximum omega value over all candidate split points.
-    :rtype: float
-
-    :notes:
-        - The implementation is :math:`O(S^2)` using prefix/suffix aggregates for the
-          within-left and within-right sums, avoiding recomputation.
-        - Very small windows (``S < 3`` after masking) return ``0.0``.
-    """
-
-    S = r2_matrix.shape[0]
-    if S < 3:
-        # return np.array([0.0,0.0])
-        return 0.0
-
-    #   Build row_sum[i] = sum_{j>i} r2[i,j]
-    #   and       col_sum[j] = sum_{i<j} r2[i,j]
-    #   Also accumulate total of all upper‐triangle entries.
-    row_sum = np.zeros(S, np.float64)
-    col_sum = np.zeros(S, np.float64)
-    total = 0.0
-    for i in range(S):
-        s = 0.0
-        for j in range(i + 1, S):
-            v = r2_matrix[i, j]
-            s += v
-            col_sum[j] += v
-        row_sum[i] = s
-        total += s
-
-    # Build prefix_L[_l] = sum_{i<j<_l} r2[i,j]
-    prefix_L = np.zeros(S, np.float64)
-    for _l in range(1, S):
-        prefix_L[_l] = prefix_L[_l - 1] + col_sum[_l - 1]
-
-    # Build suffix_R[_l] = sum_{_l≤i<j} r2[i,j]
-    suffix_R = np.zeros(S + 1, np.float64)
-    for _l in range(S - 1, -1, -1):
-        suffix_R[_l] = suffix_R[_l + 1] + row_sum[_l]
-
-    # Sweep _l = 3..S-3 in O(S), compute _omega and track maximum
-    omega_max = 0.0
-    omega_argmax = -1.0
-    for _l in range(3, S - 2):
-        sum_L = prefix_L[_l]
-        sum_R = suffix_R[_l]
-        sum_LR = total - sum_L - sum_R
-        if sum_LR > 0.0:
-            denom_L = (_l * (_l - 1) / 2.0) + ((S - _l) * (S - _l - 1) / 2.0)
-            denom_R = _l * (S - _l)
-            _omega = ((sum_L + sum_R) / denom_L) / (sum_LR / denom_R)
-            if _omega > omega_max:
-                omega_max = _omega
-                omega_argmax = _l + 2
-
-    # return np.array([omega_max,omega_argmax])
-    return omega_max
-
-
-@njit(parallel=False)
-def omega_linear_correct_mask(_r2, mask=None):
-    """
-    Compute :math:`\\omega_{\\max}` from an LD matrix of pairwise :math:`r^2` values.
-
-    Given a square matrix ``_r2`` of pairwise linkage disequilibrium :math:`r^2`
-    between :math:`S` SNPs (only the upper triangle needs valid values), this
-    function scans all admissible split points :math:`\\ell` and compares the mean
-    LD **within** each side of the split to the mean LD **between** sides. It
-    returns the maximum value over :math:`\\ell`.
-
-    Let
-
-    .. math::
-
-       \\begin{aligned}
-       &\\text{within-left}  &&= \\sum_{0 \\le i < j < \\ell} r^2_{ij},\\\\
-       &\\text{within-right} &&= \\sum_{\\ell \\le i < j < S} r^2_{ij},\\\\
-       &\\text{between}      &&= \\sum_{0 \\le i < \\ell} \\sum_{\\ell \\le j < S} r^2_{ij},
-       \\end{aligned}
-
-    and define their means by dividing by the corresponding pair counts
-    :math:`\\binom{\\ell}{2}`, :math:`\\binom{S-\\ell}{2}`, and :math:`\\ell(S-\\ell)`.
-    The omega score at :math:`\\ell` is
-
-    .. math::
-
-       \\omega(\\ell) = \\frac{\\dfrac{\\text{within-left}}{\\binom{\\ell}{2}}
-                          + \\dfrac{\\text{within-right}}{\\binom{S-\\ell}{2}}}
-                         {\\dfrac{\\text{between}}{\\ell(S-\\ell)}}\\,,
-
-    and the function returns :math:`\\max_\\ell \\omega(\\ell)`.
-
-    :param numpy.ndarray _r2:
-        Square matrix (``S`` × ``S``) of pairwise :math:`r^2`. Only the upper triangle
-        (``i < j``) must contain valid values; the routine treats the matrix as symmetric.
-    :param numpy.ndarray mask:
-        Optional boolean array (length ``S``) selecting a subset of SNP indices to include.
-        If ``None``, all indices are used. Default ``None``.
-
-    :returns:
-        Maximum omega value across candidate split points.
-    :rtype: float
-
-    :notes:
-        - Time complexity is :math:`O(S^2)` via one pass to accumulate pairwise sums and
-          prefix/suffix aggregates; each candidate split is then evaluated in :math:`O(1)`.
-        - Very small windows (``S < 3`` after masking) yield ``0.0``.
-    """
-
-    # Select the SNP indices to include based on mask
-    if mask is None:
-        idx = np.arange(_r2.shape[0])
-    else:
-        idx = np.where(mask)[0]
-
-    S = len(idx)
-    if S < 3:
-        return 0.0
-
-    # Accumulate sums of r^2 for all pairs (i < j)
-    row_sum = np.zeros(S, np.float64)  # ∑_j>i r2[i,j]
-    col_sum = np.zeros(S, np.float64)  # ∑_i<j r2[i,j]
-    total = 0.0
-    for a in range(S):
-        i = idx[a]
-        s = 0.0
-        for b in range(a + 1, S):
-            j = idx[b]
-            v = _r2[i, j]
-            s += v
-            col_sum[b] += v
-        row_sum[a] = s
-        total += s
-
-    # Precompute prefix and suffix sums for L and R partitions
-    # ∑_{i<l} ∑_{j<l} r²[i,j]
-    prefix_L = np.zeros(S, np.float64)
-    for _l in range(1, S):
-        prefix_L[_l] = prefix_L[_l - 1] + col_sum[_l - 1]
-
-    # ∑_{i>=l} ∑_{j>i} r²[i,j]
-    suffix_R = np.zeros(S + 1, np.float64)
-    for _l in range(S - 1, -1, -1):
-        suffix_R[_l] = suffix_R[_l + 1] + row_sum[_l]
-
-    # Main omega scan: iterate over candidate split points _l
-    omega_max = 0.0
-    omega_argmax = -1.0
-    for _l in range(3, S - 2):
-        # within-left block
-        sum_L = prefix_L[_l]
-        # within-right block
-        sum_R = suffix_R[_l]
-        # between-block
-        sum_LR = total - sum_L - sum_R
-        if sum_LR > 0.0:
-            denom_L = (_l * (_l - 1) / 2.0) + ((S - _l) * (S - _l - 1) / 2.0)
-            denom_R = _l * (S - _l)
-            _omega = ((sum_L + sum_R) / denom_L) / (sum_LR / denom_R)
-            if _omega > omega_max:
-                omega_max = _omega
-                # SNP index offset for compatibility
-                omega_argmax = _l + 2
-=======
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
     and the means are obtained by dividing by the corresponding pair counts
     :math:`\\binom{\\ell}{2}`, :math:`\\binom{S-\\ell}{2}`, and :math:`\\ell(S-\\ell)`.
@@ -11234,14 +6148,10 @@ def Ld(hap, as_float32=True) -> tuple:
 ################## Spectrum stats
 
 
-<<<<<<< HEAD
-@njit(float64[:](int64), cache=True)
-=======
 ################## Site Frequency Spectrum stats
 
 
 @njit(cache=True)
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 def _harmonic_sums(n):
     """
     Return harmonic sums up to ``n-1``.
@@ -11265,59 +6175,18 @@ def _harmonic_sums(n):
     return np.array((a1, a2), dtype=np.float64)
 
 
-<<<<<<< HEAD
-@njit
-def theta_watterson(ac, positions):
-    """
-    Watterson's theta per base from allele counts and positions.
-
-    The absolute estimator is ``theta_W_abs = S / a1`` with
-    ``S = ac.shape[0]`` segregating sites and ``a1 = sum_{i=1}^{n-1} 1/i``.
-    This implementation then divides by a span length computed from
-    ``positions`` to output **per-base** ``theta_W``.
-
-    :param numpy.ndarray ac:
-        Allele counts array of shape ``(S, 2)`` where columns are
-        (ancestral_count, derived_count). Assumes a constant ``n`` across sites.
-    :param numpy.ndarray positions:
-        Sorted 1D array (length ``S``) of physical positions for the
-        segregating sites.
-    :returns:
-        Per-base Watterson’s theta (float).
-    :rtype: float
-
-    .. note::
-       Per-base normalization uses
-       ``positions[-1] - (positions[1] + 1)`` as the span. Ensure positions
-       are sorted and represent the intended accessible region.
-    """
-=======
 @njit(cache=True)
 def theta_watterson(ac, positions):
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     # count segregating variants
     S = ac.shape[0]
     n = ac[0].sum()
 
-<<<<<<< HEAD
-    # (n-1)th harmonic number
-=======
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     a1 = _harmonic_sums(n)[0]
 
     # calculate absolute value
     theta_hat_w_abs = S / a1
 
     # calculate value per base
-<<<<<<< HEAD
-    n_bases = positions[-1] - positions[0] + 1
-    theta_hat_w = theta_hat_w_abs / n_bases
-
-    return theta_hat_w
-
-
-@njit
-=======
     if positions.size < 2:
         # not enough positions to estimate per-base value meaningfully
         return theta_hat_w_abs, np.nan
@@ -11329,7 +6198,6 @@ def theta_watterson(ac, positions):
 
 
 @njit(cache=True)
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 def sfs_nb(dac, n):
     """
     Site-frequency spectrum (SFS) from derived-allele counts.
@@ -11364,11 +6232,7 @@ def sfs_nb(dac, n):
     return s
 
 
-<<<<<<< HEAD
-@njit
-=======
 @njit(cache=True)
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 def theta_pi(ac):
     """
     Per-site nucleotide diversity (π) from allele counts.
@@ -11397,11 +6261,7 @@ def theta_pi(ac):
     return pi
 
 
-<<<<<<< HEAD
-@njit
-=======
 @njit(cache=True)
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 def tajima_d(ac, min_sites=3):
     """
     Tajima’s D from allele counts.
@@ -11459,28 +6319,6 @@ def tajima_d(ac, min_sites=3):
     return D
 
 
-<<<<<<< HEAD
-@njit(float64(int64[:]), cache=True)
-def achaz_y(fs):
-    """
-    Achaz’s Y neutrality test (standardized).
-
-    Input ``fs`` is a site-frequency spectrum array of length ``n+1`` for a
-    sample size ``n`` (with bins 0..n). The statistic downweights polarization
-    errors by using the **folded** spectrum and emphasizes deviations in the
-    abundance of very rare variants.
-
-    :param numpy.ndarray fs:
-        Folded site-frequency spectrum of length ``n+1`` (``int64``).
-    :returns:
-        Standardized Achaz’s Y as a float; returns ``nan`` if ``n < 3`` or
-        if there are no segregating sites (after folding exclusions).
-    :rtype: float
-    """
-    n = fs.shape[0] - 1
-    if n < 3:
-        return np.nan
-=======
 @njit(cache=True)
 def achaz_y(ac):
     """
@@ -11504,7 +6342,6 @@ def achaz_y(ac):
     if n < 3:
         return np.nan
     fs = sfs_nb(ac[:, 1], n)
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     a1, a2 = _harmonic_sums(n)
     a1m1 = a1 - 1.0
     ff = (n - 2.0) / (n * a1m1)
@@ -11519,30 +6356,18 @@ def achaz_y(ac):
             a1 * (4.0 * (n + 1.0) * inv_n1 * inv_n1)
             - 2.0 * (n + 1.0) * (n + 2.0) * inv_n * inv_n1
         )
-<<<<<<< HEAD
-        - a1 * 8.0 * (n - 1.0) * inv_n * inv_n1 * inv_n1
-        + (2.0 * n2 + 60.0 * n + 12.0) * (inv_n * inv_n) * (1.0 / 3.0) * inv_n1
-=======
         - a1 * 8.0 * (n + 1.0) * inv_n * inv_n1 * inv_n1
         + (n * n2 + n2 + 60.0 * n + 12.0) * (inv_n * inv_n) * (1.0 / 3.0) * inv_n1
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     )
     beta = (
         ff * ff * (a2 + a1 * (4.0 * inv_n1 * inv_n2) - 4.0 * inv_n2)
         + ff
         * (
             -a1 * (4.0 * (n + 2.0) * inv_n * inv_n1 * inv_n2)
-<<<<<<< HEAD
-            - ((n2 - 3.0 * n2 - 16.0 * n + 20.0) * inv_n * inv_n1 * inv_n2)
-        )
-        + a1 * (8.0 * inv_n * inv_n1 * inv_n2)
-        + (2.0 * (n2 * n2 - n2 * n - 17.0 * n2 - 42.0 * n + 72.0))
-=======
             - ((n * n2 - 3.0 * n2 - 16.0 * n + 20.0) * inv_n * inv_n1 * inv_n2)
         )
         + a1 * (8.0 * inv_n * inv_n1 * inv_n2)
         + (2.0 * (2.0 * n2 * n2 - n2 * n - 17.0 * n2 - 42.0 * n + 72.0))
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
         * (inv_n * inv_n)
         * (inv_n1 * inv_n2)
         * (1.0 / 9.0)
@@ -11568,13 +6393,6 @@ def achaz_y(ac):
     return (pi_hat - ff * S) / np.sqrt(alpha * that + beta * that_sq)
 
 
-<<<<<<< HEAD
-@njit
-def fay_wu_h_norm(ac, positions=None):
-    """
-    Fay & Wu’s H and its normalized form (single-population, infinite sites).
-
-=======
 @njit(cache=True)
 def achaz_y_star(ac):
     """
@@ -11757,7 +6575,6 @@ def fay_wu_h_norm(ac, positions=None):
     """
     Fay & Wu’s H and its normalized form (single-population, infinite sites).
 
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     Computes:
       - ``theta_h``: estimator that upweights high-frequency derived alleles.
       - ``h = pi - theta_h`` (Fay & Wu’s H).
@@ -11809,11 +6626,7 @@ def fay_wu_h_norm(ac, positions=None):
     return theta_h, h, h / np.sqrt(var1 + var2)
 
 
-<<<<<<< HEAD
-@njit
-=======
 @njit(cache=True)
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 def zeng_e(ac):
     """
     Zeng’s E statistic (single-population, infinite sites), standardized.
@@ -11855,11 +6668,7 @@ def zeng_e(ac):
     return (tl - theta_w) / np.sqrt(var1 + var2)
 
 
-<<<<<<< HEAD
-@njit
-=======
 @njit(cache=True)
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 def fuli_f_star(ac):
     """
     Fu and Li’s F* (starred) statistic (no outgroup required).
@@ -11889,11 +6698,7 @@ def fuli_f_star(ac):
         aj = ac[j, 1]
         pi += 2.0 * aj * (n - aj) / denom_pairs
 
-<<<<<<< HEAD
-    ss = (ac[:, 1] == 1).sum()
-=======
     ss = ((ac[:, 1] == 1) | (ac[:, 1] == n - 1)).sum()
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
     vfs = (
         (
@@ -11918,11 +6723,7 @@ def fuli_f_star(ac):
     return num / den
 
 
-<<<<<<< HEAD
-@njit
-=======
 @njit(cache=True)
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 def fuli_f(ac):
     """
     Fu and Li’s F statistic (polarized).
@@ -11969,11 +6770,7 @@ def fuli_f(ac):
     return F
 
 
-<<<<<<< HEAD
-@njit
-=======
 @njit(cache=True)
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 def fuli_d_star(ac):
     """
     Fu and Li’s D* (starred) statistic (no outgroup required).
@@ -12010,20 +6807,12 @@ def fuli_d_star(ac):
     ) / (an**2 + bn)
     uds = ((n / (n - 1.0)) * (an - n / (n - 1.0))) - vds
 
-<<<<<<< HEAD
-    ss = (ac[:, 1] == 1).sum()
-=======
     ss = ((ac[:, 1] == 1) | (ac[:, 1] == n - 1)).sum()
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     Dstar1 = ((n / (n - 1.0)) * S - (an * ss)) / (uds * S + vds * (S**2)) ** 0.5
     return Dstar1
 
 
-<<<<<<< HEAD
-@njit
-=======
 @njit(cache=True)
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 def fuli_d(ac):
     """
     Fu and Li’s D statistic (polarized form).
@@ -12058,13 +6847,6 @@ def fuli_d(ac):
     return D
 
 
-<<<<<<< HEAD
-################## LASSI
-
-
-def get_empir_freqs_np_fast(hap):
-    """
-=======
 @njit(cache=True)
 def neutrality_stats(ac, positions):
     """
@@ -12184,7 +6966,6 @@ def neutrality_stats(ac, positions):
 
 def get_empir_freqs_np_fast(hap):
     """
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     Optimized version to calculate the empirical frequencies of haplotypes.
 
     Parameters:
@@ -12242,13 +7023,7 @@ def process_spectra(k: np.ndarray, h_f: np.ndarray, K_truncation: int, n_ind: in
     return Kcount, Kspect
 
 
-<<<<<<< HEAD
-def LASSI_spectrum_and_Kspectrum(
-    hap_data, K_truncation=10, window=110, step=5
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-=======
 def LASSI_spectrum_and_Kspectrum(input_data, K_truncation=10, window=110, step=5):
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     """
     Compute haplotype count and frequency spectra within sliding windows.
 
@@ -12271,30 +7046,6 @@ def LASSI_spectrum_and_Kspectrum(input_data, K_truncation=10, window=110, step=5
     )
     np.seterr(divide="ignore", invalid="ignore")
 
-<<<<<<< HEAD
-    if isinstance(hap_data, list) or isinstance(hap_data, tuple):
-        hap, rec_map, p = hap_data
-    elif isinstance(hap_data, str):
-        try:
-            hap, rec_map, p = ms_parser(hap_data)
-        except:
-            try:
-                hap, rec_map, p = genome_reader(hap_data, region)
-            except:
-                return None
-    else:
-        return None
-
-    (
-        hap_int,
-        rec_map_01,
-        ac,
-        biallelic_mask,
-        position_masked,
-        genetic_position_masked,
-    ) = filter_gt(hap, rec_map, region=None)
-    freqs = ac[:, 1] / ac.sum(axis=1)
-=======
     if isinstance(input_data, list) or isinstance(input_data, tuple):
         hap_int, position_masked = input_data
     elif isinstance(input_data, str):
@@ -12324,7 +7075,6 @@ def LASSI_spectrum_and_Kspectrum(input_data, K_truncation=10, window=110, step=5
 
     else:
         return None
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
     K_count = []
     K_spectrum = []
@@ -12467,11 +7217,7 @@ def sweep_likelihood(
     return output
 
 
-<<<<<<< HEAD
-@njit
-=======
 @njit(cache=True)
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 def compute_epsilon_values(K_truncation, K_neutral_last):
     epsilon_min = 1 / (K_truncation * 100)
     values = []
@@ -12482,13 +7228,8 @@ def compute_epsilon_values(K_truncation, K_neutral_last):
     return np.array(values)
 
 
-<<<<<<< HEAD
-@njit
-def T_m_statistic_core(K_counts, K_neutral, windows, K_truncation, sweep_mode=5):
-=======
 @njit(cache=True)
 def T_m_statistic_core(K_counts, K_neutral, windows, K_truncation, sweep_mode=4):
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     num_windows = len(windows)
     m_vals = K_truncation + 1
     epsilon_values = compute_epsilon_values(K_truncation, K_neutral[-1])
@@ -12511,11 +7252,7 @@ def T_m_statistic_core(K_counts, K_neutral, windows, K_truncation, sweep_mode=4)
         for e in epsilon_values:
             for m in range(1, m_vals):
                 alt_like = sweep_likelihood(
-<<<<<<< HEAD
-                    K_neutral, K_iter, K_truncation, m, e, K_neutral[-1]
-=======
                     K_neutral, K_iter, K_truncation, m, e, K_neutral[-1], sweep_mode
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
                 )
                 likelihood_diff = 2 * (alt_like - null_likelihood)
                 if likelihood_diff > best_likelihood:
@@ -12524,49 +7261,28 @@ def T_m_statistic_core(K_counts, K_neutral, windows, K_truncation, sweep_mode=4)
                     best_e = e
 
         # Build the output row
-<<<<<<< HEAD
-        output[j, 0] = best_likelihood
-        output[j, 1] = best_m
-        output[j, 2] = best_e
-        output[j, 3] = K_neutral[-1]
-        output[j, 4] = sweep_mode
-        output[j, 5] = w
-=======
         output[j, 0] = w
         output[j, 1] = best_likelihood
         output[j, 2] = best_m
         output[j, 3] = best_e
         output[j, 4] = K_neutral[-1]
         output[j, 5] = sweep_mode
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
         output[j, 6:] = K_iter
 
     return output
 
 
 def T_m_statistic_fast(
-<<<<<<< HEAD
-    K_counts, K_neutral, windows, K_truncation, sweep_mode=5, _iter=0
-):
-    t_m = T_m_statistic_core(K_counts, K_neutral, windows, K_truncation, sweep_mode)
-    stats_schema = {
-        "t_statistic": pl.Float64,
-=======
     K_counts, K_neutral, windows, K_truncation, sweep_mode=4, _iter=0
 ):
     t_m = T_m_statistic_core(K_counts, K_neutral, windows, K_truncation, sweep_mode)
     stats_schema = {
         "window_lassi": pl.Int64,
         "T": pl.Float64,
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
         "m": pl.Float64,
         "frequency": pl.Float64,
         "e": pl.Float64,
         "model": pl.Float64,
-<<<<<<< HEAD
-        "window_lassi": pl.Float64,
-=======
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     }
     k_schema = {"Kcounts_" + str(i): pl.Float64 for i in range(1, K_truncation + 1)}
     output = pl.DataFrame(
@@ -12578,15 +7294,6 @@ def T_m_statistic_fast(
 
 def compute_t_m(
     sim_list,
-<<<<<<< HEAD
-    K_truncation=5,
-    w_size=110,
-    step=5,
-    K_neutral=None,
-    # windows=[10000, 25000, 50000, 100000, 200000],
-    windows=[50000, 100000, 200000, 500000, 1000000],
-    center=[5e5, 7e5],
-=======
     K_truncation=10,
     w_size=201,
     w_step=10,
@@ -12595,7 +7302,6 @@ def compute_t_m(
     center=[5e4, 1.2e6 - 5e4],
     windows=[100000],
     step=int(1e5),
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     nthreads=1,
     params=None,
     parallel_manager=None,
@@ -12636,13 +7342,6 @@ def compute_t_m(
             m is the estimated number of sweeping haplotypes (1 = hard; >1 = soft),
             upper-bounded by ``K_truncation``.
     """
-<<<<<<< HEAD
-    if parallel_manager is None:
-        parallel_manager = Parallel(n_jobs=nthreads, verbose=2)
-
-    hfs_stats = parallel_manager(
-        delayed(LASSI_spectrum_and_Kspectrum)(hap_data, K_truncation, w_size, step)
-=======
     from . import Parallel, delayed
 
     if parallel_manager is None:
@@ -12650,7 +7349,6 @@ def compute_t_m(
 
     hfs_stats = parallel_manager(
         delayed(LASSI_spectrum_and_Kspectrum)(hap_data, K_truncation, w_size, w_step)
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
         for _index, (hap_data) in enumerate(sim_list[:], 1)
     )
 
@@ -12661,70 +7359,17 @@ def compute_t_m(
 
     t_m = parallel_manager(
         delayed(T_m_statistic_fast)(
-<<<<<<< HEAD
-            kc, K_neutral, windows_lassi[_iter - 1], K_truncation, _iter=_iter
-=======
             kc,
             K_neutral,
             windows_lassi[_iter - 1],
             K_truncation,
             sweep_mode=sweep_mode,
             _iter=_iter,
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
         )
         for _iter, (kc) in enumerate(K_counts, 1)
     )
 
     t_m_cut = parallel_manager(
-<<<<<<< HEAD
-        delayed(cut_t_m_argmax)(t, windows=windows, center=center, _iter=_iter)
-        for _iter, t in enumerate(t_m, 1)
-    )
-
-    t_m_cut = pl.concat(t_m_cut)
-    t_m_cut = t_m_cut.select(
-        [
-            "iter",
-            "window",
-            "center",
-            *[
-                col
-                for col in t_m_cut.columns
-                if col not in ("iter", "window", "center")
-            ],
-        ]
-    )
-    if params is not None:
-        t_m_cut = pivot_feature_vectors(
-            pl.concat(
-                [
-                    pl.DataFrame(
-                        np.repeat(
-                            params,
-                            t_m_cut.select(["center", "window"]).unique().shape[0],
-                            axis=0,
-                        ),
-                        schema=["s", "t", "f_i", "f_t"],
-                    ),
-                    t_m_cut,
-                ],
-                how="horizontal",
-            )
-        )
-
-    return t_m_cut, K_neutral
-
-
-def cut_t_m(df_t_m, windows=[10000, 25000, 50000, 100000, 200000], center=6e5):
-    out = []
-    for w in windows:
-        # for w in [1000000]:
-        lower = center - w / 2
-        upper = center + w / 2
-
-        df_t_m_subset = df_t_m[
-            (df_t_m.iloc[:, 5] > lower) & (df_t_m.iloc[:, 5] < upper)
-=======
         delayed(cut_t_m_argmax)(
             t, windows=windows, center=center, step=step, _iter=_iter
         )
@@ -12742,7 +7387,6 @@ def cut_t_m(df_t_m, windows=[10000, 25000, 50000, 100000, 200000], center=6e5):
                 for col in t_m_cut.columns
                 if col not in ("iter", "window", "center")
             ],
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
         ]
     )
     if params is not None:
@@ -12768,27 +7412,15 @@ def cut_t_m(df_t_m, windows=[10000, 25000, 50000, 100000, 200000], center=6e5):
 
 def cut_t_m_argmax(
     df_t_m,
-<<<<<<< HEAD
-    windows=[50000, 100000, 200000, 500000, 1000000],
-    # windows=[10000, 25000, 50000, 100000, 200000],
-    center=[5e5, 7e5],
-    step=1e4,
-    _iter=0,
-=======
     center=[5e4, 1.2e6 - 5e4],
     windows=[100000],
     step=1e5,
     _iter=1,
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 ):
     K_names_c = df_t_m.select("^Kcounts_.*$").schema
     t_schema = OrderedDict(
         {
-<<<<<<< HEAD
-            "t_statistic": pl.Float64,
-=======
             "T": pl.Float64,
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
             "m": pl.Float64,
             **K_names_c,
             "iter": pl.Int64,
@@ -12804,19 +7436,12 @@ def cut_t_m_argmax(
         lower = c - w / 2
         upper = c + w / 2
 
-<<<<<<< HEAD
-        df_t_m_subset = df_t_m.filter((df_t_m[:, 5] > lower) & (df_t_m[:, 5] < upper))
-
-        try:
-            max_t = df_t_m_subset["t_statistic"].arg_max()
-=======
         df_t_m_subset = df_t_m.filter(
             (pl.col("window_lassi") > lower) & (pl.col("window_lassi") < upper)
         )
 
         try:
             max_t = df_t_m_subset["T"].arg_max()
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
             # df_t_m_subset = df_t_m_subset[df_t_m_subset.m > 0]
             # max_t = df_t_m_subset[df_t_m_subset.m > 0].m.argmin()
@@ -12829,11 +7454,7 @@ def cut_t_m_argmax(
                 pl.lit(c).cast(pl.Int64).alias("center"),
             )
             out.append(df_t_m_subset)
-<<<<<<< HEAD
-        except:
-=======
         except Exception:
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
             tmp = pl.DataFrame(
                 {
                     col: [
@@ -12856,362 +7477,6 @@ def cut_t_m_argmax(
     return out
 
 
-<<<<<<< HEAD
-def open_pickle(f):
-    with open(f, "rb") as handle:
-        return pickle.load(handle)
-
-
-def save_pickle(f, data):
-    with open(f, "wb") as handle:
-        pickle.dump(data, handle)
-
-
-##########
-
-
-@njit
-def compute_mu_var(start_idx, end_idx, snp_positions, D_ln, W_sz):
-    l_start = snp_positions[start_idx]
-    l_end = snp_positions[end_idx - 1]
-    return ((l_end - l_start) / (D_ln * W_sz)) * snp_positions.shape[0]
-
-
-@njit
-def compute_mu_sfs(window, n, theta_W):
-    if window.shape[0] == 0:
-        return np.nan
-    derived_counts = np.sum(window, axis=1)
-    edge_mask = (derived_counts == 1) | (derived_counts == n - 1)
-    n_edges = np.sum(edge_mask)
-    W_sz = window.shape[0]
-    return (n_edges / W_sz) * theta_W
-
-
-@njit
-def compute_mu_ld(start_idx: int, end_idx: int, r2: np.ndarray) -> float:
-    """
-    Numba‐accelerated version of mu_ld_from_r2matrix_lr.
-    Operates entirely via loops over the relevant sub‐blocks.
-    """
-    length = end_idx - start_idx
-    mid = length // 2
-    L = mid
-    R = length - mid
-    base = start_idx
-
-    # 1) within‐left block
-    if L > 1:
-        sumL = 0.0
-        # sum strictly upper‐triangle
-        for i in range(L):
-            row_i = base + i
-            for j in range(i + 1, L):
-                col_j = base + j
-                sumL += r2[row_i, col_j]
-        mean_ld_left = 2.0 * sumL / (L * (L - 1))
-    else:
-        mean_ld_left = 0.0
-
-    # 2) within‐right block
-    if R > 1:
-        sumR = 0.0
-        for i in range(R):
-            row_i = base + mid + i
-            for j in range(i + 1, R):
-                col_j = base + mid + j
-                sumR += r2[row_i, col_j]
-        mean_ld_right = 2.0 * sumR / (R * (R - 1))
-    else:
-        mean_ld_right = 0.0
-
-    # 3) cross‐block
-    if L > 0 and R > 0:
-        sumC = 0.0
-        for i in range(L):
-            row_i = base + i
-            for j in range(R):
-                col_j = base + mid + j
-                sumC += r2[row_i, col_j]
-        mean_ld_cross = sumC / (L * R)
-    else:
-        mean_ld_cross = 1e-6
-
-    # 4) final ratio, guarding zero‐division
-    num = 0.5 * (mean_ld_left + mean_ld_right)
-    den = mean_ld_cross if mean_ld_cross > 0.0 else 1e-6
-    return num / den
-
-
-def mu_stat(hap, snp_positions, r2_matrix, window_size=50):
-    """
-    Compute RAiSD composite sweep score :math:`\\mu` over overlapping SNP windows.
-
-    For each sliding window of ``window_size`` consecutive SNPs (step = 1 SNP),
-    this routine evaluates three components and their product:
-
-    * **mu_var** – reduction-of-variation component (computed by
-      :func:`compute_mu_var`), scaled by the region length.
-    * **mu_sfs** – site-frequency-spectrum skew component (from
-      :func:`compute_mu_sfs`), standardized using Watterson’s harmonic correction
-      (``_harmonic_sums(n)[0]``).
-    * **mu_ld** – linkage-disequilibrium contrast component (from
-      :func:`compute_mu_ld`) using the supplied :math:`r^2` matrix.
-    * **mu_total** – composite statistic ``mu_var * mu_sfs * mu_ld``.
-
-    The window center coordinate is recorded as the midpoint between the first
-    and last SNP positions in the window. Results are returned as a Polars
-    DataFrame with one row per window.
-
-    :param numpy.ndarray hap: Haplotype matrix of shape ``(S, n)`` with 0/1 alleles
-        (rows = SNPs, columns = haplotypes or chromosomes).
-    :param numpy.ndarray snp_positions: Monotonically increasing physical positions
-        of length ``S`` (aligned to rows of ``hap``).
-    :param numpy.ndarray r2_matrix: Pairwise LD matrix :math:`r^2` of shape ``(S, S)``.
-        Must index compatibly with SNP order in ``hap`` / ``snp_positions``.
-        (A symmetric full matrix is expected; using an upper-triangular fill is fine
-        if :func:`compute_mu_ld` only reads ``i < j``.)
-    :param int window_size: SNP window size; defaults to ``50`` (RAiSD’s ``-w`` default).
-
-    :returns: A Polars DataFrame with columns
-        * ``positions`` (int): window center (bp, midpoint of first/last SNP in window)
-        * ``mu_var`` (float): variation component
-        * ``mu_sfs`` (float): SFS component
-        * ``mu_ld`` (float): LD component
-        * ``mu_total`` (float): composite score ``mu_var * mu_sfs * mu_ld``
-    :rtype: polars.DataFrame
-
-    :notes:
-        * The genome/region span used for scaling the variation component is
-          ``D_ln = (snp_positions[-1] + 1) - snp_positions[0]``.
-        * Windows advance by one SNP (maximally overlapping). For ``S`` SNPs and
-          window size ``W``, the output has ``S - W + 1`` rows.
-        * Inputs must be consistent (same SNP order across ``hap``, ``snp_positions``,
-          and ``r2_matrix``); this function does not validate shapes beyond usage.
-
-    :see also:
-        :func:`compute_mu_var`, :func:`compute_mu_sfs`, :func:`compute_mu_ld`,
-        :func:`compute_r2_matrix_upper`
-    """
-    # full chromosome/region length
-    D_ln = (snp_positions[-1] + 1) - snp_positions[0]
-    S, n = hap.shape
-
-    theta_w_correction = _harmonic_sums(n)[0]
-    # Match RAiSD -w option (default: 50)
-    _window_size = window_size
-
-    _iter_windows = list(range(S - _window_size + 1))
-    mu_var_np = np.zeros(len(_iter_windows))
-    mu_sfs_np = np.zeros(len(_iter_windows))
-    mu_ld_np = np.zeros(len(_iter_windows))
-    mu_total_np = np.zeros(len(_iter_windows))
-    center_np = np.zeros(len(_iter_windows))
-
-    for i in _iter_windows:
-        # Indices for this window
-        start_idx = i
-        end_idx = i + _window_size  # exclusive in Python slicing
-
-        # Window SNP positions (for plotting)
-        center_pos = (snp_positions[start_idx] + snp_positions[end_idx - 1]) / 2
-        window_positions = snp_positions[start_idx:end_idx]
-        window = hap[start_idx:end_idx, :]
-
-        if end_idx <= start_idx or end_idx > hap.shape[0]:
-            mu_var_corr[i] = np.nan
-            mu_sfs_corr[i] = np.nan
-            mu_ld_corr[i] = np.nan
-            mu_total_corr[i] = np.nan
-            continue
-
-        window = hap[start_idx:end_idx]
-        mu_var = compute_mu_var(
-            start_idx, end_idx, snp_positions, D_ln, end_idx - start_idx
-        )
-        mu_sfs = compute_mu_sfs(window, n, theta_w_correction)
-        mu_ld = compute_mu_ld(start_idx, end_idx, r2_matrix)
-        mu_total = mu_var * mu_sfs * mu_ld
-
-        mu_var_np[i] = mu_var
-        mu_sfs_np[i] = mu_sfs
-        mu_ld_np[i] = mu_ld
-        mu_total_np[i] = mu_total
-        center_np[i] = center_pos
-
-    df_mu = pl.DataFrame(
-        {
-            "positions": center_np.astype(int),
-            "mu_var": mu_var_np,
-            "mu_sfs": mu_sfs_np,
-            "mu_ld": mu_ld_np,
-            "mu_total": mu_total_np,
-        }
-    )
-
-    # return mu_var_np,mu_sfs_np,mu_ld_np,mu_total_np
-    return df_mu
-
-
-################## Sorting
-
-
-@njit(parallel=False)
-def corr_sorting(matrix):
-    samples, sites = matrix.shape
-
-    # Step 1: Compute PCC matrix between rows
-    PCC = np.zeros((samples, samples), dtype=np.float64)
-    sum_pcc = np.zeros(samples, dtype=np.float64)
-    P_A = np.zeros(samples, dtype=np.int32)
-
-    for i in range(samples):
-        for k in range(sites):
-            P_A[i] += matrix[i, k]
-
-    for i in range(samples):
-        for k in range(samples):
-            if i == k:
-                PCC[i, k] = 1.000001
-            else:
-                P_AB = 0
-                for m in range(sites):
-                    if matrix[i, m] == 1 and matrix[k, m] == 1:
-                        P_AB += 1
-                num = (P_AB / sites - (P_A[i] / sites) * (P_A[k] / sites)) ** 2
-                den = (
-                    (P_A[i] / sites)
-                    * (1 - P_A[i] / sites)
-                    * (P_A[k] / sites)
-                    * (1 - P_A[k] / sites)
-                )
-                PCC[i, k] = num / den if den != 0 else 0.0
-    for i in range(samples):
-        for k in range(samples):
-            sum_pcc[i] += PCC[i, k]
-
-    # Step 2: Find max PCC sum index
-    max_idx = 0
-    for i in range(1, samples):
-        if sum_pcc[i] > sum_pcc[max_idx]:
-            max_idx = i
-
-    # Step 3: Sort rows based on PCC[max_idx] in descending order
-    indices = np.arange(samples)
-    for m in range(samples):
-        for n in range(m + 1, samples):
-            if PCC[max_idx, indices[m]] < PCC[max_idx, indices[n]]:
-                indices[m], indices[n] = indices[n], indices[m]
-
-    # Step 4: Reorder matrix
-    sorted_matrix = np.empty_like(matrix)
-    for i in range(samples):
-        for j in range(sites):
-            sorted_matrix[i, j] = matrix[indices[i], j]
-
-    return sorted_matrix
-
-
-@njit
-def daf_sorting(matrix):
-    samples, sites = matrix.shape
-    count = np.zeros(sites, dtype=int64)
-
-    # Count number of 1s per column (DAF)
-    for m in range(sites):
-        for n in range(samples):
-            if matrix[n, m] == 1:
-                count[m] += 1
-
-    # Bubble sort columns by descending count
-    for m in range(sites):
-        for n in range(m + 1, sites):
-            if count[m] < count[n]:
-                # Swap columns m and n
-                for k in range(samples):
-                    tmp = matrix[k, m]
-                    matrix[k, m] = matrix[k, n]
-                    matrix[k, n] = tmp
-                tmpc = count[m]
-                count[m] = count[n]
-                count[n] = tmpc
-
-    return matrix
-
-
-@njit
-def freq_sorting(matrix):
-    samples, sites = matrix.shape
-    weights = np.zeros(samples, dtype=np.int32)
-
-    # Step 1: Count the number of 1s (Hamming weight) per row
-    for i in range(samples):
-        for j in range(sites):
-            if matrix[i, j] == 1:
-                weights[i] += 1
-
-    # Step 2: Bubble sort rows by descending Hamming weight
-    for i in range(samples - 1):
-        for j in range(i + 1, samples):
-            if weights[i] < weights[j]:
-                # Swap weights
-                tmp_w = weights[i]
-                weights[i] = weights[j]
-                weights[j] = tmp_w
-
-                # Swap rows in matrix
-                for k in range(sites):
-                    tmp = matrix[i, k]
-                    matrix[i, k] = matrix[j, k]
-                    matrix[j, k] = tmp
-
-    return matrix
-
-
-@njit
-def pcc_column_sort_numba(matrix):
-    n, m = matrix.shape
-    PCC_matrix = np.zeros((m, m), dtype=np.float64)
-    scores = np.zeros(m, dtype=np.float64)
-
-    # Step 1: Compute PCC_matrix between columns
-    for i in range(m):
-        for j in range(m):
-            if i == j:
-                PCC_matrix[i, j] = 1.000001
-            else:
-                PA_i = 0
-                PA_j = 0
-                PAB = 0
-                for k in range(n):
-                    PA_i += matrix[k, i]
-                    PA_j += matrix[k, j]
-                    PAB += matrix[k, i] * matrix[k, j]
-
-                num = (PAB / n - (PA_i * PA_j) / (n * n)) ** 2
-                den = (PA_i / n) * (1 - PA_i / n) * (PA_j / n) * (1 - PA_j / n)
-                PCC_matrix[i, j] = num / den if den != 0 else 0.0
-    # Step 2: Compute total PCC for each SNP (column)
-    for i in range(m):
-        for j in range(m):
-            scores[i] += PCC_matrix[i, j]
-
-    # Step 3: Bubble sort columns by score (descending)
-    for i in range(m - 1):
-        for j in range(i + 1, m):
-            if scores[i] < scores[j]:
-                # Swap scores
-                tmp_score = scores[i]
-                scores[i] = scores[j]
-                scores[j] = tmp_score
-                # Swap columns i and j in matrix
-                for k in range(n):
-                    tmp = matrix[k, i]
-                    matrix[k, i] = matrix[k, j]
-                    matrix[k, j] = tmp
-
-    return matrix
-=======
 def run_lassi(
     hap_data, K_truncation=10, w_size=201, step=10, K_neutral=None, sweep_mode=4
 ):
@@ -14550,4 +8815,3 @@ def ncd1(position_masked, freqs, tf=0.5, w=3000, minIS=2):
         valid_mask[widx] = True
 
     return results[valid_mask]
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)

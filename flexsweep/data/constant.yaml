@@ -2,8 +2,4 @@ time_units: generations
 demes:
   - name: Equilibrium
     epochs:
-<<<<<<< HEAD
-      - start_size: 10000
-=======
       - start_size: 20000
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)

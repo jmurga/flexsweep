@@ -1,37 +1,12 @@
 [project]
 name = "flexsweep"
-<<<<<<< HEAD
-version = "1.3"
-=======
 version = "1.9"
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 description = ""
 authors = [{ name = "Jesus Murga-Moreno", email = "murgamoreno@gmail.com" }]
 requires-python = ">=3.12,<3.13"
 readme = "README.md"
-<<<<<<< HEAD
-packages = [
-    { include = "flexsweep" },
-]
 
-[tool.poetry.dependencies]
-python = ">=3.12"
-scipy = "^1.14.0"
-scikit-allel = "^1.3.8"
-scikit-learn = "^1.5.1"
-joblib = "^1.4.2"
-threadpoolctl = "^3.5.0"
-click = "^8.1.7"
-numpy = "1.26.4"
-numba = "^0.60.0"
-demes = "^0.2.3"
-tensorflow = {extras = ["and-cuda"], version = "^2.18.0"}
-pyarrow = "^17.0.0"
-matplotlib = "^3.9.2"
-polars = "^1.14.0"
-pybedtools = "^0.12.0"
-tbb = "^2022.1.0"
-=======
+
 license = "MIT"
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -59,7 +34,7 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/jmurga/flexsweep"
 Repository = "https://github.com/jmurga/flexsweep"
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
+
 
 [project.scripts]
 flexsweep = "flexsweep.main:cli"
@@ -69,15 +44,6 @@ module-name = ["flexsweep"]
 module-root = ""
 
 [build-system]
-<<<<<<< HEAD
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
-
-
-[tool.poetry.group.docs.dependencies]
-sphinx = "^8.0"
-sphinx-rtd-theme = "^3.0"
-=======
 requires = ["uv_build>=0.9.28,<0.10.0"]
 build-backend = "uv_build"
 
@@ -86,4 +52,3 @@ dev = [
     "sphinx>=9.1.0",
     "sphinx-rtd-theme>=3.1.0",
 ]
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)

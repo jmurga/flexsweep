@@ -1,25 +1,13 @@
 import gzip
 import os
-<<<<<<< HEAD
-
-from . import pl, np, Parallel, delayed
-=======
 import shutil
 import subprocess
 import tempfile
 import warnings
 from pathlib import Path
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
-
 import demes
 from scipy import stats
 
-<<<<<<< HEAD
-
-# Extract default data and binaries
-DISCOAL = os.path.join(os.path.dirname(__file__), "data", "discoal")
-DECODE_MAP = os.path.join(os.path.dirname(__file__), "data", "decode_sexavg_2019.txt")
-=======
 from . import Parallel, delayed, np, pl
 
 _DISCOAL_BIN_NAME = "discoal"
@@ -103,7 +91,7 @@ DISCOAL = os.path.join(os.path.dirname(__file__), "data", "discoal")
 DECODE_MAP = os.path.join(
     os.path.dirname(__file__), "data", "decode_sexavg_2019.txt.gz"
 )
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
+
 DEMES_EXAMPLES = {
     "constant": os.path.join(os.path.dirname(__file__), "data", "constant.yaml"),
     "yri": os.path.join(
@@ -142,15 +130,10 @@ class Simulator:
         },
         locus_length=int(1.2e6),
         discoal_path=DISCOAL,
-<<<<<<< HEAD
-        num_simulations=int(1.25e4),
-        ne=int(1e4),
-=======
         num_simulations=int(2.5e5),
         saf = [0, 0.1],
         eaf = [0.5, 1],
         s = [0.01, 0.05],
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
         time=[0, 5000],
         nthreads=1,
         ne=int(1e4),
@@ -190,11 +173,6 @@ class Simulator:
         :param int nthreads: Maximum joblib workers. **Default:** ``1``.
         :param float fixed_ratio: Fraction of complete sweeps within hard/soft sets.
             **Default:** ``0.1``.
-<<<<<<< HEAD
-        :param bool split: If ``True``, split jobs into low/high recombination groups.
-            **Default:** ``False``.
-=======
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
         .. note::
            Random number generation is **not seeded** (non-deterministic runs).
@@ -216,17 +194,6 @@ class Simulator:
         self.output_folder = output_folder
         self.discoal_path = str(_ensure_discoal(discoal_path))
         self.nthreads = nthreads
-<<<<<<< HEAD
-        self.num_simulations = num_simulations
-        self.f_t = [0.5, 1]
-        self.f_i = [0, 0.1]
-        self.time = [0, 5000]
-        self.s = [0.005, 0.02]
-        self.fixed_ratio = 0.1
-        self.reset_simulations = False
-        self.demes_data = None
-        self.split = split
-=======
         self.num_simulations = int(num_simulations)
         self.f_i = saf
         self.f_t = eaf
@@ -235,7 +202,6 @@ class Simulator:
         self.fixed_ratio = fixed_ratio
         self.reset_simulations = False
         self.demes_data = None
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
         self.parameters = None
 
     def check_inputs(self):
@@ -249,21 +215,12 @@ class Simulator:
         Returns:
             str: Discoal demographic flags string (e.g., " -en <t> 0 <size> ...").
         """
-<<<<<<< HEAD
-        assert isinstance(
-            self.mutation_rate, dict
-        ), "Please input distribution and mutation rates values"
-        assert isinstance(
-            self.recombination_rate, dict
-        ), "Please input distribution and recombination_rate values"
-=======
         assert isinstance(self.mutation_rate, dict), (
             "Please input distribution and mutation rates values"
         )
         assert isinstance(self.recombination_rate, dict), (
             "Please input distribution and recombination_rate values"
         )
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
         os.makedirs(self.output_folder, exist_ok=True)
         os.makedirs(self.output_folder + "/sweep/", exist_ok=True)
@@ -369,18 +326,6 @@ class Simulator:
                 num,
             )
         elif self.recombination_rate["dist"] == "exponential":
-<<<<<<< HEAD
-            rho = []
-            while len(rho) < num:
-                tmp_rho = np.random.exponential(self.recombination_rate["mean"], num)
-                valid_values = tmp_rho[
-                    (tmp_rho >= self.recombination_rate["min"])
-                    & (tmp_rho <= self.recombination_rate["max"])
-                ]
-                remaining = num - len(rho)
-                rho.extend(valid_values[:remaining])
-            rho = np.array(rho)
-=======
             if len(self.recombination_rate.keys()) == 2:
                 rho =  np.random.exponential(self.recombination_rate["mean"], num)
             else:
@@ -394,7 +339,6 @@ class Simulator:
                     remaining = num - len(rho)
                     rho.extend(valid_values[:remaining])
                 rho = np.array(rho)
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
         elif self.recombination_rate["dist"] == "fixed":
             next
         else:
@@ -424,14 +368,8 @@ class Simulator:
             pl.DataFrame: Parameters with columns
                 ['iter', 'mu', 'r', 'eaf', 'saf', 's', 't', 'model'].
         """
-<<<<<<< HEAD
-        discoal_demes = self.check_inputs()
-=======
+
         _ = self.check_inputs()
-
-
-        scaling = 4 * self.ne * self.locus_length
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
         scaling = 4 * self.ne * self.locus_length
 
@@ -523,11 +461,7 @@ class Simulator:
 
         # Simulating
         df_params = pl.concat([df_neutral, df_sweeps], how="vertical")
-<<<<<<< HEAD
-        df_params.write_csv(self.output_folder + "/params.txt.gz")
-=======
         df_params.write_csv(self.output_folder + "/params.txt.gz", compression="gzip")
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
         self.parameters = df_params
 
@@ -545,11 +479,7 @@ class Simulator:
 
         try:
             df_params = pl.read_csv(self.output_folder + "/params.txt.gz")
-<<<<<<< HEAD
-        except:
-=======
         except FileNotFoundError:
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
             raise FileNotFoundError(
                 f"File not found: {self.output_folder}/params.txt.gz"
             )
@@ -699,8 +629,7 @@ class Simulator:
             output.write(result.stdout)
 
         return output_file
-<<<<<<< HEAD
-=======
+
 
     def simulate_batch(self):
         """
@@ -801,4 +730,3 @@ class Simulator:
                 out.append(res)
 
         return out
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)

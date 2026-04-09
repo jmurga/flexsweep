@@ -60,7 +60,7 @@ from math import ceil
 from allel import nsl
 
 from . import Parallel, delayed, np, pl
-from .fv_v2 import (
+from .fv import (
     Lambda_statistic_fast,
     LASSI_spectrum_and_Kspectrum,
     Ld,

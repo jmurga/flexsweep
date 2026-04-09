@@ -12,12 +12,6 @@ Second version of `Flex-sweep <https://doi.org/10.1093/molbev/msad139>`_, a vers
 .. toctree::
    :maxdepth: 2
    :caption: Contents:
-<<<<<<< HEAD
-   
-   introduction
-   installation
-   basic_usage
-=======
 
    introduction
    installation
@@ -26,7 +20,6 @@ Second version of `Flex-sweep <https://doi.org/10.1093/molbev/msad139>`_, a vers
    prediction
    enrichment
    polarize
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
    advanced_usage
    api
 
@@ -49,7 +42,5 @@ Support
 
 ..
 .. API
-<<<<<<< HEAD
 
-=======
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
+

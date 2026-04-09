@@ -1,7 +1,4 @@
-<<<<<<< HEAD
-API
-===
-=======
+=============
 API Reference
 =============
 
@@ -9,55 +6,15 @@ API Reference
    :local:
    :depth: 2
 
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
-
 Simulation
 ----------
 
-<<<<<<< HEAD
-.. autoclass:: flexsweep.Simulator()
-=======
+
 .. autoclass:: flexsweep.Simulator
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
     :members:
     :undoc-members:
     :show-inheritance:
 
-<<<<<<< HEAD
-Feature vectors
----------------
-
-.. autofunction:: flexsweep.summary_statistics()
-.. autofunction:: flexsweep.fv._process_sims()
-.. autofunction:: flexsweep.fv._process_vcf()
-.. autofunction:: flexsweep.fv.calculate_stats_simplify()
-.. autofunction:: flexsweep.fv.calculate_stats_vcf()
-
-Population genetics statisitcs
-------------------------------
-
-Site Frequency Spectrum (SFS)–based
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. autofunction:: flexsweep.fv.theta_watterson()
-.. autofunction:: flexsweep.fv.sfs_nb()
-.. autofunction:: flexsweep.fv.theta_pi()
-.. autofunction:: flexsweep.fv.tajima_d()
-.. autofunction:: flexsweep.fv.achaz_y()
-.. autofunction:: flexsweep.fv.fay_wu_h_norm()
-.. autofunction:: flexsweep.fv.zeng_e()
-.. autofunction:: flexsweep.fv.fuli_f_star()
-.. autofunction:: flexsweep.fv.fuli_f()
-.. autofunction:: flexsweep.fv.fuli_d_star()
-.. autofunction:: flexsweep.fv.fuli_d()
-
-Derived-background diversity
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. autofunction:: flexsweep.fv.dind_high_low()
-.. autofunction:: flexsweep.fv.s_ratio()
-
-=======
 
 Data I/O
 --------
@@ -71,15 +28,15 @@ Data I/O
 Feature vectors
 ---------------
 
-.. autofunction:: flexsweep.fv_v2.summary_statistics
-.. autofunction:: flexsweep.fv_v2._process_sims
-.. autofunction:: flexsweep.fv_v2._process_vcf
-.. autofunction:: flexsweep.fv_v2.calculate_stats_simulations
-.. autofunction:: flexsweep.fv_v2.calculate_stats_vcf_flat
-.. autofunction:: flexsweep.fv_v2.normalize_neutral
-.. autofunction:: flexsweep.fv_v2.normalize_stats
-.. autofunction:: flexsweep.fv_v2.normalize_cut_raw
-.. autofunction:: flexsweep.fv_v2.resolve_stats
+.. autofunction:: flexsweep.fv.summary_statistics
+.. autofunction:: flexsweep.fv._process_sims
+.. autofunction:: flexsweep.fv._process_vcf
+.. autofunction:: flexsweep.fv.calculate_stats_simulations
+.. autofunction:: flexsweep.fv.calculate_stats_vcf_flat
+.. autofunction:: flexsweep.fv.normalize_neutral
+.. autofunction:: flexsweep.fv.normalize_stats
+.. autofunction:: flexsweep.fv.normalize_cut_raw
+.. autofunction:: flexsweep.fv.resolve_stats
 
 
 Outlier scan
@@ -159,121 +116,64 @@ pipeline and the scan module. They can also be called directly on numpy arrays.
 Site Frequency Spectrum (SFS)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. autofunction:: flexsweep.fv_v2.neutrality_stats
-.. autofunction:: flexsweep.fv_v2.theta_watterson
-.. autofunction:: flexsweep.fv_v2.sfs_nb
-.. autofunction:: flexsweep.fv_v2.theta_pi
-.. autofunction:: flexsweep.fv_v2.tajima_d
-.. autofunction:: flexsweep.fv_v2.achaz_y
-.. autofunction:: flexsweep.fv_v2.achaz_y_star
-.. autofunction:: flexsweep.fv_v2.achaz_t
-.. autofunction:: flexsweep.fv_v2.fay_wu_h_norm
-.. autofunction:: flexsweep.fv_v2.zeng_e
-.. autofunction:: flexsweep.fv_v2.fuli_f_star
-.. autofunction:: flexsweep.fv_v2.fuli_f
-.. autofunction:: flexsweep.fv_v2.fuli_d_star
-.. autofunction:: flexsweep.fv_v2.fuli_d
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
+.. autofunction:: flexsweep.fv.neutrality_stats
+.. autofunction:: flexsweep.fv.theta_watterson
+.. autofunction:: flexsweep.fv.sfs_nb
+.. autofunction:: flexsweep.fv.theta_pi
+.. autofunction:: flexsweep.fv.tajima_d
+.. autofunction:: flexsweep.fv.achaz_y
+.. autofunction:: flexsweep.fv.achaz_y_star
+.. autofunction:: flexsweep.fv.achaz_t
+.. autofunction:: flexsweep.fv.fay_wu_h_norm
+.. autofunction:: flexsweep.fv.zeng_e
+.. autofunction:: flexsweep.fv.fuli_f_star
+.. autofunction:: flexsweep.fv.fuli_f
+.. autofunction:: flexsweep.fv.fuli_d_star
+.. autofunction:: flexsweep.fv.fuli_d
+
 
 Haplotype-based
 ~~~~~~~~~~~~~~~
-
-<<<<<<< HEAD
-.. autofunction:: flexsweep.fv.ihs_ihh()
-.. autofunction:: flexsweep.fv.nsl()
-.. autofunction:: flexsweep.fv.haf_top()
-.. autofunction:: flexsweep.fv.run_isafe()
-.. autofunction:: flexsweep.fv.garud_h_numba()
-.. autofunction:: flexsweep.fv.h12_enard()
-.. autofunction:: flexsweep.fv.hapdaf_o()
-.. autofunction:: flexsweep.fv.hapdaf_s()
-
-
-LD
-~~
-
-.. autofunction:: flexsweep.fv.Ld()
-.. autofunction:: flexsweep.fv.r2()
-.. autofunction:: flexsweep.fv.compute_r2_matrix_upper()
-.. autofunction:: flexsweep.fv.omega_linear_correct()
-
-
-Composite methods
-~~~~~~~~~~~~~~~~~
-
-.. autofunction:: flexsweep.fv.compute_t_m()
-.. autofunction:: flexsweep.fv.mu_stat()
-=======
-.. autofunction:: flexsweep.fv_v2.ihs_ihh
-.. autofunction:: flexsweep.fv_v2.haf_top
-.. autofunction:: flexsweep.fv_v2.garud_h
-.. autofunction:: flexsweep.fv_v2.h12_enard
-.. autofunction:: flexsweep.fv_v2.hscan
-.. autofunction:: flexsweep.fv_v2.run_isafe
-.. autofunction:: flexsweep.fv_v2.isafe
+.. autofunction:: flexsweep.fv.ihs_ihh
+.. autofunction:: flexsweep.fv.haf_top
+.. autofunction:: flexsweep.fv.garud_h
+.. autofunction:: flexsweep.fv.h12_enard
+.. autofunction:: flexsweep.fv.hscan
+.. autofunction:: flexsweep.fv.run_isafe
+.. autofunction:: flexsweep.fv.isafe
 
 Derived-background diversity
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. autofunction:: flexsweep.fv_v2.dind_high_low
-.. autofunction:: flexsweep.fv_v2.s_ratio
-.. autofunction:: flexsweep.fv_v2.hapdaf_o
-.. autofunction:: flexsweep.fv_v2.hapdaf_s
-.. autofunction:: flexsweep.fv_v2.fast_sq_freq_pairs
-.. autofunction:: flexsweep.fv_v2.dind_high_low_from_pairs
-.. autofunction:: flexsweep.fv_v2.s_ratio_from_pairs
-.. autofunction:: flexsweep.fv_v2.hapdaf_from_pairs
+.. autofunction:: flexsweep.fv.dind_high_low
+.. autofunction:: flexsweep.fv.s_ratio
+.. autofunction:: flexsweep.fv.hapdaf_o
+.. autofunction:: flexsweep.fv.hapdaf_s
+.. autofunction:: flexsweep.fv.fast_sq_freq_pairs
+.. autofunction:: flexsweep.fv.dind_high_low_from_pairs
+.. autofunction:: flexsweep.fv.s_ratio_from_pairs
+.. autofunction:: flexsweep.fv.hapdaf_from_pairs
 
 Linkage disequilibrium
 ~~~~~~~~~~~~~~~~~~~~~~~
 
-.. autofunction:: flexsweep.fv_v2.Ld
-.. autofunction:: flexsweep.fv_v2.r2
-.. autofunction:: flexsweep.fv_v2.compute_r2_matrix_upper
-.. autofunction:: flexsweep.fv_v2.omega_linear_correct
+.. autofunction:: flexsweep.fv.Ld
+.. autofunction:: flexsweep.fv.r2
+.. autofunction:: flexsweep.fv.compute_r2_matrix_upper
+.. autofunction:: flexsweep.fv.omega_linear_correct
 
 Composite sweep statistics
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-.. autofunction:: flexsweep.fv_v2.LASSI_spectrum_and_Kspectrum
-.. autofunction:: flexsweep.fv_v2.T_m_statistic_fast
-.. autofunction:: flexsweep.fv_v2.compute_t_m
-.. autofunction:: flexsweep.fv_v2.Lambda_statistic_fast
-.. autofunction:: flexsweep.fv_v2.run_lassip
-.. autofunction:: flexsweep.fv_v2.mu_stat
-.. autofunction:: flexsweep.fv_v2.run_raisd
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
+.. autofunction:: flexsweep.fv.LASSI_spectrum_and_Kspectrum
+.. autofunction:: flexsweep.fv.T_m_statistic_fast
+.. autofunction:: flexsweep.fv.compute_t_m
+.. autofunction:: flexsweep.fv.Lambda_statistic_fast
+.. autofunction:: flexsweep.fv.run_lassip
+.. autofunction:: flexsweep.fv.mu_stat
+.. autofunction:: flexsweep.fv.run_raisd
 
 Balancing selection
 ~~~~~~~~~~~~~~~~~~~
-
-<<<<<<< HEAD
-.. autofunction:: flexsweep.balancing.ncd1()
-.. autofunction:: flexsweep.balancing.run_beta_window()
-
-
-Convolutional Neural Network
-----------------------------
-
-.. autoclass:: flexsweep.CNN()
-    :members:
-    :undoc-members:
-    :show-inheritance:
-
-.. autoclass:: flexsweep.cnn.DAParquetSequence()
-    :members:
-    :undoc-members:
-    :show-inheritance:
-
-.. autofunction:: flexsweep.cnn.rank_probabilities()
-
-
-
-
-
-
-
-=======
-.. autofunction:: flexsweep.fv_v2.ncd1
-.. autofunction:: flexsweep.fv_v2.run_beta_window
->>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
+.. autofunction:: flexsweep.fv.ncd1
+.. autofunction:: flexsweep.fv.run_beta_window
