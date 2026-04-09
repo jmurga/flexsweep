@@ -9,8 +9,8 @@ build:
       # Install uv
       - curl -LsSf https://astral.sh/uv/install.sh | sh
     post_install:
-      - /home/docs/.cargo/bin/uv sync --frozen --group docs
-      - /home/docs/.cargo/bin/uv pip install -e .
+      - /home/docs/.local/bin/uv pip install .[docs]
+
 sphinx:
   configuration: docs/conf.py
 
