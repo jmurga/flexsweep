@@ -548,7 +548,7 @@ def empirical_pvalues(
     if abs_rank:
         s = s.abs()
     n_valid = int(s.is_not_null().sum() - s.is_nan().sum())
-    # Negate: largest original value → most negative → rank 1 → p = 1/N_valid ≈ 0 (outlier)
+    # Negative: largest original value → most negative → rank 1 → p = 1/N_valid ≈ 0 (outlier)
     p_emp = (-s).fill_nan(None).rank(method="average") / n_valid
     return df.with_columns(p_emp.alias(f"{stat_col}_pvalue"))
 

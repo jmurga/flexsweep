@@ -16,10 +16,6 @@ updated accordingly.
 The polarization engine is implemented in Rust for performance and is invoked
 via a compiled binary (``flexsweep-polarize``).
 
-.. contents:: Contents
-   :local:
-   :depth: 2
-
 
 How it works
 ------------
@@ -78,7 +74,7 @@ Requirements
 
 The polarization binary is implemented in Rust. You need either:
 
-- A **conda-forge installation** — the binary is included automatically.
+- A **bioconda installation** — the binary is included automatically.
 - A **manual build** — requires the Rust toolchain (``rustc`` and ``cargo``).
   Run the following once before using the polarize commands:
 

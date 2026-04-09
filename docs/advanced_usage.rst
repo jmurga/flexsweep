@@ -211,9 +211,9 @@ From simulations:
     df = fs.summary_statistics(
         "./simulations",
         stats=diploshic_stats,
-        locus_length=100000,
-        step=10000,
-        windows=[10000],
+        locus_length=1100000,
+        step=100000,
+        windows=[100000],
         nthreads=8,
     )
 
@@ -225,10 +225,10 @@ From VCF data:
         "./vcf_data",
         vcf=True,
         stats=diploshic_stats,
-        locus_length=100000,
-        step=10000,
-        step_vcf=100000,
-        windows=[10000],
+        locus_length=1100000,
+        step=100000,
+        step_vcf=1000000,
+        windows=[100000],
         nthreads=8,
     )
 
@@ -274,12 +274,12 @@ the simulation and VCF runs so that normalisation bins match.
         nthreads=8,
     )
 
-    # Shorter locus with a finer step
+    # Larger locus with a finer step
     df = fs.summary_statistics(
         "./simulations",
-        locus_length=600000,
+        locus_length=2000000,
         step=50000,
-        windows=[50000, 100000],
+        windows=[100000],
         nthreads=8,
     )
 
@@ -302,17 +302,17 @@ stratification is used.
 
     df = fs.summary_statistics(
         "./simulations",
-        recombination_map="recomb_map.csv",
+        recombination_map="decode_like_map.csv",
         r_bins=[1, 5, 10],
-        min_rate=0.0,
+        min_rate=0.01,
         nthreads=8,
     )
 
-.. note::
+.. .. note::
 
-   ``r_bins`` stratification is not recommended for domain-adaptive (DANN)
-   training — it has been shown to increase domain shift in that context.
-   Use it only with the standard CNN.
+..    ``r_bins`` stratification is not recommended for domain-adaptive (DANN)
+..    training — it has been shown to increase domain shift in that context.
+..    Use it only with the standard CNN.
 
 
 Custom CNN
@@ -434,7 +434,7 @@ Haplotype sorting
 Before feeding a raw haplotype matrix into a custom CNN you may want to
 rearrange rows (haplotypes) or columns (SNPs) so that similar haplotypes are
 placed adjacently — this can improve the spatial patterns a 2D CNN learns.
-All functions below accept a binary ``(samples × sites)`` NumPy array.
+All functions below accept a binary ``(samples × sites)`` NumPy array. Please read for further information `Zhao et al. 2023 <https://doi.org/10.1093/bioinformatics/btad265>`_ and `Tran et al. 2025 <https://doi.org/10.1093/molbev/msaf250>`_ for further information.
 
 .. list-table::
    :header-rows: 1
@@ -473,14 +473,14 @@ The two ``haplotype_freq_sorting`` variants operate on general NumPy arrays.
         daf_sorting, freq_sorting, haplotype_freq_sorting
     )
 
-    # hap: binary (n_haplotypes × n_sites) array from your VCF window
-    hap = np.random.randint(0, 2, (200, 500), dtype=np.int32)
+    # random hap: binary (n_haplotypes × n_sites) array from your VCF window
+    hap = np.random.randint(0, 2, (1000, 216), dtype=np.int32)
 
     # Sort SNPs by DAF, then haplotypes by frequency
     hap_daf = daf_sorting(hap.copy())
     hap_sorted, col_order, groups, freqs = haplotype_freq_sorting(hap_daf)
 
-    # hap_sorted is now ready for a (batch, haplotypes, sites, 1) CNN input
+    # hap_sorted is now ready for a (batch, haplotypes, sites, 1) CNN input as needed
 
 Demography mis-specification
 ----------------------------
@@ -502,6 +502,6 @@ Flex-sweep DA will subset the exact same number of ``source_data`` (labelled sim
         output_folder="yri_vcfs",
     )
 
-    fs_cnn.train_da()
+    fs_cnn.train_da(ramp_epochs=30,max_lambda=1)
     df_prediction = fs_cnn.predict_da()
 

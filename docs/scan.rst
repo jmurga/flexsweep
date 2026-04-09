@@ -25,13 +25,13 @@ empirical outlier approach (Akey 2009):
 
    p_i = \frac{\mathrm{rank}(-x_i)}{N_{\mathrm{valid}}}
 
-where rank is computed on the negated value so that the **largest** statistic
+where rank is computed on the negative value so that the **largest** statistic
 gets the **smallest** p-value (rank 1 → p ≈ 0, outlier). :math:`N_{\mathrm{valid}}`
 is the count of non-NaN loci. NaN values are excluded from the ranking and do
 not contribute to :math:`N_{\mathrm{valid}}`.
 
 For **signed statistics** (iHS, nSL, Tajima's D, Fay-Wu H, Zeng E), ranking
-is done on :math:`|x_i|` before negation, so that extreme values at both tails
+is done on :math:`|x_i|` before convert to negative, so that extreme values at both tails
 are flagged as outliers.
 
 The output column is named ``{stat}_pvalue``. A value close to 0 means the
@@ -116,10 +116,8 @@ One score per polymorphic site. No sliding window.
        2015). Measures the mean shared haplotype block length across all
        sample pairs; detects hard and soft sweeps. Configurable:
        ``max_gap`` (200000), ``dist_mode`` (0), ``hscan_step`` (1).
-
-       .. note::
-          Use ``hscan_step`` (not ``step``) to control scan resolution.
-          ``step`` is a shared SNP-window parameter and is not used by hscan.
+        (Use ``hscan_step`` (not ``step``) to control scan resolution.
+          ``step`` is a shared SNP-window parameter and is not used by hscan)
 
 Sliding SNP-window statistics
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

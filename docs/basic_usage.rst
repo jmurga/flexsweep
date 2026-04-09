@@ -7,7 +7,7 @@ nucleotide diversity. All timing estimates are based on a 24-core AMD Ryzen 9
 PRO 5945 workstation with 64 GB RAM and an NVIDIA RTX 3080.
 
 The full workflow — simulations, feature vector estimation for all 22 YRI
-autosomes, training, and genome-wide prediction — completes in a few hours on
+autosomes, training, and genome-wide prediction — completes in a ~2 hours on
 this configuration.
 
 Command line

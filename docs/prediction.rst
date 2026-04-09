@@ -8,102 +8,6 @@ and gene-level rankings.
 
 All functions are in ``flexsweep.utils``.
 
-.. contents:: Contents
-   :local:
-   :depth: 2
-
-
-Training diagnostics
---------------------
-
-Use these two functions to inspect your feature vectors before or after
-training, particularly to check for domain shift between simulations and
-empirical data.
-
-Feature vector PCA
-~~~~~~~~~~~~~~~~~~
-
-.. code-block:: python
-
-    from flexsweep.utils import plot_fv_pca
-
-    fig = plot_fv_pca(
-        train_data="yri_test/fvs.parquet",
-        empirical_data="yri_vcf/fvs_yri.parquet",
-        subsample=5000,
-        output_path="fv_pca.svg",
-    )
-
-Projects the feature matrix onto its first two principal components, coloured
-by neutral (blue) and sweep (red). Pass ``empirical_data`` to overlay
-empirical windows as a third colour — a large separation between the
-simulation cloud and the empirical cloud indicates domain shift that may
-require DANN training.
-
-.. list-table::
-   :header-rows: 1
-   :widths: 25 12 63
-
-   * - Parameter
-     - Default
-     - Description
-   * - ``train_data``
-     - required
-     - Path to ``fvs*.parquet`` or a Polars DataFrame. Must have a ``model``
-       column (``neutral`` / sweep label).
-   * - ``empirical_data``
-     - ``None``
-     - Path to empirical ``fvs*.parquet`` or DataFrame (no ``model`` column).
-       When provided, plotted as a third distribution.
-   * - ``subsample``
-     - ``5000``
-     - Maximum rows to use (avoids slow PCA on large datasets).
-   * - ``output_path``
-     - ``None``
-     - Save path (SVG). If ``None``, shows interactively.
-
-Statistic distributions
-~~~~~~~~~~~~~~~~~~~~~~~
-
-.. code-block:: python
-
-    from flexsweep.utils import plot_stat_distributions
-
-    fig = plot_stat_distributions(
-        train_data="yri_test/fvs.parquet",
-        empirical_data="yri_vcf/fvs_yri.parquet",
-        stats=["pi", "h12", "ihs", "nsl", "tajima_d"],
-        output_path="stat_distributions.svg",
-    )
-
-Violin plots of each statistic split by neutral, sweep, and (optionally)
-empirical data. This is the primary diagnostic for identifying which
-statistics are shifted between simulations and real data — a stat whose
-empirical distribution is far from both the neutral and sweep simulation
-distributions is a candidate to exclude from DANN training (see ``ihs``
-exclusion in CLAUDE.md for an example).
-
-.. list-table::
-   :header-rows: 1
-   :widths: 25 12 63
-
-   * - Parameter
-     - Default
-     - Description
-   * - ``train_data``
-     - required
-     - Path to ``fvs*.parquet`` or Polars DataFrame with ``model`` column.
-   * - ``empirical_data``
-     - ``None``
-     - Empirical ``fvs*.parquet`` or DataFrame (no ``model`` column).
-   * - ``stats``
-     - all stats
-     - List of statistic base names to plot, e.g.
-       ``["pi", "h12", "ihs"]``. Defaults to the full Flex-sweep stat set.
-   * - ``output_path``
-     - ``None``
-     - Save path (SVG). If ``None``, shows interactively.
-
 
 Prediction visualization
 ------------------------
@@ -305,3 +209,96 @@ must be numeric (``1``–``22``); the function prepends ``chr`` automatically.
      - ``111``
      - Number of nearest prediction windows to consider per gene. Equivalent
        to ``bedtools closest -k k``.
+
+
+
+Training diagnostics
+--------------------
+
+Use these two functions to inspect your feature vectors before or after
+training, particularly to check for domain shift between simulations and
+empirical data.
+
+Feature vector PCA
+~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+    from flexsweep.utils import plot_fv_pca
+
+    fig = plot_fv_pca(
+        train_data="yri_test/fvs.parquet",
+        empirical_data="yri_vcf/fvs_yri.parquet",
+        subsample=5000,
+        output_path="fv_pca.svg",
+    )
+
+Projects the feature matrix onto its first two principal components, coloured
+by neutral (blue) and sweep (red). Pass ``empirical_data`` to overlay
+empirical windows as a third colour — a large separation between the
+simulation cloud and the empirical cloud indicates domain shift that may
+require DANN training.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 12 63
+
+   * - Parameter
+     - Default
+     - Description
+   * - ``train_data``
+     - required
+     - Path to ``fvs*.parquet`` or a Polars DataFrame. Must have a ``model``
+       column (``neutral`` / sweep label).
+   * - ``empirical_data``
+     - ``None``
+     - Path to empirical ``fvs*.parquet`` or DataFrame (no ``model`` column).
+       When provided, plotted as a third distribution.
+   * - ``subsample``
+     - ``5000``
+     - Maximum rows to use (avoids slow PCA on large datasets).
+   * - ``output_path``
+     - ``None``
+     - Save path (SVG). If ``None``, shows interactively.
+
+Statistic distributions
+~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+    from flexsweep.utils import plot_stat_distributions
+
+    fig = plot_stat_distributions(
+        train_data="yri_test/fvs.parquet",
+        empirical_data="yri_vcf/fvs_yri.parquet",
+        stats=["pi", "h12", "ihs", "nsl", "tajima_d"],
+        output_path="stat_distributions.svg",
+    )
+
+Violin plots of each statistic split by neutral, sweep, and (optionally)
+empirical data. This is the primary diagnostic for identifying which
+statistics are shifted between simulations and real data — a stat whose
+empirical distribution is far from both the neutral and sweep simulation
+distributions is a candidate to exclude from DANN training (see ``ihs``
+exclusion in CLAUDE.md for an example).
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 12 63
+
+   * - Parameter
+     - Default
+     - Description
+   * - ``train_data``
+     - required
+     - Path to ``fvs*.parquet`` or Polars DataFrame with ``model`` column.
+   * - ``empirical_data``
+     - ``None``
+     - Empirical ``fvs*.parquet`` or DataFrame (no ``model`` column).
+   * - ``stats``
+     - all stats
+     - List of statistic base names to plot, e.g.
+       ``["pi", "h12", "ihs"]``. Defaults to the full Flex-sweep stat set.
+   * - ``output_path``
+     - ``None``
+     - Save path (SVG). If ``None``, shows interactively.
