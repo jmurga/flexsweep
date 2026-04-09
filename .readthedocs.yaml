@@ -10,7 +10,7 @@ build:
       - curl -LsSf https://astral.sh/uv/install.sh | sh
     post_install:
       - /home/docs/.local/bin/uv pip install .[docs]
-
+      - /home/docs/.local/bin/uv pip install "sphinx-rtd-theme"
 sphinx:
   configuration: docs/conf.py
 
