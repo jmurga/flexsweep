@@ -1,7 +1,18 @@
 dist/
 __pycache__/
+docs/_build
+docs/_static
+docs/_templates
+flexsweep/src/target/
 # conda smithy ci-skeleton start
 *.pyc
 build_artifacts
 _build
 # conda smithy ci-skeleton end
+*.pyc
+*.nbi
+*.nbc
+!README.md
+*.md
+flexsweep/test_code/
+.zed

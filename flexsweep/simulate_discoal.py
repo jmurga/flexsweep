@@ -1,17 +1,109 @@
+import gzip
 import os
+<<<<<<< HEAD
 
 from . import pl, np, Parallel, delayed
+=======
+import shutil
+import subprocess
+import tempfile
+import warnings
+from pathlib import Path
+>>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
 import demes
-import subprocess
-
-import gzip
 from scipy import stats
 
+<<<<<<< HEAD
 
 # Extract default data and binaries
 DISCOAL = os.path.join(os.path.dirname(__file__), "data", "discoal")
 DECODE_MAP = os.path.join(os.path.dirname(__file__), "data", "decode_sexavg_2019.txt")
+=======
+from . import Parallel, delayed, np, pl
+
+_DISCOAL_BIN_NAME = "discoal"
+
+
+def _find_discoal(binary=None):
+    """Locate the discoal binary. Priority: explicit path → env var → bundled data/ → PATH."""
+    if binary:
+        p = Path(binary)
+        if p.is_file() and os.access(p, os.X_OK):
+            return p
+
+    env_bin = os.environ.get("FLEXSWEEP_DISCOAL_BIN")
+    if env_bin:
+        p = Path(env_bin)
+        if p.is_file() and os.access(p, os.X_OK):
+            return p
+
+    bundled = Path(__file__).resolve().parent / "data" / _DISCOAL_BIN_NAME
+    if bundled.is_file() and os.access(bundled, os.X_OK):
+        return bundled
+
+    resolved = shutil.which(_DISCOAL_BIN_NAME)
+    if resolved:
+        return Path(resolved)
+
+    return None
+
+
+def build_discoal():
+    """Clone discoal from GitHub and compile with make. Returns path to binary."""
+    if not shutil.which("git"):
+        raise FileNotFoundError("git not found; required to build discoal.")
+    if not shutil.which("make"):
+        raise FileNotFoundError("make not found; required to build discoal.")
+
+    build_dir = Path(tempfile.mkdtemp(prefix="discoal_build_"))
+    try:
+        subprocess.run(
+            ["git", "clone", "--depth", "1",
+             "https://github.com/kr-colab/discoal.git", str(build_dir)],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        )
+        subprocess.run(
+            ["make", "discoal"],
+            cwd=str(build_dir),
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        if exc.stderr:
+            print(exc.stderr, end="")
+        raise
+
+    built = build_dir / _DISCOAL_BIN_NAME
+    if not built.exists():
+        raise FileNotFoundError("make succeeded but discoal binary not found.")
+
+    dest = Path(__file__).resolve().parent / "data" / _DISCOAL_BIN_NAME
+    try:
+        shutil.copy2(built, dest)
+        dest.chmod(dest.stat().st_mode | 0o111)
+        return dest
+    except OSError:
+        return built
+
+
+def _ensure_discoal(binary=None):
+    """Return discoal path, building from source on first use if not found."""
+    path = _find_discoal(binary)
+    if path:
+        return path
+    warnings.warn(
+        "discoal binary not found; attempting to build from source.",
+        RuntimeWarning,
+    )
+    return build_discoal()
+
+
+# Extract default data and binaries
+DISCOAL = os.path.join(os.path.dirname(__file__), "data", "discoal")
+DECODE_MAP = os.path.join(
+    os.path.dirname(__file__), "data", "decode_sexavg_2019.txt.gz"
+)
+>>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 DEMES_EXAMPLES = {
     "constant": os.path.join(os.path.dirname(__file__), "data", "constant.yaml"),
     "yri": os.path.join(
@@ -50,10 +142,18 @@ class Simulator:
         },
         locus_length=int(1.2e6),
         discoal_path=DISCOAL,
+<<<<<<< HEAD
         num_simulations=int(1.25e4),
         ne=int(1e4),
+=======
+        num_simulations=int(2.5e5),
+        saf = [0, 0.1],
+        eaf = [0.5, 1],
+        s = [0.01, 0.05],
+>>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
         time=[0, 5000],
         nthreads=1,
+        ne=int(1e4),
         fixed_ratio=0.1,
         split=False,
     ):
@@ -90,8 +190,11 @@ class Simulator:
         :param int nthreads: Maximum joblib workers. **Default:** ``1``.
         :param float fixed_ratio: Fraction of complete sweeps within hard/soft sets.
             **Default:** ``0.1``.
+<<<<<<< HEAD
         :param bool split: If ``True``, split jobs into low/high recombination groups.
             **Default:** ``False``.
+=======
+>>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
         .. note::
            Random number generation is **not seeded** (non-deterministic runs).
@@ -111,8 +214,9 @@ class Simulator:
         self.locus_length = int(locus_length)
         self.demes = demes
         self.output_folder = output_folder
-        self.discoal_path = discoal_path
+        self.discoal_path = str(_ensure_discoal(discoal_path))
         self.nthreads = nthreads
+<<<<<<< HEAD
         self.num_simulations = num_simulations
         self.f_t = [0.5, 1]
         self.f_i = [0, 0.1]
@@ -122,6 +226,16 @@ class Simulator:
         self.reset_simulations = False
         self.demes_data = None
         self.split = split
+=======
+        self.num_simulations = int(num_simulations)
+        self.f_i = saf
+        self.f_t = eaf
+        self.time = time
+        self.s = s
+        self.fixed_ratio = fixed_ratio
+        self.reset_simulations = False
+        self.demes_data = None
+>>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
         self.parameters = None
 
     def check_inputs(self):
@@ -135,12 +249,21 @@ class Simulator:
         Returns:
             str: Discoal demographic flags string (e.g., " -en <t> 0 <size> ...").
         """
+<<<<<<< HEAD
         assert isinstance(
             self.mutation_rate, dict
         ), "Please input distribution and mutation rates values"
         assert isinstance(
             self.recombination_rate, dict
         ), "Please input distribution and recombination_rate values"
+=======
+        assert isinstance(self.mutation_rate, dict), (
+            "Please input distribution and mutation rates values"
+        )
+        assert isinstance(self.recombination_rate, dict), (
+            "Please input distribution and recombination_rate values"
+        )
+>>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
         os.makedirs(self.output_folder, exist_ok=True)
         os.makedirs(self.output_folder + "/sweep/", exist_ok=True)
@@ -183,7 +306,7 @@ class Simulator:
 
         discoal_demes = " "
         for i, j in zip(epochs, sizes):
-            discoal_demes += "-en {0:.20f} 0 {1:.20f} ".format(i, j)
+            discoal_demes += f"-en {i:.20f} 0 {j:.20f} "
         return discoal_demes
 
     def random_distribution(self, num):
@@ -246,6 +369,7 @@ class Simulator:
                 num,
             )
         elif self.recombination_rate["dist"] == "exponential":
+<<<<<<< HEAD
             rho = []
             while len(rho) < num:
                 tmp_rho = np.random.exponential(self.recombination_rate["mean"], num)
@@ -256,6 +380,21 @@ class Simulator:
                 remaining = num - len(rho)
                 rho.extend(valid_values[:remaining])
             rho = np.array(rho)
+=======
+            if len(self.recombination_rate.keys()) == 2:
+                rho =  np.random.exponential(self.recombination_rate["mean"], num)
+            else:
+                rho = []
+                while len(rho) < num:
+                    tmp_rho = np.random.exponential(self.recombination_rate["mean"], num)
+                    valid_values = tmp_rho[
+                        (tmp_rho >= self.recombination_rate["min"])
+                        & (tmp_rho <= self.recombination_rate["max"])
+                    ]
+                    remaining = num - len(rho)
+                    rho.extend(valid_values[:remaining])
+                rho = np.array(rho)
+>>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
         elif self.recombination_rate["dist"] == "fixed":
             next
         else:
@@ -285,7 +424,14 @@ class Simulator:
             pl.DataFrame: Parameters with columns
                 ['iter', 'mu', 'r', 'eaf', 'saf', 's', 't', 'model'].
         """
+<<<<<<< HEAD
         discoal_demes = self.check_inputs()
+=======
+        _ = self.check_inputs()
+
+
+        scaling = 4 * self.ne * self.locus_length
+>>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
         scaling = 4 * self.ne * self.locus_length
 
@@ -373,11 +519,15 @@ class Simulator:
             }
         )
 
-        params = df_sweeps.select(["s", "t", "saf", "eaf"]).to_numpy()
+        # params = df_sweeps.select(["s", "t", "saf", "eaf"]).to_numpy()
 
         # Simulating
         df_params = pl.concat([df_neutral, df_sweeps], how="vertical")
+<<<<<<< HEAD
         df_params.write_csv(self.output_folder + "/params.txt.gz")
+=======
+        df_params.write_csv(self.output_folder + "/params.txt.gz", compression="gzip")
+>>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
         self.parameters = df_params
 
@@ -395,7 +545,11 @@ class Simulator:
 
         try:
             df_params = pl.read_csv(self.output_folder + "/params.txt.gz")
+<<<<<<< HEAD
         except:
+=======
+        except FileNotFoundError:
+>>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
             raise FileNotFoundError(
                 f"File not found: {self.output_folder}/params.txt.gz"
             )
@@ -545,3 +699,106 @@ class Simulator:
             output.write(result.stdout)
 
         return output_file
+<<<<<<< HEAD
+=======
+
+    def simulate_batch(self):
+        """
+        Run neutral and sweep simulations via discoal, in batches.
+
+
+        Returns:
+            dict[str, list[str]]: Paths to gzipped ms files, with keys 'neutral' and 'sweep'.
+        """
+        discoal_demes = self.check_inputs()
+        scaling = 4 * self.ne * self.locus_length
+
+        try:
+            df_params = pl.read_csv(self.output_folder + "/params.txt.gz")
+        except Exception:
+            raise FileNotFoundError(
+                f"File not found: {self.output_folder}/params.txt.gz"
+            )
+
+
+        # materialize rows once
+        neutral_rows = list(
+            df_params.filter(pl.col("model") == "neutral").iter_rows(named=True)
+        )
+        sweep_rows = list(
+            df_params.filter(pl.col("model") != "neutral").iter_rows(named=True)
+        )
+
+
+        batch_size = int(max(1, len(neutral_rows) / self.nthreads))
+
+        # build batched tasks (each task handles a chunk of rows)
+        neutral_tasks = [
+            delayed(self._batch_simulate)(
+                neutral_rows[i : i + batch_size],
+                scaling,
+                discoal_demes,
+                "neutral",
+            )
+            for i in range(0, len(neutral_rows), batch_size)
+        ]
+
+        sweep_tasks = [
+            delayed(self._batch_simulate)(
+                sweep_rows[i : i + batch_size],
+                scaling,
+                discoal_demes,
+                "sweep",
+            )
+            for i in range(0, len(sweep_rows), batch_size)
+        ]
+
+        sims_n, sims_s = [], []
+
+        with Parallel(n_jobs=self.nthreads, backend="loky", verbose=1) as parallel:
+            print("Performing neutral simulations (batched)")
+            neutral_batches = parallel(neutral_tasks)
+            sims_n = [sim for batch in neutral_batches for sim in batch]
+
+            print("Performing sweep simulations (batched)")
+            sweep_batches = parallel(sweep_tasks)
+            sims_s = [sim for batch in sweep_batches for sim in batch]
+
+        sims = {
+            "sweep": sims_s,
+            "neutral": sims_n,
+        }
+        return sims
+
+    def _batch_simulate(self, params_batch, scaling, discoal_demes, model):
+        """
+        Helper that runs either neutral or sweep simulations for a batch of
+        parameter rows and returns a list of results.
+        """
+        out = []
+
+        if model == "neutral":
+            for v in params_batch:
+                res = self.neutral(
+                    v["mu"] * scaling,
+                    v["r"] * scaling,
+                    discoal_demes,
+                    v["iter"],
+                )
+                out.append(res)
+        else:  # sweep
+            for v in params_batch:
+                res = self.sweep(
+                    v["mu"] * scaling,
+                    v["r"] * scaling,
+                    v["eaf"],
+                    v["saf"],
+                    v["t"] / (4 * self.ne),
+                    2 * self.ne * v["s"],
+                    discoal_demes,
+                    v["iter"],
+                )
+                out.append(res)
+
+        return out
+>>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)

@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 import os
 
 from . import np, Parallel, delayed, pl
@@ -11,8 +12,100 @@ import gzip
 import glob
 from subprocess import run
 from collections import OrderedDict
+=======
+import glob
+import os
+import re
+from collections import OrderedDict
+from itertools import chain
+
+# from subprocess import run
+# from typing import Any, cast
+from warnings import filterwarnings
+
+from allel import GenotypeArray, index_windows, read_vcf, read_vcf_headers
+from scipy.interpolate import interp1d
+
+from . import Parallel, delayed, np, pl
+>>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
 filterwarnings("ignore", message="invalid INFO header", module="allel.io.vcf_read")
+
+
+def _chrom_id(s):
+    """
+    Canonical chromosome extractor.
+
+    Normalizes:
+      chr01, chr1, contig_1, SUPER__01 -> "1"
+      chrX -> "x"
+      chrMT / chrM -> "mt"
+    """
+    s = s.lower()
+
+    # unify mitochondrial naming
+    s = re.sub(r"chr?m(t)?", "mt", s)
+
+    # extract first meaningful token
+    # Use lookahead instead of \b: in Python regex '_' is \w so \b fails for
+    # tokens like "chr1_polarized" where '1' is followed by '_'.
+    # (?=[^a-z0-9]|$) requires the token to be followed by a separator or EOS,
+    # which also prevents 'y' in 'yri' from matching the Y chromosome.
+    m = re.search(r"(?:chr|contig|super)?[^a-z0-9]*([0-9]+|x|y|mt)(?=[^a-z0-9]|$)", s)
+    if not m:
+        return None
+
+    chrom = m.group(1)
+
+    # normalize numeric chromosomes: "01" -> "1"
+    if chrom.isdigit():
+        chrom = str(int(chrom))
+
+    return chrom
+
+
+def get_contig_from_vcf_filename(path):
+    """
+    Returns:
+        (contig_name, contig_length)
+    """
+
+    # Read headers
+    headers = read_vcf_headers(path)
+
+    # Parse contigs
+    contig_pattern = re.compile(r"##contig=<ID=([^,]+),length=(\d+)>")
+
+    contigs = {
+        m.group(1): int(m.group(2))
+        for line in headers.headers
+        if (m := contig_pattern.match(line))
+    }
+
+    # Extract chrom from filename
+    fname = os.path.basename(path)
+    file_chr = _chrom_id(fname)
+
+    if file_chr is None:
+        return None, None
+
+    # Match against header contigs
+    matches = []
+
+    for contig_name, length in contigs.items():
+        contig_chr = _chrom_id(contig_name)
+
+        if contig_chr == file_chr:
+            matches.append((contig_name, length))
+
+    # Resolve
+    if len(matches) == 1:
+        return matches[0]
+
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous contig match: {matches}")
+
+    return None, None
 
 
 class Data:
@@ -93,14 +186,14 @@ class Data:
 
         try:
             gt = GenotypeArray(raw_data["calldata/GT"])
-        except:
+        except Exception:
             return {region: None}
 
         pos = raw_data["variants/POS"]
         np_chrom = np.char.replace(raw_data["variants/CHROM"].astype(str), "chr", "")
         try:
             np_chrom = np_chrom.astype(int)
-        except:
+        except Exception:
             pass
         ac = gt.count_alleles()
 
@@ -183,14 +276,16 @@ class Data:
             raise FileNotFoundError(
                 f"Please index the vcf/bcf file before continue using: tabix -p vcf {self.data}"
             )
+        # check_contig_length = (
+        # f"{'zcat' if '.gz' in self.data else 'cat'} {self.data} | tail -n 1"
+        # )
+        # contig_name, contig_length = run(
+        #     check_contig_length, shell=True, capture_output=True, text=True
+        # ).stdout.split("\t")[:2]
 
-        check_contig_length = (
-            f"{'zcat' if '.gz' in self.data else 'cat'} {self.data} | tail -n 1"
-        )
-        contig_name, contig_length = run(
-            check_contig_length, shell=True, capture_output=True, text=True
-        ).stdout.split("\t")[:2]
+        contig_name, contig_length = get_contig_from_vcf_filename(self.data)
 
+<<<<<<< HEAD
         check_contig_start = (
             f'zgrep -v "#" {self.data} | head -n 1'
             if self.data.endswith(".gz")
@@ -207,6 +302,24 @@ class Data:
             step = None
         else:
             step = int(self.step)
+=======
+        # check_contig_start = (
+        # f'zgrep -v "#" {self.data} | head -n 1'
+        # if self.data.endswith(".gz")
+        # else f'fgrep -v "^#" {self.data} | head -n 1'
+        # )
+        # contig_start = run(
+        # check_contig_start, shell=True, capture_output=True, text=True
+        # ).stdout.split("\t")[1]
+
+        # if (int(contig_start) - 6e5) < 0:
+        # contig_start = 1
+
+        # if self.step is None:
+        #     step = None
+        # else:
+        #     step = int(self.step)
+>>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
         window_iter = list(
             index_windows(
@@ -276,9 +389,15 @@ class Data:
                 raise ValueError(f"Directory is empty: {folder_path}")
 
         df_params = pl.read_csv(self.data + "/params.txt.gz")
+<<<<<<< HEAD
         params = df_params.select(["model", "s", "t", "saf", "eaf"])
         df_neutral = df_params.filter(model="neutral")
         df_sweeps = df_params.filter(model="sweep")
+=======
+        params = df_params.select(["model", "s", "t", "saf", "eaf", "mu", "r"])
+        df_neutral = df_params.filter(pl.col("model") == "neutral")
+        df_sweeps = df_params.filter(pl.col("model") == "sweep")
+>>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 
         sweeps = (
             (self.data + "/sweep/sweep_" + (df_sweeps.select("iter") + ".ms.gz"))
@@ -307,15 +426,25 @@ class Data:
         Args:
             df_rec_map (pl.DataFrame):
                 Recombination map with numeric columns where:
+<<<<<<< HEAD
                   - df_rec_map.columns[1] holds physical coordinate (bp),
                   - df_rec_map.columns[-1] holds cumulative genetic distance (cM).
+=======
+                  columns[1] holds physical coordinate (bp) and
+                  columns[-1] holds cumulative genetic distance (cM).
+
+>>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
             positions (np.ndarray[int]): Physical positions to interpolate.
 
         Returns:
             np.ndarray[float]: Interpolated cumulative cM values (negative values clamped to 0).
 
         Notes:
+<<<<<<< HEAD
             - Uses linear interpolation with extrapolation at ends.
+=======
+            Uses linear interpolation with extrapolation at ends.
+>>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
         """
         interp_func = interp1d(
             df_rec_map.select(df_rec_map.columns[1]).to_numpy().flatten(),
@@ -333,6 +462,7 @@ class Data:
         # rate = (rr2 - rr1) / ((positions[:, 1] - positions[:, 0]) / 1e6)
 
         return rr1
+<<<<<<< HEAD
 
 
 # def get_hap_window(self, hap_data, positions, rec_map, window):
@@ -449,3 +579,5 @@ class Data:
 
 # "sweep": ms_sweeps,
 # "neutral": ms_neutral,
+=======
+>>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)

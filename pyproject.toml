@@ -1,12 +1,15 @@
-[tool.poetry]
+[project]
 name = "flexsweep"
+<<<<<<< HEAD
 version = "1.3"
+=======
+version = "1.9"
+>>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
 description = ""
-authors = ["Jesus Murga-Moreno <murgamoreno@gmail.com>"]
-license = "MIT"
-homepage = "https://github.com/jmurga/flexsweep"
-repository = "https://github.com/jmurga/flexsweep"
+authors = [{ name = "Jesus Murga-Moreno", email = "murgamoreno@gmail.com" }]
+requires-python = ">=3.12,<3.13"
 readme = "README.md"
+<<<<<<< HEAD
 packages = [
     { include = "flexsweep" },
 ]
@@ -28,11 +31,45 @@ matplotlib = "^3.9.2"
 polars = "^1.14.0"
 pybedtools = "^0.12.0"
 tbb = "^2022.1.0"
+=======
+license = "MIT"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "scipy>=1.14.0,<2",
+    "scikit-allel>=1.3.8,<2",
+    "scikit-learn>=1.5.1,<2",
+    "joblib>=1.4.2,<2",
+    "threadpoolctl>=3.5.0,<4",
+    "click>=8.1.7,<9",
+    "numpy==1.26.4",
+    "numba>=0.60.0,<0.61",
+    "demes>=0.2.3,<0.3",
+    "tensorflow[and-cuda]>=2.18.0,<3",
+    "pyarrow>=21.0.0,<22",
+    "matplotlib>=3.9.2,<4",
+    "polars>=1.14.0,<2",
+    "polars-bio>=0.20.1,<1",
+    "tbb>=2022.1.0,<2023",
+    "tqdm>=4.67.1,<5",
+]
 
-[tool.poetry.scripts]
+[project.urls]
+Homepage = "https://github.com/jmurga/flexsweep"
+Repository = "https://github.com/jmurga/flexsweep"
+>>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
+
+[project.scripts]
 flexsweep = "flexsweep.main:cli"
 
+[tool.uv.build-backend]
+module-name = ["flexsweep"]
+module-root = ""
+
 [build-system]
+<<<<<<< HEAD
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
 
@@ -40,3 +77,13 @@ build-backend = "poetry.core.masonry.api"
 [tool.poetry.group.docs.dependencies]
 sphinx = "^8.0"
 sphinx-rtd-theme = "^3.0"
+=======
+requires = ["uv_build>=0.9.28,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "sphinx>=9.1.0",
+    "sphinx-rtd-theme>=3.1.0",
+]
+>>>>>>> ed421eb (pushing to 2.0. dann, recombination stratification normalization, custom stats, center/windows, outlier scan, partial cms, plotting)
