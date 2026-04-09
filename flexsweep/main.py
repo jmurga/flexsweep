@@ -135,7 +135,6 @@ def simulator(
     nthreads,
 ):
     """
-
     Run the discoal simulator with user-specified parameters.
 
     flexsweep.Simulator class, parsing mutation and
