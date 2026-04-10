@@ -69,28 +69,28 @@ Multiple random starts (``--nrandom``, default 10) are used for model fitting
 to avoid local optima.
 
 
-Requirements
-------------
+.. Requirements
+.. ------------
 
-The polarization binary is implemented in Rust. You need either:
+.. The polarization binary is implemented in Rust. You need either:
 
-- A **bioconda installation** — the binary is included automatically.
-- A **manual build** — requires the Rust toolchain (``rustc`` and ``cargo``).
-  Run the following once before using the polarize commands:
+.. - A **bioconda installation** — the binary is included automatically.
+.. - A **manual build** — requires the Rust toolchain (``rustc`` and ``cargo``).
+..   Run the following once before using the polarize commands:
 
-.. code-block:: python
+.. .. code-block:: python
 
-    import flexsweep as fs
-    fs.build_rust_polarization()
+..     import flexsweep as fs
+..     fs.build_rust_polarization()
 
-The binary is searched in this order:
+.. The binary is searched in this order:
 
-1. ``FLEXSWEEP_RUST_BIN`` environment variable (explicit path).
-2. ``flexsweep/src/target/release/`` or ``debug/`` (local build).
-3. ``flexsweep-polarize`` or ``polarize`` on the system ``PATH``.
+.. 1. ``FLEXSWEEP_RUST_BIN`` environment variable (explicit path).
+.. 2. ``flexsweep/src/target/release/`` or ``debug/`` (local build).
+.. 3. ``flexsweep-polarize`` or ``polarize`` on the system ``PATH``.
 
-If none is found and ``cargo`` is available, the binary is compiled
-automatically on first use.
+.. If none is found and ``cargo`` is available, the binary is compiled
+.. automatically on first use.
 
 
 Input files

@@ -1,8 +1,6 @@
 import math
 import os
-
 import click
-
 
 def parse_float_list(value):
     """Parse a comma-separated list of floats."""
@@ -1411,9 +1409,23 @@ def enrichment(
     type=bool,
     required=False,
     default=False,
-    help="Sort MAF file before polaring.",
+    help="Sort MAF file before polarizing.",
 )
-def polarize(maf, vcf, outgroups, method, nrandom, sort):
+@click.option(
+    "--split",
+    type=bool,
+    required=False,
+    default=False,
+    help="Splt MAF file before polarizing.",
+)
+@click.option(
+    "--contig",
+    type=str,
+    required=False,
+    default=None,
+    help="Reference contig to split",
+)
+def polarize(maf, vcf, outgroups, method, nrandom, sort, split, contig):
     """
     Polarize VCF using rust est-sfs refactor. MAF file anchored to the VCF specie will be used to parse outgroups information.
     Please cite: https://doi.org/10.1534/genetics.118.301120
@@ -1425,14 +1437,52 @@ def polarize(maf, vcf, outgroups, method, nrandom, sort):
         flexsweep polarize --maf input.maf.gz --vcf input.maf.gz --outgroups specie1,specie2,specie3 --method kimura
 
     """
+
     import flexsweep as fs
+    import logging
+
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
+    # fs.polarize.init_logging()
+
+    dir_name = os.path.dirname(maf)
+    base_name = os.path.basename(maf).replace(".maf.gz", "").replace(".maf", "")
+    
+    maf_input = maf
+
+    if split:
+        if not contig:
+            click.secho("Error: --contig is required when --split is enabled.", fg="red")
+            raise click.Abort()
+            
+        maf_split = os.path.join(dir_name, f"{base_name}_{contig}.maf.gz")
+        click.echo(f"Splitting MAF for contig: {contig}")
+        fs.polarize.maf_split(maf, maf_split, contig)
+        maf_input = maf_split
 
     if sort:
-        maf_input = fs.run_sort_maf(maf)
-    else:
-        maf_input = maf
+        suffix = f"_{contig}_sorted" if split else "_sorted"
+        maf_sort = os.path.join(dir_name, f"{base_name}{suffix}.maf.gz")
+        
+        click.echo("Sorting MAF file...")
+        try:
+            fs.polarize.maf_sort(maf_input, maf_sort)
+            maf_input = maf_sort 
+        except Exception as e:
+            click.secho(f"Error during sorting: {e}", fg="red")
+            raise click.Abort()
 
-    fs.run_polarize(maf_input, vcf, outgroups.split(","), method, nrandom)
+    try:
+        fs.polarize.polarize(
+            maf_input, 
+            vcf, 
+            outgroups, 
+            method, 
+            int(nrandom)
+        )
+    except Exception as e:
+        click.secho(f"Error during polarization: {e}", fg="red")
+        raise click.Abort()
 
 
 @cli.command()

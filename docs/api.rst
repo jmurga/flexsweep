@@ -90,9 +90,9 @@ wrappers below invoke the compiled binary; the binary must be built first with
 - ``kimura`` — Kimura two-parameter model (default).
 - ``r6`` — General reversible model (6 free parameters); slowest, most accurate.
 
-.. autofunction:: flexsweep.polarize.run_sort_maf
-.. autofunction:: flexsweep.polarize.run_polarize
-.. autofunction:: flexsweep.polarize.build_rust_polarization
+.. autofunction:: flexsweep.polarize.maf_sort
+.. autofunction:: flexsweep.polarize.maf_split
+.. autofunction:: flexsweep.polarize.polarize
 
 
 Visualization

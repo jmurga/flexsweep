@@ -1,6 +1,10 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0","ziglang"]
+build-backend = "maturin"
+
 [project]
 name = "flexsweep"
-version = "1.9"
+version = "1.9.2"
 description = ""
 authors = [{ name = "Jesus Murga-Moreno", email = "murgamoreno@gmail.com" }]
 requires-python = ">=3.12,<3.13"
@@ -39,13 +43,35 @@ Repository = "https://github.com/jmurga/flexsweep"
 [project.scripts]
 flexsweep = "flexsweep.main:cli"
 
-[tool.uv.build-backend]
-module-name = ["flexsweep"]
-module-root = ""
 
-[build-system]
-requires = ["uv_build>=0.9.28,<0.10.0"]
-build-backend = "uv_build"
+[tool.maturin]
+bindings = "pyo3" 
+python-source = "."
+manifest-path = "src/Cargo.toml"
+module-name = "flexsweep.polarize"
+compatibility = "manylinux_2_28"
+zig = true
+exclude = [
+  "flexsweep/test_code/**",
+  "flexsweep/src/target/**",
+  "src/target/**",
+  "**/target/**",
+]
+
+
+# [tool.uv.build-backend]
+# module-name = ["flexsweep"]
+# module-root = "."
+
+# exclude = [
+#   "flexsweep/test_code/**",
+#   "flexsweep/src/target/**",
+#   "**/target/**",
+# ]
+
+# [build-system]
+# requires = ["uv_build>=0.9.28,<=0.11.6"]
+# build-backend = "uv_build"
 
 [project.optional-dependencies]
 docs = [
@@ -56,4 +82,6 @@ docs = [
 [dependency-groups]
 dev = [
     "flexsweep[docs]",
+    "maturin>=1.13.1",
+    "ziglang>=0.15.2",
 ]

@@ -132,11 +132,6 @@ _LAZY_ATTRS = {
     "rank_probabilities": (".utils", "rank_probabilities"),
     "plot_sfs": (".utils", "plot_sfs"),
     "plot_diversity": (".utils", "plot_diversity"),
-    # Rust CLI wrappers
-    "run_sort_maf": (".polarize", "run_sort_maf"),
-    "run_polarize": (".polarize", "run_polarize"),
-    "build_rust_polarization": (".polarize", "build_rust_polarization"),
-    # Convenience accessors
     "threadpoolctl": ("threadpoolctl", None),
     "multiprocessing": ("multiprocessing", None),
 }
@@ -179,9 +174,6 @@ __all__ = [
     "rank_probabilities",
     "plot_sfs",
     "plot_diversity",
-    "run_sort_maf",
-    "run_polarize",
-    "build_rust_polarization",
     "fv",
     "polarize",
     "simulate_discoal",
