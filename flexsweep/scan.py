@@ -178,7 +178,9 @@ STAT_REGISTRY: dict[str, StatDef] = {
             "min_tot_freq": 0.10,
         },
     ),
-    "haf": StatDef("window", 1, "haf", {"window_mode": "snp", "w_size": 201, "step": 10}),
+    "haf": StatDef(
+        "window", 1, "haf", {"window_mode": "snp", "w_size": 201, "step": 10}
+    ),
     "hscan": StatDef(
         "snp", 1, "hscan", {"max_gap": 200_000, "dist_mode": 0, "hscan_step": 1}
     ),
@@ -354,41 +356,71 @@ def stat_params(stat_key: str | None = None) -> dict:
     # Stat-specific params: registry defaults merged with runner-read kwargs.
     # These are the keys a user can pass via config={"stat": {key: val}}.
     _STAT_SPECIFIC: dict[str, dict] = {
-        "ihs":       {"include_edges": False, "gap_scale": 20000, "max_gap": 200000},
-        "nsl":       {},
-        "isafe":     {"region_size_bp": 1_000_000, "isafe_window": 300, "isafe_step": 150,
-                      "top_k": 1, "max_rank": 15},
-        "dind":      {"window_size": 50000, "min_focal_freq": 0.25, "max_focal_freq": 0.95},
-        "high_freq": {"window_size": 50000, "min_focal_freq": 0.25, "max_focal_freq": 0.95},
-        "low_freq":  {"window_size": 50000, "min_focal_freq": 0.25, "max_focal_freq": 0.95},
-        "s_ratio":   {"window_size": 50000, "min_focal_freq": 0.25, "max_focal_freq": 0.95},
-        "hapdaf_o":  {"window_size": 50000, "min_focal_freq": 0.25, "max_focal_freq": 0.95,
-                      "max_ancest_freq": 0.25, "min_tot_freq": 0.25},
-        "hapdaf_s":  {"window_size": 50000, "min_focal_freq": 0.25, "max_focal_freq": 0.95,
-                      "max_ancest_freq": 0.10, "min_tot_freq": 0.10},
-        "haf":       {},
-        "hscan":     {"max_gap": 200_000, "dist_mode": 0,
-                      "hscan_step": 1},  # note: NOT "step" — avoids shared override
-        "h12":       {},
-        "garud":     {},
+        "ihs": {"include_edges": False, "gap_scale": 20000, "max_gap": 200000},
+        "nsl": {},
+        "isafe": {
+            "region_size_bp": 1_000_000,
+            "isafe_window": 300,
+            "isafe_step": 150,
+            "top_k": 1,
+            "max_rank": 15,
+        },
+        "dind": {"window_size": 50000, "min_focal_freq": 0.25, "max_focal_freq": 0.95},
+        "high_freq": {
+            "window_size": 50000,
+            "min_focal_freq": 0.25,
+            "max_focal_freq": 0.95,
+        },
+        "low_freq": {
+            "window_size": 50000,
+            "min_focal_freq": 0.25,
+            "max_focal_freq": 0.95,
+        },
+        "s_ratio": {
+            "window_size": 50000,
+            "min_focal_freq": 0.25,
+            "max_focal_freq": 0.95,
+        },
+        "hapdaf_o": {
+            "window_size": 50000,
+            "min_focal_freq": 0.25,
+            "max_focal_freq": 0.95,
+            "max_ancest_freq": 0.25,
+            "min_tot_freq": 0.25,
+        },
+        "hapdaf_s": {
+            "window_size": 50000,
+            "min_focal_freq": 0.25,
+            "max_focal_freq": 0.95,
+            "max_ancest_freq": 0.10,
+            "min_tot_freq": 0.10,
+        },
+        "haf": {},
+        "hscan": {
+            "max_gap": 200_000,
+            "dist_mode": 0,
+            "hscan_step": 1,
+        },  # note: NOT "step" — avoids shared override
+        "h12": {},
+        "garud": {},
         "neutrality": {},
-        "omega":     {},
-        "zns":       {},
-        "tajima_d":  {},
-        "pi":        {},
-        "theta_w":   {},
-        "fay_wu_h":  {},
-        "zeng_e":    {},
-        "achaz_y":   {},
-        "fuli_f":    {},
+        "omega": {},
+        "zns": {},
+        "tajima_d": {},
+        "pi": {},
+        "theta_w": {},
+        "fay_wu_h": {},
+        "zeng_e": {},
+        "achaz_y": {},
+        "fuli_f": {},
         "fuli_f_star": {},
-        "fuli_d":    {},
+        "fuli_d": {},
         "fuli_d_star": {},
-        "lassi":     {"K_truncation": 10, "sweep_mode": 4},
-        "lassip":    {"K_truncation": 10, "sweep_mode": 4, "max_extend": 1e5, "n_A": 100},
-        "raisd":     {"window_size": 50},
-        "beta":      {"m": 0.1},
-        "ncd":       {"tf": 0.5, "w": 3000, "minIS": 2},
+        "lassi": {"K_truncation": 10, "sweep_mode": 4},
+        "lassip": {"K_truncation": 10, "sweep_mode": 4, "max_extend": 1e5, "n_A": 100},
+        "raisd": {"window_size": 50},
+        "beta": {"m": 0.1},
+        "ncd": {"tf": 0.5, "w": 3000, "minIS": 2},
     }
 
     def _entry(key):
@@ -418,7 +450,9 @@ def stat_params(stat_key: str | None = None) -> dict:
 
     if stat_key is not None:
         if stat_key not in STAT_REGISTRY:
-            raise ValueError(f"Unknown stat: {stat_key!r}. Available: {available_stats()}")
+            raise ValueError(
+                f"Unknown stat: {stat_key!r}. Available: {available_stats()}"
+            )
         return {stat_key: _entry(stat_key)}
 
     return {k: _entry(k) for k in STAT_REGISTRY}
@@ -928,12 +962,14 @@ def _run_lassi_scan(hap, positions, ac, rec_map, genetic_pos, **params):
     t_m = T_m_statistic_fast(
         K_counts, K_neutral, windows_lassi, K_truncation, sweep_mode=sweep_mode
     )
-    return t_m.select([
-        pl.col("window_lassi").cast(pl.Int64).alias("pos"),
-        pl.col("T").alias("T_m"),
-        pl.col("m"),
-        pl.col("frequency").alias("epsilon"),
-    ])
+    return t_m.select(
+        [
+            pl.col("window_lassi").cast(pl.Int64).alias("pos"),
+            pl.col("T").alias("T_m"),
+            pl.col("m"),
+            pl.col("frequency").alias("epsilon"),
+        ]
+    )
 
 
 def _run_lassip_scan(hap, positions, ac, rec_map, genetic_pos, nthreads=1, **params):
@@ -1044,6 +1080,7 @@ def _run_single_neutrality_fn(
 ):
     """Run per-window, call individual function fn(ac_win[, pos_win])."""
     import inspect
+
     _fn_nparams = len(inspect.signature(fn).parameters)
 
     def _call(ac_win, pos_win):
@@ -1252,8 +1289,6 @@ _WINDOW_WHOLE = {"lassi", "lassip", "raisd", "beta", "ncd"}
 
 
 # Parallelism helpers (called from global task pool in scan())
-
-
 def _region_bounds(positions, region_size_bp: int):
     """Yield non-overlapping (lo, hi) bp bounds covering all positions."""
     lo = int(positions[0])
@@ -1438,13 +1473,19 @@ def scan(
     # Phase 1: Pre-load all chromosomes sequentially (genome_reader uses
     # pysam which is not thread-safe, so this must stay sequential).
     # ------------------------------------------------------------------
-    chrom_data: dict = {}  # chrom → (hap_int, rec_map, ac, positions, genetic_pos, recomb_vals)
+    chrom_data: dict = (
+        {}
+    )  # chrom → (hap_int, rec_map, ac, positions, genetic_pos, recomb_vals)
     for vcf_file in vcf_files:
         hap_int, rec_map, ac, _, position_masked, genetic_pos = genome_reader(
             vcf_file, recombination_map=recombination_map
         )
         chrom = str(int(rec_map[0, 0]))
-        recomb_vals = _snp_cm_mb(position_masked, rec_map) if recombination_map is not None else None
+        recomb_vals = (
+            _snp_cm_mb(position_masked, rec_map)
+            if recombination_map is not None
+            else None
+        )
         chrom_data[chrom] = (
             hap_int,
             rec_map,
@@ -1664,7 +1705,9 @@ def scan(
                 recomb_for_norm = np.concatenate(aligned_parts)
             if rank_col in df_all.columns:
                 vals = df_all[rank_col].to_numpy().astype(np.float64)
-                normalized = _normalize_daf_bins(vals, daf, recomb_for_norm, n_daf_bins, n_r_bins)
+                normalized = _normalize_daf_bins(
+                    vals, daf, recomb_for_norm, n_daf_bins, n_r_bins
+                )
                 df_all = df_all.with_columns(pl.Series(rank_col, normalized))
 
         if rank_col in df_all.columns:

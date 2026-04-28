@@ -253,10 +253,12 @@ def best_window_idx_per_position_cm(
 
         def key(k):  # (primary, secondary, idx)
             return (-w_cm[k], -w_end[k], k)
+
     elif mode == "min":
 
         def key(k):
             return (w_cm[k], -w_end[k], k)
+
     else:
         raise ValueError("mode must be 'max' or 'min'")
 
@@ -951,9 +953,6 @@ def get_closest_snps(position_array, center, N):
 ################## Summaries
 
 
-################## Summaries
-
-
 def _process_vcf(
     data_dir,
     nthreads,
@@ -1018,9 +1017,9 @@ def _process_vcf(
         suitable for per-window summary statistic computation.
     """
 
-    assert r_bins is None or (min_rate is not None and isinstance(min_rate, float)), (
-        "If r_bins is not None, min_rate must be a float (minimum recombination rate simulated)."
-    )
+    assert r_bins is None or (
+        min_rate is not None and isinstance(min_rate, float)
+    ), "If r_bins is not None, min_rate must be a float (minimum recombination rate simulated)."
 
     if func is None:
         func = calculate_stats_vcf_flat
@@ -1450,14 +1449,16 @@ def _process_sims(
         for sim_type, stats_values in results.items():
             df_w, df_w_raw = normalize_stats(
                 stats_values,
-                binned_data["neutral"],
+                bins=binned_data["neutral"],
+                region=None,
                 center=center,
                 windows=windows,
                 step=step,
-                parallel_manager=parallel,
+                parallel_manager=None,
                 nthreads=nthreads,
                 vcf=False,
                 df_r_bins=df_r[sim_type],
+                locus_length=locus_length,
             )
             df_fv_cnn[sim_type] = df_w
             df_fv_cnn_raw[sim_type] = df_w_raw
@@ -1601,9 +1602,9 @@ def summary_statistics(
     else:
         if vcf:
             if func is not None and stats is None:
-                assert suffix is not None, (
-                    "You are using a custom function. Please input a suffix string to avoid feature vectors duplications"
-                )
+                assert (
+                    suffix is not None
+                ), "You are using a custom function. Please input a suffix string to avoid feature vectors duplications"
 
             return _process_vcf(
                 data_dir,
@@ -1622,9 +1623,9 @@ def summary_statistics(
             )
         else:
             if func is not None:
-                assert suffix is not None, (
-                    "You are using a custom function. Please input a suffix string to avoid feature vectors duplications"
-                )
+                assert (
+                    suffix is not None
+                ), "You are using a custom function. Please input a suffix string to avoid feature vectors duplications"
 
             return _process_sims(
                 data_dir,
@@ -2970,7 +2971,7 @@ def normalize_neutral(d_stats_neutral, vcf=False, df_r_bins=None):
                     df_r_bins, on="iter", how="left"
                 )
 
-        df_binned = bin_values(tmp_neutral_snps)
+        df_binned = bin_values(tmp_neutral_snps).fill_nan(None)
 
         group_keys = ["freq_bins"] + (
             ["r_bins"]
@@ -3073,7 +3074,7 @@ def normalize_stats(
 
     df_fv_w = df_fv_w.fill_nan(None)
     num_nans = (
-        df_fv_w.select(pl.exclude(["iter", "s", "t", "f_i", "f_t", "model"]))
+        df_fv_w.select(pl.exclude(["iter", "s", "t", "f_i", "f_t", "mu", "r", "model"]))
         .transpose()
         .null_count()
         .to_numpy()
@@ -3082,9 +3083,9 @@ def normalize_stats(
     df_fv_w = df_fv_w.filter(
         num_nans
         < int(
-            df_fv_w.select(pl.exclude(["iter", "s", "t", "f_i", "f_t", "model"])).shape[
-                1
-            ]
+            df_fv_w.select(
+                pl.exclude(["iter", "s", "t", "f_i", "f_t", "r", "mu", "model"])
+            ).shape[1]
             * 0.1
         )
     ).fill_null(0)
@@ -3753,9 +3754,6 @@ def normalize_snps_statistics(df_snps, df_window, bins, stats_names, dps_shape=F
     df_window_z = df_window_z.select(keep_base + stats_windowed_all)
 
     return (normalized_df, df_window_z.select(pl.exclude("r_bins")))
-
-
-################## Haplotype structure stats
 
 
 ################## Haplotype structure stats
@@ -4776,9 +4774,6 @@ def hscan(
 ################## FS stats
 
 
-################## FS stats
-
-
 @njit(cache=True, parallel=False)
 def fast_sq_freq_pairs(
     hap,
@@ -5527,9 +5522,6 @@ def fs_stats_dataframe(
 ################## iSAFE
 
 
-################## iSAFE
-
-
 @njit(cache=True)
 def rank_with_duplicates(x):
     # sorted_arr = sorted(x, reverse=True)
@@ -5925,9 +5917,6 @@ def get_top_k_snps_in_each_window(df_snps, k=1):
 ################## LD stats
 
 
-################## LD stats
-
-
 @njit(parallel=False, cache=True)
 def r2(locus_A: np.ndarray, locus_B: np.ndarray) -> float:
     """
@@ -6143,9 +6132,6 @@ def Ld(hap, as_float32=True) -> tuple:
 
     # return zns, 0
     return zns, omega_max
-
-
-################## Spectrum stats
 
 
 ################## Site Frequency Spectrum stats
@@ -6958,8 +6944,6 @@ def neutrality_stats(ac, positions):
 
     return out
 
-
-################## LASSI
 
 ################## LASSI
 
@@ -7838,9 +7822,6 @@ def run_lassip(
 ################## RAISD
 
 
-################## RAISD
-
-
 @njit(cache=True)
 def compute_mu_var(start_idx, end_idx, snp_positions, D_ln, W_sz):
     """Variation component of the RAiSD mu statistic (paper Eq. 1).
@@ -8445,9 +8426,6 @@ def run_raisd(hap_data, window_size=50):
     df_mu = mu_stat(hap_int, position_masked, window_size=window_size)
 
     return df_mu
-
-
-################## Balancing stats
 
 
 ################## Balancing stats

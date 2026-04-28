@@ -26,13 +26,13 @@ from .fv import get_cm
 ################## Plotting
 
 
-def plot_diversity(data_dir, nthreads=1):
+def plot_diversity(data_dir, figsize=None, title=None, out=None, nthreads=1):
     vcf_files = glob.glob(f"{data_dir}/*vcf.gz")
     vcf_files = [p for p in vcf_files if "masked" not in p]
     with Parallel(n_jobs=nthreads, verbose=2) as parallel:
         vcf_data = parallel(delayed(read_vcf)(i) for i in vcf_files)
 
-    out = []
+    _out = []
     for v in vcf_data:
         hap = GenotypeArray(v["calldata/GT"]).to_haplotypes()
         ac = hap.count_alleles()
@@ -82,10 +82,13 @@ def plot_diversity(data_dir, nthreads=1):
             }
         )
 
-        out.append(pl.concat([tmp_1, tmp_2]))
+        _out.append(pl.concat([tmp_1, tmp_2]))
 
-    df = pl.concat(out).sort("contig")
-
+    df = pl.concat(_out).sort(
+        pl.col("contig").str.replace("chr", "").cast(pl.Int64),
+        "window_size",
+        "start",
+    )
     df_plot = df.with_columns(
         ((pl.col("start") + pl.col("end")) / 2).alias("mid")
     ).filter(pl.col("window_size") == int(1.2e6))
@@ -113,28 +116,21 @@ def plot_diversity(data_dir, nthreads=1):
     pdf = df_plot.sort("genome_pos").to_pandas()
     boundaries = contig_offsets.to_pandas()
 
-    # -----------------------
-    # 2. Compute mean per contig
-    # -----------------------
+    # Compute mean per contig
     stats = ["pi", "theta_w", "s"]
     means = df_plot.group_by("contig").agg([pl.mean(s).alias(s) for s in stats])
     means_pdf = means.join(contig_offsets, on="contig").to_pandas()
     means_pdf["start_pos"] = means_pdf["offset"]
     means_pdf["end_pos"] = means_pdf["offset"] + means_pdf["length"]
 
-    # -----------------------
-    # 3. Set publication-ready colors
-    # -----------------------
+    # Set publication-ready colors
     colors = {
         "pi": "#1f77b4",  # blue
         "theta_w": "#ff7f0e",  # orange
         "s": "#2ca02c",  # green
     }
 
-    # -----------------------
-    # 4. Plot genome tracks
-    # -----------------------
-
+    # Plot genome tracks
     ylabels = ["π", "θ watterson", "S"]
 
     fig, axes = plt.subplots(3, 1, figsize=(12, 6), sharex=True)
@@ -165,17 +161,19 @@ def plot_diversity(data_dir, nthreads=1):
 
     axes[-1].set_xlabel("genome position")
 
-    # -----------------------
-    # 5. Chromosome labels
-    # -----------------------
+    # Chromosome labels
     if len(boundaries) > 1:
         centers = boundaries.copy()
         centers["center"] = centers["offset"] + centers["length"] / 2
         axes[-1].set_xticks(centers["center"])
         axes[-1].set_xticklabels(centers["contig"], rotation=90)
 
-    plt.tight_layout()
-    plt.show()
+    if out is not None:
+        plt.savefig(out, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.tight_layout()
+        plt.show()
 
     return df
 
@@ -395,7 +393,8 @@ def plot_sfs(
 
 
 def plot_manhattan(
-    input,
+    prediction,
+    recombination_map: str | None = None,
     eps: float = 1e-10,
     chr_col: str | None = None,
     pos_col: str | None = None,
@@ -405,177 +404,321 @@ def plot_manhattan(
     figsize: tuple = (14, 5),
     out: str | None = None,
     title: str | None = None,
+    chrom: str | int | None = None,
+    center: int | None = None,
+    window_bp: int = 5_000_000,
+    chr_prefix_pattern: str = r"^chr",
 ):
-    """Genome-wide Manhattan plot.
-
-    Works for both CNN output (``prob_sweep``) and scan.py output (``{stat}_pvalue``).
-    All new parameters default to None/True to preserve backward-compatible CNN behaviour.
-
-    Parameters
-    ----------
-    input : str | polars.DataFrame
-        CSV/DataFrame with genomic positions and p-values.
-    eps : float
-        Floor applied to p-values before -log10 to avoid inf.
-    chr_col : str, optional
-        Chromosome column name. None → ``"chr"`` (CNN default).
-    pos_col : str, optional
-        Position column name. None → ``"start"`` (CNN default).
-    p_col : str, optional
-        Column to use as p-value directly. None → compute ``1 - prob_sweep`` (CNN default).
-    log_transform : bool
-        If True (default), plot ``-log10(P)`` on y-axis. If False, plot raw values.
-    threshold_lines : list of (y_value, linestyle, label), optional
-        Horizontal threshold lines. None → CNN defaults (y=3 solid, y=2 dashed).
-        Pass ``[]`` for no lines.
-    figsize : tuple
-        Figure size in inches.
-    out : str, optional
-        Save path. If None, shows interactively.
-    title : str, optional
-        Plot title.
-    """
-    # Load
-    if isinstance(input, str):
-        try:
-            df = pl.read_csv(input, separator=",")
-        except Exception:
-            df = None
-    else:
-        df = input
-
-    # CNN-specific stats (only when predicted_model column present)
-    if "predicted_model" in df.columns:
-        pred_counts = df["predicted_model"].value_counts()
-        total = len(df)
-        count_1 = (
-            pred_counts.filter(pl.col("predicted_model") == 1)["count"][0]
-            if 1 in pred_counts["predicted_model"].to_list()
-            else 0
+    # ----------------------------
+    # Stable chromosome encoding
+    # ----------------------------
+    def _chr_to_int(expr: pl.Expr) -> pl.Expr:
+        cleaned = (
+            expr.cast(pl.Utf8)
+            .str.to_uppercase()
+            .str.replace(chr_prefix_pattern, "")
+            .str.extract(r"(\d+|X|Y|MT|M)$", 1)
         )
 
-    # Resolve column names
+        return cleaned.replace({"X": "23", "Y": "24", "MT": "25", "M": "25"}).cast(
+            pl.Int32
+        )
+
+    def _chr_str_to_int(val: str | int) -> int:
+        s = str(val).upper()
+        s = pl.Series([s]).str.replace(chr_prefix_pattern, "").to_list()[0]
+
+        if s == "X":
+            return 23
+        if s == "Y":
+            return 24
+        if s in {"MT", "M"}:
+            return 25
+        return int(s)
+
+    # ----------------------------
+    # Fixed chromosome color map
+    # ----------------------------
+    _CHR_COLORS = {i: ("black" if i % 2 == 1 else "0.8") for i in range(1, 26)}
+
+    # ----------------------------
+    # Load data
+    # ----------------------------
+    df = pl.read_csv(prediction) if isinstance(prediction, str) else prediction
+
     _chr_col = chr_col or "chr"
     _pos_col = pos_col or "start"
-
-    # Build CHR, BP, P columns
-    if p_col is not None:
-        df = df.with_columns(
-            [
-                pl.col(_chr_col)
-                .cast(pl.Utf8)
-                .str.replace("^chr", "")
-                .cast(pl.Float64)
-                .alias("CHR"),
-                pl.col(p_col).cast(pl.Float64).clip(lower_bound=eps).alias("P"),
-            ]
-        ).select(["CHR", pl.col(_pos_col).cast(pl.Float64).alias("BP"), "P"])
-    else:
-        # CNN default: P = 1 - prob_sweep
-        df = df.with_columns(
-            [
-                pl.col(_chr_col)
-                .cast(pl.Utf8)
-                .str.replace("^chr", "")
-                .cast(pl.Float64)
-                .alias("CHR"),
-                (1 - pl.col("prob_sweep")).clip(lower_bound=eps).alias("P"),
-            ]
-        ).select(["CHR", pl.col(_pos_col).cast(pl.Float64).alias("BP"), "P"])
-
-    # Compute cumulative chromosome offsets
-    chr_lens = (
-        df.group_by("CHR")
-        .agg(pl.col("BP").max().alias("chr_len"))
-        .sort("CHR")
-        .with_columns((pl.col("chr_len").cum_sum() - pl.col("chr_len")).alias("tot"))
-        .select(["CHR", "tot"])
+    _end_col = (
+        "end" if "end" in df.columns else ("stop" if "stop" in df.columns else _pos_col)
     )
+    is_regional = chrom is not None
 
+    # ----------------------------
+    # Normalize input
+    # ----------------------------
     df = (
-        df.join(chr_lens, on="CHR", how="left")
-        .sort(["CHR", "BP"])
-        .with_columns((pl.col("BP") + pl.col("tot")).alias("BPcum"))
+        df.with_columns(
+            [
+                _chr_to_int(pl.col(_chr_col)).alias("CHR_INT"),
+                pl.col(_pos_col).cast(pl.Int64).alias("BP_START"),
+                pl.col(_end_col).cast(pl.Int64).alias("BP_END"),
+            ]
+        )
+        .filter(pl.col("CHR_INT").is_not_null())
+        .with_columns(((pl.col("BP_START") + pl.col("BP_END")) / 2).alias("midpoint"))
+        .sort(["CHR_INT", "BP_START"])
     )
 
-    # Axis tick positions (center of each chromosome)
-    axisdf = (
-        df.group_by("CHR")
-        .agg(((pl.col("BPcum").max() + pl.col("BPcum").min()) / 2).alias("center"))
-        .sort("CHR")
+    p_target = p_col or "prob_sweep"
+    df = df.with_columns(
+        pl.col(p_target).cast(pl.Float64).clip(lower_bound=eps).alias("P")
     )
 
+    # ----------------------------
+    # Recombination map
+    # ----------------------------
+    if recombination_map:
+        df_rec = (
+            pl.read_csv(
+                recombination_map,
+                separator="\t",
+                comment_prefix="#",
+                schema=pl.Schema(
+                    [
+                        ("chr", pl.String),
+                        ("start", pl.Int64),
+                        ("end", pl.Int64),
+                        ("cm_mb", pl.Float64),
+                        ("cm", pl.Float64),
+                    ]
+                ),
+            )
+            .with_columns(_chr_to_int(pl.col("chr")).alias("chr"))
+            .filter(pl.col("chr").is_not_null())
+        )
+
+        df_temp = df.select(
+            [
+                pl.col("CHR_INT").alias("chr"),
+                pl.col("BP_START").alias("start"),
+                pl.col("BP_END").alias("end"),
+            ]
+        )
+
+        rate_frames = [
+            get_cm(
+                df_rec.filter(pl.col("chr") == c),
+                df_temp.filter(pl.col("chr") == c)
+                .select("start", "end")
+                .unique()
+                .to_numpy(),
+                cm_mb=True,
+            )
+            for c in df_temp["chr"].unique()
+            if c in df_rec["chr"].unique()
+        ]
+
+        if rate_frames:
+            df_rate = pl.concat(rate_frames).select(["chr", "start", "end", "cm_mb"])
+            df = df.join(
+                df_rate,
+                left_on=["CHR_INT", "BP_START", "BP_END"],
+                right_on=["chr", "start", "end"],
+                how="left",
+            )
+
+    chrom_order = list(range(1, 26))
+
+    # ----------------------------
+    # Regional mode
+    # ----------------------------
+    if is_regional:
+        target_chrom = _chr_str_to_int(chrom)
+        df_plot = df.filter(pl.col("CHR_INT") == target_chrom)
+
+        if center is not None:
+            xlim_lo, xlim_hi = center - window_bp, center + window_bp
+            plot_center_line = float(center)
+
+            df_plot = df_plot.filter(
+                (pl.col("midpoint") >= xlim_lo - 1_000_000)
+                & (pl.col("midpoint") <= xlim_hi + 1_000_000)
+            )
+        else:
+            xlim_lo, xlim_hi, plot_center_line = None, None, None
+
+        df_plot = df_plot.sort("BP_START")
+
+    # ----------------------------
+    # Global mode
+    # ----------------------------
+    else:
+        df = df.filter(pl.col("CHR_INT").is_in(chrom_order))
+
+        chr_lens = (
+            df.group_by("CHR_INT")
+            .agg(pl.col("BP_START").max().alias("chr_len"))
+            .sort("CHR_INT")
+            .with_columns(
+                (pl.col("chr_len").cum_sum() - pl.col("chr_len")).alias("tot")
+            )
+        )
+
+        df_plot = (
+            df.join(chr_lens, on="CHR_INT", how="left")
+            .sort(["CHR_INT", "BP_START"])
+            .with_columns((pl.col("BP_START") + pl.col("tot")).alias("BPcum"))
+        )
+
+        axisdf = (
+            df_plot.group_by("CHR_INT")
+            .agg(((pl.col("BPcum").max() + pl.col("BPcum").min()) / 2).alias("center"))
+            .sort("CHR_INT")
+        )
+
+    # ----------------------------
     # Plot
+    # ----------------------------
     fig, ax = plt.subplots(figsize=figsize)
 
-    chromosomes = df["CHR"].unique().sort().to_list()
-    colors = ["black", "0.8"]
-    for i, chrom in enumerate(chromosomes):
-        sub = df.filter(pl.col("CHR") == chrom)
-        p_vals = sub["P"].to_numpy()
-        y_vals = -np.log10(p_vals) if log_transform else p_vals
-        ax.scatter(
-            sub["BPcum"].to_numpy(),
-            y_vals,
-            color=colors[i % 2],
-            alpha=0.8,
-            s=8,
-            linewidths=0,
-        )
+    # ----------------------------
+    # Recombination (ON TOP, darker)
+    # ----------------------------
+    if "cm_mb" in df_plot.columns:
+        ax2 = ax.twinx()
+        ax2.set_zorder(ax.get_zorder() + 1)
+        ax2.patch.set_alpha(0)
 
-    # Threshold lines
-    if threshold_lines is None:
-        # CNN defaults
-        ax.axhline(
-            y=3,
-            color="black",
-            linestyle="-",
-            linewidth=1.2,
-            label=r"$p_{sweep} > 0.999$",
+        x_rec = (
+            df_plot["midpoint"].to_numpy()
+            if is_regional
+            else df_plot["BPcum"].to_numpy()
         )
-        ax.axhline(
-            y=2,
-            color="black",
-            linestyle="--",
-            linewidth=1.2,
-            label=r"$p_{sweep} > 0.99$",
+        y_rec = df_plot["cm_mb"].fill_null(0).to_numpy()
+
+        recomb_color = "#e60000"
+
+        if is_regional:
+            ax2.plot(x_rec, y_rec, color=recomb_color, lw=1.6, alpha=0.6, zorder=50)
+        else:
+            ax2.scatter(x_rec, y_rec, color=recomb_color, s=2, alpha=0.45, zorder=50)
+
+        ax2.set_ylabel("Recombination Rate (cM/Mb)", fontsize=9)
+
+        if is_regional and center is not None:
+            ax2.set_xlim(xlim_lo, xlim_hi)
+
+    # ----------------------------
+    # Manhattan scatter
+    # ----------------------------
+    if is_regional:
+        y = (
+            -np.log10((1 - df_plot["P"]).clip(lower_bound=eps).to_numpy())
+            if log_transform
+            else df_plot["P"].to_numpy()
         )
+        x = df_plot["midpoint"].to_numpy()
+
+        colors = [_CHR_COLORS[c] for c in df_plot["CHR_INT"].to_list()]
+
+        ax.scatter(x, y, color=colors, s=8, lw=0, zorder=10)
+
     else:
-        for y_val, ls, label in threshold_lines:
-            ax.axhline(y_val, color="black", linestyle=ls, linewidth=1.0, label=label)
+        for c_val in chrom_order:
+            sub = df_plot.filter(pl.col("CHR_INT") == c_val)
+            if sub.is_empty():
+                continue
 
-    # Axis formatting
-    ax.set_xticks(axisdf["center"].to_list())
-    ax.set_xticklabels([str(int(c)) for c in axisdf["CHR"].to_list()], fontsize=7)
+            y = (
+                -np.log10((1 - sub["P"]).clip(lower_bound=eps).to_numpy())
+                if log_transform
+                else sub["P"].to_numpy()
+            )
+            x = sub["BPcum"].to_numpy()
+
+            ax.scatter(x, y, color=_CHR_COLORS[c_val], s=8, lw=0, zorder=10)
+
+    # ----------------------------
+    # Center line
+    # ----------------------------
+    if is_regional and center is not None:
+        ax.axvline(
+            plot_center_line, color="black", lw=1.2, ls="--", alpha=0.6, zorder=100
+        )
+
+    # ----------------------------
+    # Thresholds (RESTORED)
+    # ----------------------------
+    if threshold_lines:
+        for y_v, ls, lbl in threshold_lines:
+            ax.axhline(y_v, color="black", linestyle=ls, lw=1.0, label=lbl, zorder=20)
+    elif log_transform:
+        ax.axhline(
+            3, color="black", ls="-", lw=1.2, label=r"$p_{sweep} > 0.999$", zorder=20
+        )
+        ax.axhline(
+            2, color="black", ls="--", lw=1.2, label=r"$p_{sweep} > 0.99$", zorder=20
+        )
+
+    # ----------------------------
+    # Formatting
+    # ----------------------------
     if log_transform:
-        ax.set_yticks([2, 4, 6, 8, 10])
-        ax.set_ylim(0, 10)
-        ax.set_ylabel(
-            r"$-\log_{10}(1 - p_{sweep})$"
-            if p_col is None
-            else rf"$-\log_{{10}}({p_col})$"
-        )
+        ax.set_ylabel(r"$-\log_{10}(1 - P)$")
+        ax.set_ylim(0, 8)
     else:
-        ax.set_ylabel(p_col or "stat")
-    ax.set_xlabel("")
+        ax.set_ylabel("Probability of Sweep")
+        ax.set_ylim(0, 1.1)
+
+    if is_regional:
+        ax.xaxis.set_major_formatter(
+            mticker.FuncFormatter(lambda x, _: f"{x / 1e6:.2f} Mb")
+        )
+        ax.set_xlabel(f"Chromosome {chrom}")
+    else:
+        ax.set_xticks(axisdf["center"].to_list())
+        ax.set_xticklabels([str(c) for c in axisdf["CHR_INT"].to_list()], fontsize=7)
+
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(axis="y", color="lightgray", lw=0.5)
+
+    if log_transform or threshold_lines:
+        ax.legend(fontsize=9)
+
     if title:
         ax.set_title(title)
 
-    # Style
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.spines["left"].set_visible(True)
-    ax.spines["bottom"].set_visible(True)
-    ax.grid(axis="y", color="lightgray", linewidth=0.5)
-    ax.grid(axis="x", visible=False)
+    ax.set_xlim(center - 1_000_000, center + 1_000_000)
 
-    ax.legend(fontsize=9, frameon=False)
+    # If you want the Y-axis to auto-adjust to the data
+    # visible in this new X-range:
+    ax.relim()
+    ax.autoscale_view(scalex=False, scaley=True)
     plt.tight_layout()
+
     if out:
-        fig.savefig(out, dpi=150)
+        fig.savefig(out, dpi=150, bbox_inches="tight")
         plt.close(fig)
     else:
         plt.show()
+
+    # # 1. Access the main axis
+    # ax = a.axes[0]
+
+    # # 2. Set the zoom and the narrow figure size
+    # ax.set_xlim(80_900_000, 82_800_000)
+    # a.set_size_inches(6, 5)
+
+    # # 3. FIX OVERLAPPING TICKS
+    # # Option A: Tell Matplotlib to only show a few ticks (e.g., max 4)
+    # ax.xaxis.set_major_locator(mticker.MaxNLocator(nbins=4))
+
+    # # Option B: Rotate the labels slightly so they don't hit each other
+    # plt.setp(ax.get_xticklabels(), rotation=30, ha='right')
+
+    # # 4. Cleanup and Save
+    # a.tight_layout()
+    # a.savefig("plot_zoom_fixed_ticks.png", dpi=150, bbox_inches="tight")
     return fig
 
 
@@ -1474,7 +1617,7 @@ def haplotype_freq_sorting(matrix):
     matrix = np.asarray(matrix)
     S, n = matrix.shape
 
-    # --- same grouping logic as in haplotype_freq_sorting_hamming ---
+    # same grouping logic as in haplotype_freq_sorting_hamming
     d = defaultdict(list)
     for i in range(n):
         k = hash(matrix[:, i].tobytes())
@@ -1898,7 +2041,7 @@ def rank_probabilities(prediction, feature_coordinates, rank_distance=False, k=1
 
 
 def interpolate_rates(
-    prediction, recombination_map, prediction_lr=None, corr=False, bins=10
+    prediction, recombination_map, prediction_lr=None, corr=False, bins=10, out=None
 ):
     """
     Interpolate recombination rates (cM/Mb) onto prediction windows and optionally
@@ -1987,6 +2130,7 @@ def interpolate_rates(
                 pl.len().alias("n_in_bin"),
                 pl.min("cm_mb").alias("cm_mb_min"),
                 pl.max("cm_mb").alias("cm_mb_max"),
+                ((pl.col("prob_sweep") > 0.9).sum() / pl.len()).alias("cm_mb_prop"),
             )
             .sort("cm_mb_min")
             .with_columns(
@@ -2064,7 +2208,7 @@ def interpolate_rates(
                 .then(pl.col("prob_neutral_right"))
                 .otherwise(pl.col("prob_neutral")),
             )
-            .select(df_pred.columns + ["cm_mb"])  # restore original column order
+            .select(df_pred.columns + ["cm_mb"])
         )
 
     else:
@@ -2085,7 +2229,7 @@ def interpolate_rates(
         df_trend = df_corr_binned.join(df_bins, on="chr", how="left")
 
         chrs = sorted(df_trend["chr"].unique().to_list(), key=_chr_key)
-        ncols = 4
+        ncols = 4 if len(chrs) >= 4 else len(chrs)
         nrows = math.ceil(len(chrs) / ncols)
 
         fig, axes = plt.subplots(
@@ -2097,6 +2241,7 @@ def interpolate_rates(
             t = df_trend.filter(pl.col("chr") == c)
             x = t.get_column("cm_mb").to_numpy()
             y = t.get_column("prob_sweep").to_numpy()
+            # y = t.get_column("cm_mb_prop").to_numpy()
             ax.plot(x, y, linewidth=1.2, color="#2166ac")
             r = t.get_column("corr")[0]
             r_str = f"r={r:.2f}" if r is not None else "r=NA"
@@ -2115,8 +2260,10 @@ def interpolate_rates(
             ax.axis("off")
 
         plt.tight_layout(h_pad=3.5, w_pad=1.5)  # ← h_pad is the main lever here
-        # plt.savefig("fig1.pdf", dpi=300, bbox_inches="tight")
-        plt.show()
+        if out is not None:
+            plt.savefig(out, dpi=300, bbox_inches="tight")
+        else:
+            plt.show()
 
         return (
             df_pred_rate,

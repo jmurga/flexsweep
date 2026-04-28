@@ -1,5 +1,5 @@
 mod maf;
-mod polarize;
+mod est_sfs;
 
 use clap::Parser;
 use flate2::Compression;
@@ -732,19 +732,22 @@ fn run_parsimony(
             .unwrap_or_else(|| "N".to_string());
 
         let info = record.info();
+
         let an: i32 = match info.get(&header, "AN") {
             Some(Ok(Some(Value::Integer(v)))) if v >= 0 => v as i32,
             _ => 0,
         };
         let ac: i32 = match info.get(&header, "AC") {
+            Some(Ok(Some(Value::Integer(v)))) => v as i32,
             Some(Ok(Some(Value::Array(Array::Integer(values))))) => values
                 .iter()
                 .next()
                 .and_then(|v| v.ok().flatten())
-                .unwrap_or(0)
-                as i32,
+                .unwrap_or(0) as i32,
+                
             _ => 0,
         };
+
         let af: f32 = match info.get(&header, "AF") {
             Some(Ok(Some(Value::Array(Array::Float(values))))) => {
                 let mut iter = values.iter();
@@ -870,14 +873,16 @@ fn run_model_based(
             _ => 0,
         };
         let ac: i32 = match info.get(&header, "AC") {
+            Some(Ok(Some(Value::Integer(v)))) => v as i32,
             Some(Ok(Some(Value::Array(Array::Integer(values))))) => values
                 .iter()
                 .next()
                 .and_then(|v| v.ok().flatten())
-                .unwrap_or(0)
-                as i32,
+                .unwrap_or(0) as i32,
+                
             _ => 0,
         };
+
         let _af: f32 = match info.get(&header, "AF") {
             Some(Ok(Some(Value::Array(Array::Float(values))))) => {
                 let mut iter = values.iter();
@@ -1112,14 +1117,16 @@ fn run_model_based(
             _ => 0,
         };
         let ac: i32 = match info.get(&header, "AC") {
+            Some(Ok(Some(Value::Integer(v)))) => v as i32,
             Some(Ok(Some(Value::Array(Array::Integer(values))))) => values
                 .iter()
                 .next()
                 .and_then(|v| v.ok().flatten())
-                .unwrap_or(0)
-                as i32,
+                .unwrap_or(0) as i32,
+                
             _ => 0,
         };
+
         let af: f32 = match info.get(&header, "AF") {
             Some(Ok(Some(Value::Array(Array::Float(values))))) => {
                 let mut iter = values.iter();

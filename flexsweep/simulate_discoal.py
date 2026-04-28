@@ -47,14 +47,26 @@ def build_discoal():
     build_dir = Path(tempfile.mkdtemp(prefix="discoal_build_"))
     try:
         subprocess.run(
-            ["git", "clone", "--depth", "1",
-             "https://github.com/kr-colab/discoal.git", str(build_dir)],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            [
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "https://github.com/kr-colab/discoal.git",
+                str(build_dir),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
         )
         subprocess.run(
             ["make", "discoal"],
             cwd=str(build_dir),
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
         )
     except subprocess.CalledProcessError as exc:
         if exc.stderr:
@@ -125,15 +137,15 @@ class Simulator:
         recombination_rate={
             "dist": "exponential",
             "min": 1e-9,
-            "max": 4e-8,
+            "max": 1e-7,
             "mean": 1e-8,
         },
         locus_length=int(1.2e6),
         discoal_path=DISCOAL,
         num_simulations=int(2.5e5),
-        saf = [0, 0.1],
-        eaf = [0.5, 1],
-        s = [0.01, 0.05],
+        saf=[0, 0.1],
+        eaf=[0.5, 1],
+        s=[0.01, 0.05],
         time=[0, 5000],
         nthreads=1,
         ne=int(1e4),
@@ -215,12 +227,12 @@ class Simulator:
         Returns:
             str: Discoal demographic flags string (e.g., " -en <t> 0 <size> ...").
         """
-        assert isinstance(self.mutation_rate, dict), (
-            "Please input distribution and mutation rates values"
-        )
-        assert isinstance(self.recombination_rate, dict), (
-            "Please input distribution and recombination_rate values"
-        )
+        assert isinstance(
+            self.mutation_rate, dict
+        ), "Please input distribution and mutation rates values"
+        assert isinstance(
+            self.recombination_rate, dict
+        ), "Please input distribution and recombination_rate values"
 
         os.makedirs(self.output_folder, exist_ok=True)
         os.makedirs(self.output_folder + "/sweep/", exist_ok=True)
@@ -327,11 +339,13 @@ class Simulator:
             )
         elif self.recombination_rate["dist"] == "exponential":
             if len(self.recombination_rate.keys()) == 2:
-                rho =  np.random.exponential(self.recombination_rate["mean"], num)
+                rho = np.random.exponential(self.recombination_rate["mean"], num)
             else:
                 rho = []
                 while len(rho) < num:
-                    tmp_rho = np.random.exponential(self.recombination_rate["mean"], num)
+                    tmp_rho = np.random.exponential(
+                        self.recombination_rate["mean"], num
+                    )
                     valid_values = tmp_rho[
                         (tmp_rho >= self.recombination_rate["min"])
                         & (tmp_rho <= self.recombination_rate["max"])
@@ -630,7 +644,6 @@ class Simulator:
 
         return output_file
 
-
     def simulate_batch(self):
         """
         Run neutral and sweep simulations via discoal, in batches.
@@ -649,7 +662,6 @@ class Simulator:
                 f"File not found: {self.output_folder}/params.txt.gz"
             )
 
-
         # materialize rows once
         neutral_rows = list(
             df_params.filter(pl.col("model") == "neutral").iter_rows(named=True)
@@ -657,7 +669,6 @@ class Simulator:
         sweep_rows = list(
             df_params.filter(pl.col("model") != "neutral").iter_rows(named=True)
         )
-
 
         batch_size = int(max(1, len(neutral_rows) / self.nthreads))
 
