@@ -104,18 +104,61 @@ DECODE_MAP = os.path.join(
     os.path.dirname(__file__), "data", "decode_sexavg_2019.txt.gz"
 )
 
+_DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+
+# 1000 Genomes populations with a shipped Relate (Speidel et al. 2019) single-population
+# Ne trajectory, file data/<pop>_spiedel_2019_full.yaml
+POPULATIONS_1KG = (
+    "ACB ASW BEB CDX CEU CHB CHS CLM ESN FIN GBR GIH GWD "
+    "IBS ITU JPT KHV LWK MSL MXL PEL PJL PUR STU TSI YRI"
+).split()
+
 DEMES_EXAMPLES = {
-    "constant": os.path.join(os.path.dirname(__file__), "data", "constant.yaml"),
-    "yri": os.path.join(
-        os.path.dirname(__file__), "data", "yri_spiedel_2019_full.yaml"
-    ),
-    "ceu": os.path.join(
-        os.path.dirname(__file__), "data", "ceu_spiedel_2019_full.yaml"
-    ),
-    "chb": os.path.join(
-        os.path.dirname(__file__), "data", "chb_spiedel_2019_full.yaml"
-    ),
+    "constant": os.path.join(_DATA_DIR, "constant.yaml"),
+    "africa_1t12": os.path.join(_DATA_DIR, "Africa_1T12.yaml"),
+    **{
+        pop.lower(): os.path.join(_DATA_DIR, f"{pop.lower()}_spiedel_2019_full.yaml")
+        for pop in POPULATIONS_1KG
+    },
 }
+
+
+def resolve_demes(value: str) -> str:
+    """Resolve a demes model given as a shipped alias or a path.
+
+    Aliases are the keys of ``DEMES_EXAMPLES``, case-insensitive: ``constant``,
+    ``africa_1t12`` and the 26 1000 Genomes population codes (``yri``, ``ceu``,
+    ``chb``, ...; see ``POPULATIONS_1KG``), or the basename of a shipped YAML (e.g.
+    ``yri_spiedel_2019_full.yaml``). Anything else is treated as a path to a demes
+    YAML file.
+    """
+    key = str(value).lower()
+    if key in DEMES_EXAMPLES:
+        return DEMES_EXAMPLES[key]
+    for path in DEMES_EXAMPLES.values():
+        if os.path.basename(path) == os.path.basename(str(value)) and not os.path.exists(value):
+            return path
+    if not os.path.exists(value):
+        raise FileNotFoundError(
+            f"Demes model not found: {value!r}. Pass a path to a demes YAML file or one "
+            f"of the shipped models: constant, africa_1t12, or a 1000 Genomes population "
+            f"code ({', '.join(p.lower() for p in POPULATIONS_1KG)})."
+        )
+    return value
+
+
+def resolve_recombination_map(value: str | None) -> str | None:
+    """Resolve ``'decode'`` to the bundled deCODE 2019 sex-averaged map (GRCh38)."""
+    if value is None:
+        return None
+    if str(value).lower() == "decode":
+        return DECODE_MAP
+    if not os.path.exists(value):
+        raise FileNotFoundError(
+            f"Recombination map not found: {value!r}. Pass a path or 'decode' for the "
+            f"bundled deCODE 2019 sex-averaged map (GRCh38)."
+        )
+    return value
 
 
 class Simulator:
@@ -152,6 +195,7 @@ class Simulator:
         ne=int(1e4),
         fixed_ratio=0.1,
         split=False,
+        seed=None,
     ):
         """
         Initialize discoal coalescent simulations.
@@ -160,7 +204,9 @@ class Simulator:
         the ``discoal`` binary.
 
         :param int sample_size: Number of haplotypes per replicate.
-        :param str demes: Path to a demes YAML file describing demography.
+        :param str demes: Path to a demes YAML file describing demography, or a
+            shipped alias (``constant``, ``africa_1t12`` or a 1000 Genomes population
+            code such as ``yri``; see ``DEMES_EXAMPLES``).
         :param str output_folder: Directory to write ms outputs and parameters.
         :param dict mutation_rate: Mutation rate distribution (per-bp :math:`\\mu`).
             Supported forms:
@@ -168,20 +214,30 @@ class Simulator:
             * ``{"dist": "uniform", "min": float, "max": float}``
             * ``{"dist": "exponential", "min": float, "max": float, "mean": float}``
             * ``{"dist": "truncnorm", "min": float, "max": float, "mean": float, "std": float}``
-            * ``{"dist": "fixed", "value": float}`` (placeholder, not implemented)
+            * ``{"dist": "fixed", "value": float}`` (same value in every replicate)
 
             **Default:** ``{"dist": "uniform", "min": 5e-9, "max": 2e-8}``.
         :param dict recombination_rate: Recombination rate distribution (per-bp :math:`r`).
             Same schema as ``mutation_rate``. **Default:**
-            ``{"dist": "exponential", "min": 1e-9, "max": 4e-8, "mean": 1e-8}``.
+            ``{"dist": "exponential", "min": 1e-9, "max": 1e-7, "mean": 1e-8}``.
         :param int locus_length: Sequence length in base pairs.
             **Default:** ``1_200_000``.
         :param str discoal_path: Path to the discoal executable.
             **Default:** value of module/global ``DISCOAL``.
         :param int num_simulations: Number of neutral and number of sweep replicates (each).
-            **Default:** ``12500``.
-        :param int ne: Effective population size :math:`N_e`. **Default:** ``10000``.
-        :param list time: Sweep time window in generations ``[min, max]``.
+            **Default:** ``250000``.
+        :param int ne: Effective population size :math:`N_e`. Replaced by the size of the
+            oldest epoch of the demes model when the model is read; that ancestral size
+            scales :math:`\theta`, :math:`\rho`, ``s`` and ``time`` to discoal units.
+            **Default:** ``10000``.
+        :param list saf: Start allele frequency range ``[min, max]`` of soft sweeps.
+            **Default:** ``[0, 0.1]``.
+        :param list eaf: End allele frequency range ``[min, max]`` of incomplete sweeps.
+            **Default:** ``[0.5, 1]``.
+        :param list s: Selection coefficient range ``[min, max]``, drawn uniformly.
+            **Default:** ``[0.01, 0.05]``.
+        :param list time: Range ``[min, max]`` of generations before the present at which
+            the sweep ends, drawn uniformly (discoal ``-ws``).
             **Default:** ``[0, 5000]``.
         :param x: Sweep position along the locus as a fraction in ``[0, 1]``
             (discoal ``-x``). A scalar fixes the position for every replicate;
@@ -192,14 +248,10 @@ class Simulator:
         :param float fixed_ratio: Fraction of complete sweeps within hard/soft sets.
             **Default:** ``0.1``.
 
-        .. note::
-           Random number generation is **not seeded** (non-deterministic runs).
-
-        .. warning::
-           The implementation later overwrites some constructor values internally
-           (e.g., ``self.time``, ``self.s``, ``self.fixed_ratio``) to fixed ranges.
-           If you want the arguments above to take effect, remove those reassignments
-           in the code.
+        :param int seed: Seed for parameter draws and for every discoal replicate
+            (passed as ``-d seed1 seed2``; per-replicate seeds are stored in
+            ``params.txt.gz``). ``None`` draws fresh entropy; the per-replicate seeds
+            are still recorded, so any replicate can be re-run exactly.
 
         """
         self.ne_0 = ne
@@ -208,7 +260,9 @@ class Simulator:
         self.mutation_rate = mutation_rate
         self.recombination_rate = recombination_rate
         self.locus_length = int(locus_length)
-        self.demes = demes
+        self.demes = resolve_demes(demes)
+        self.seed = seed
+        self.rng = np.random.default_rng(seed)
         self.output_folder = output_folder
         self.discoal_path = str(_ensure_discoal(discoal_path))
         self.nthreads = nthreads
@@ -240,6 +294,12 @@ class Simulator:
         assert isinstance(
             self.recombination_rate, dict
         ), "Please input distribution and recombination_rate values"
+        for name, spec in (
+            ("mutation_rate", self.mutation_rate),
+            ("recombination_rate", self.recombination_rate),
+        ):
+            if spec.get("dist") == "fixed" and "value" not in spec:
+                raise ValueError(f"{name}: 'fixed' needs a 'value' key, e.g. {{'dist': 'fixed', 'value': 1e-8}}")
 
         os.makedirs(self.output_folder, exist_ok=True)
         os.makedirs(self.output_folder + "/sweep/", exist_ok=True)
@@ -299,7 +359,7 @@ class Simulator:
             - 'uniform': Uniform[min, max]
             - 'exponential': Exponential(mean), truncated to [min, max]
             - 'truncnorm': Truncated normal with mean/std/min/max
-            - 'fixed': Placeholder only (currently not implemented)
+            - 'fixed': the same value for every replicate
 
         Notes:
             - Values are in per-basepair units.
@@ -309,13 +369,13 @@ class Simulator:
         # mbe
         # N('dist':'normal','mean':1.25e-8,'std':1e-8,'min':2e-9,'max':5.2e-8)
         if self.mutation_rate["dist"] == "uniform":
-            mu = np.random.uniform(
+            mu = self.rng.uniform(
                 self.mutation_rate["min"], self.mutation_rate["max"], num
             )
         elif self.mutation_rate["dist"] == "exponential":
             mu = []
             while len(mu) < num:
-                tmp_mu = np.random.exponential(self.mutation_rate["mean"], num)
+                tmp_mu = self.rng.exponential(self.mutation_rate["mean"], num)
                 valid_values = tmp_mu[
                     (tmp_mu >= self.mutation_rate["min"])
                     & (tmp_mu <= self.mutation_rate["max"])
@@ -324,7 +384,7 @@ class Simulator:
                 mu.extend(valid_values[:remaining])
             mu = np.array(mu)
         elif self.mutation_rate["dist"] == "fixed":
-            next
+            mu = np.full(num, float(self.mutation_rate["value"]))
         else:
             mu = stats.truncnorm(
                 (self.mutation_rate["min"] - self.mutation_rate["mean"])
@@ -333,24 +393,24 @@ class Simulator:
                 / self.mutation_rate["std"],
                 loc=self.mutation_rate["mean"],
                 scale=self.mutation_rate["std"],
-            ).rvs(size=num)
+            ).rvs(size=num, random_state=self.rng)
 
         #
         # mbe = U('dist': 'normal','min':1e-9,'max':5e-8,'mean':1e-8,'std':5e-9)
         # mbe high r = U('dist': 'normal','min':1e-9,'max':5e-8,'mean':1e-8,'std':1e-8)
         if self.recombination_rate["dist"] == "uniform":
-            rho = np.random.uniform(
+            rho = self.rng.uniform(
                 self.recombination_rate["min"],
                 self.recombination_rate["max"],
                 num,
             )
         elif self.recombination_rate["dist"] == "exponential":
             if len(self.recombination_rate.keys()) == 2:
-                rho = np.random.exponential(self.recombination_rate["mean"], num)
+                rho = self.rng.exponential(self.recombination_rate["mean"], num)
             else:
                 rho = []
                 while len(rho) < num:
-                    tmp_rho = np.random.exponential(
+                    tmp_rho = self.rng.exponential(
                         self.recombination_rate["mean"], num
                     )
                     valid_values = tmp_rho[
@@ -361,7 +421,7 @@ class Simulator:
                     rho.extend(valid_values[:remaining])
                 rho = np.array(rho)
         elif self.recombination_rate["dist"] == "fixed":
-            next
+            rho = np.full(num, float(self.recombination_rate["value"]))
         else:
             rho = stats.truncnorm(
                 (self.recombination_rate["min"] - self.recombination_rate["mean"])
@@ -370,7 +430,7 @@ class Simulator:
                 / self.recombination_rate["std"],
                 loc=self.recombination_rate["mean"],
                 scale=self.recombination_rate["std"],
-            ).rvs(size=num)
+            ).rvs(size=num, random_state=self.rng)
 
         return mu, rho
 
@@ -404,18 +464,18 @@ class Simulator:
         theta_sweep = scaling * mu_sweep
         rho_sweep = scaling * r_sweep
 
-        sel_time = np.random.uniform(
+        sel_time = self.rng.uniform(
             self.time[0], self.time[-1], self.num_simulations
         ) / (4 * self.ne)
 
         sel_coef = (
-            np.random.uniform(self.s[0], self.s[-1], self.num_simulations) * 2 * self.ne
+            self.rng.uniform(self.s[0], self.s[-1], self.num_simulations) * 2 * self.ne
         )
 
         # Sweep position along the locus (discoal -x). Fixed if x is a scalar,
         # drawn uniformly per replicate if x is a [min, max] range.
         if isinstance(self.x, (list, tuple, np.ndarray)):
-            sweep_position = np.random.uniform(
+            sweep_position = self.rng.uniform(
                 self.x[0], self.x[-1], self.num_simulations
             )
         else:
@@ -424,24 +484,32 @@ class Simulator:
         num_hard = int(self.num_simulations * 0.5)
         num_soft = self.num_simulations - num_hard
 
-        hard_complete_f_t = np.repeat(1, int(num_hard * self.fixed_ratio))
-        hard_complete_f_i = np.repeat(0, int(num_hard * self.fixed_ratio))
+        # Complete/incomplete counts per class; incomplete takes the remainder so the
+        # four groups always sum to num_simulations (int() truncation of both parts
+        # dropped rows, e.g. 48 parameter sets for 50 iterations).
+        n_hard_complete = int(num_hard * self.fixed_ratio)
+        n_hard_incomplete = num_hard - n_hard_complete
+        n_soft_complete = int(num_soft * self.fixed_ratio)
+        n_soft_incomplete = num_soft - n_soft_complete
 
-        hard_incomplete_f_t = np.random.uniform(
-            self.f_t[0], self.f_t[-1], int(num_hard * (1 - self.fixed_ratio))
-        )
-        hard_incomplete_f_i = np.repeat(0, int(num_hard * (1 - self.fixed_ratio)))
+        hard_complete_f_t = np.repeat(1, n_hard_complete)
+        hard_complete_f_i = np.repeat(0, n_hard_complete)
 
-        soft_complete_f_t = np.repeat(1, int(num_soft * self.fixed_ratio))
-        soft_complete_f_i = np.random.uniform(
-            self.f_i[0], self.f_i[-1], int(num_soft * self.fixed_ratio)
+        hard_incomplete_f_t = self.rng.uniform(
+            self.f_t[0], self.f_t[-1], n_hard_incomplete
+        )
+        hard_incomplete_f_i = np.repeat(0, n_hard_incomplete)
+
+        soft_complete_f_t = np.repeat(1, n_soft_complete)
+        soft_complete_f_i = self.rng.uniform(
+            self.f_i[0], self.f_i[-1], n_soft_complete
         )
 
-        soft_incomplete_f_t = np.random.uniform(
-            self.f_t[0], self.f_t[1], int(num_soft * (1 - self.fixed_ratio))
+        soft_incomplete_f_t = self.rng.uniform(
+            self.f_t[0], self.f_t[1], n_soft_incomplete
         )
-        soft_incomplete_f_i = np.random.uniform(
-            self.f_i[0], self.f_i[1], int(num_soft * (1 - self.fixed_ratio))
+        soft_incomplete_f_i = self.rng.uniform(
+            self.f_i[0], self.f_i[1], n_soft_incomplete
         )
 
         saf = np.concatenate(
@@ -461,6 +529,9 @@ class Simulator:
             ]
         )
 
+        # Per-replicate discoal seeds (discoal -d seed1 seed2), recorded in params
+        sim_seeds = self.rng.integers(1, 2**31 - 1, size=(2 * self.num_simulations, 2))
+
         df_neutral = pl.DataFrame(
             {
                 "iter": np.arange(1, self.num_simulations + 1),
@@ -472,6 +543,8 @@ class Simulator:
                 "t": 0.0,
                 "pos": 0.0,
                 "model": "neutral",
+                "seed1": sim_seeds[: self.num_simulations, 0],
+                "seed2": sim_seeds[: self.num_simulations, 1],
             }
         )
 
@@ -486,6 +559,8 @@ class Simulator:
                 "t": 4 * self.ne * sel_time,
                 "pos": sweep_position,
                 "model": "sweep",
+                "seed1": sim_seeds[self.num_simulations :, 0],
+                "seed2": sim_seeds[self.num_simulations :, 1],
             }
         )
 
@@ -521,7 +596,11 @@ class Simulator:
 
             sims_n = parallel(
                 delayed(self.neutral)(
-                    v["mu"] * scaling, v["r"] * scaling, discoal_demes, v["iter"]
+                    v["mu"] * scaling,
+                    v["r"] * scaling,
+                    discoal_demes,
+                    v["iter"],
+                    self._seeds(v),
                 )
                 for (i, v) in enumerate(
                     df_params.filter(pl.col("model") == "neutral").iter_rows(
@@ -542,6 +621,7 @@ class Simulator:
                     discoal_demes,
                     v["iter"],
                     v["pos"],
+                    self._seeds(v),
                 )
                 for (i, v) in enumerate(
                     df_params.filter(pl.col("model") != "neutral").iter_rows(
@@ -558,7 +638,14 @@ class Simulator:
 
         return sims
 
-    def neutral(self, theta, rho, discoal_demes, _iter=1):
+    @staticmethod
+    def _seeds(row):
+        """Per-replicate discoal seeds from a params row, or None for older params files."""
+        if row.get("seed1") is None or row.get("seed2") is None:
+            return None
+        return (int(row["seed1"]), int(row["seed2"]))
+
+    def neutral(self, theta, rho, discoal_demes, _iter=1, seeds=None):
         """
         Run a single neutral simulation.
 
@@ -567,6 +654,7 @@ class Simulator:
             rho (float): 4NeLr.
             discoal_demes (str): Demography string (from read_demes).
             _iter (int, default=1): Iteration index.
+            seeds (tuple[int, int] | None): discoal ``-d`` seeds.
 
         Returns:
             str: Path to output gzipped ms file.
@@ -586,9 +674,12 @@ class Simulator:
         if discoal_demes != "constant":
             discoal_job += discoal_demes
 
+        if seeds is not None:
+            discoal_job += f" -d {seeds[0]} {seeds[1]}"
+
         output_file = self.output_folder + "/neutral/neutral_" + str(_iter) + ".ms.gz"
 
-        with gzip.open(output_file, "wb") as output:
+        with gzip.GzipFile(output_file, "wb", mtime=0) as output:
             result = subprocess.run(
                 discoal_job.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
@@ -607,6 +698,7 @@ class Simulator:
         discoal_demes,
         _iter=1,
         x=0.5,
+        seeds=None,
     ):
         """
         Run a single sweep simulation
@@ -621,6 +713,7 @@ class Simulator:
             discoal_demes (str): Demography string.
             _iter (int, default=1): Iteration index.
             x (float, default=0.5): Sweep position along the locus (discoal -x).
+            seeds (tuple[int, int] | None): discoal ``-d`` seeds.
 
         Returns:
             str: Path to output gzipped ms file.
@@ -658,8 +751,11 @@ class Simulator:
         if discoal_demes != "constant":
             discoal_job += discoal_demes
 
+        if seeds is not None:
+            discoal_job += f" -d {seeds[0]} {seeds[1]}"
+
         output_file = self.output_folder + "/sweep/sweep_" + str(_iter) + ".ms.gz"
-        with gzip.open(output_file, "wb") as output:
+        with gzip.GzipFile(output_file, "wb", mtime=0) as output:
             result = subprocess.run(
                 discoal_job.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
@@ -747,6 +843,7 @@ class Simulator:
                     v["r"] * scaling,
                     discoal_demes,
                     v["iter"],
+                    self._seeds(v),
                 )
                 out.append(res)
         else:  # sweep
@@ -761,6 +858,7 @@ class Simulator:
                     discoal_demes,
                     v["iter"],
                     v["pos"],
+                    self._seeds(v),
                 )
                 out.append(res)
 
