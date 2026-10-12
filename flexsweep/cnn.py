@@ -259,6 +259,7 @@ class CNN:
         center=[0, 1.2e6],
         step=1e5,
         windows=np.array([100000]),
+        seed=None,
     ):
         """
         Initialize a CNN runner.
@@ -281,6 +282,10 @@ class CNN:
             If True, fit a `Normalization` layer on training features.
         model : tf.keras.Model | str | None
             Prebuilt Keras model or path to a saved model.
+        seed : int | None, default=None
+            Seed for Python, NumPy and TensorFlow (``tf.keras.utils.set_random_seed``),
+            data splits, subsampling and DANN batch shuffles. GPU kernels may still be
+            non-deterministic, so GPU runs are not guaranteed bit-identical.
 
         Notes
         -----
@@ -309,6 +314,7 @@ class CNN:
         self.mean = None
         self.std = None
         self.scores = None
+        self.seed = seed
 
     def check_tf(self):
         """
@@ -327,6 +333,9 @@ class CNN:
         if self.gpu is False:
             os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
         tf = importlib.import_module("tensorflow")
+        if self.seed is not None:
+            tf.keras.utils.set_random_seed(int(self.seed))
+            tf.config.experimental.enable_op_determinism()
         return tf
 
     def preprocess(self, x, y=None, training=False, epsilon=1e-7):
@@ -643,7 +652,9 @@ class CNN:
         elif self.train_data.endswith(".parquet"):
             tmp = pl.read_parquet(self.train_data)
             if n is not None:
-                tmp = tmp.sample(n)
+                tmp = tmp.sample(n, seed=self.seed)
+        if not isinstance(self.train_data, pl.DataFrame):
+            self._check_finite(tmp, self.train_data)
 
         # tmp = tmp.with_columns(
         #     pl.when(pl.col("model") != "neutral")
@@ -700,7 +711,9 @@ class CNN:
             X_test,
             Y_train,
             y_test,
-        ) = train_test_split(train_stats, y, test_size=test_split, shuffle=True)
+        ) = train_test_split(
+            train_stats, y, test_size=test_split, shuffle=True, random_state=self.seed
+        )
 
         X_train = (
             X_train.select(X_train.columns[8:])
@@ -714,7 +727,7 @@ class CNN:
         )
 
         X_valid, X_test, Y_valid, Y_test = train_test_split(
-            X_test, y_test, test_size=0.5
+            X_test, y_test, test_size=0.5, random_state=self.seed
         )
 
         X_test_params = X_test.select(X_test.columns[:6])
@@ -866,6 +879,9 @@ class CNN:
         # Default CNN
         if cnn is None:
             cnn = self.cnn_flexsweep
+
+        # Seed Python/NumPy/TF before any split, shuffle or weight init
+        self.check_tf()
 
         (
             X_train,
@@ -1138,7 +1154,7 @@ class CNN:
         baseline_pred = self.model.predict(X, verbose=0).argmax(axis=1)
         baseline_acc = (baseline_pred == y).mean()
 
-        rng = np.random.default_rng(42)
+        rng = np.random.default_rng(42 if self.seed is None else self.seed)
         records = []
         for i, name in enumerate(self.feature_names):
             drops = []
@@ -1264,6 +1280,7 @@ class CNN:
         ), "Please input a parquet pl.DataFrame"
 
         df_test = pl.read_parquet(self.predict_data)
+        self._check_finite(df_test, self.predict_data)
 
         df_test = df_test.with_columns(
             pl.when(pl.col("model") != "neutral")
@@ -1596,6 +1613,29 @@ class CNN:
 
         return plot_roc, plot_history, cm_plot
 
+    @staticmethod
+    def _check_finite(df: pl.DataFrame, source) -> None:
+        """Raise if any feature column holds NaN or +/-inf.
+
+        Non-finite inputs make DANN training loss NaN and give NaN CNN predictions
+        without any error, so they are rejected before training or prediction.
+        """
+        params = {"iter", "s", "t", "f_i", "f_t", "mu", "r", "model"}
+        cols = [c for c, t in df.schema.items() if t.is_float() and c not in params]
+        if not cols:
+            return
+        counts = df.select(
+            (pl.col(c).is_nan() | pl.col(c).is_infinite()).sum().alias(c) for c in cols
+        ).row(0, named=True)
+        bad = {c: n for c, n in counts.items() if n}
+        if bad:
+            shown = ", ".join(f"{c} ({n})" for c, n in list(bad.items())[:10])
+            raise ValueError(
+                f"{source}: {len(bad)} feature column(s) contain NaN or inf values: "
+                f"{shown}{' ...' if len(bad) > 10 else ''}. Regenerate the feature "
+                "vectors (fvs-discoal / fvs-vcf) or drop these columns."
+            )
+
     def _select_stats_matrix(self, df: pl.DataFrame, stats: list[str]):
         # Standardize model: anything not 'neutral' -> 'sweep'
         df = df.with_columns(
@@ -1655,10 +1695,15 @@ class CNN:
             self.source_data
         )  # labeled source with 'model' ∈ {'neutral','sweep'}
         tgt_df = pl.read_parquet(self.target_data)  # target (may be unlabeled)
+        self._check_finite(df_all, self.source_data)
+        self._check_finite(tgt_df, self.target_data)
 
         # Hold-out from source for a final test set (kept as in your original code)
         (src_df, df_test) = train_test_split(
-            df_all, test_size=(1 - self.train_split) * 0.5, shuffle=True
+            df_all,
+            test_size=(1 - self.train_split) * 0.5,
+            shuffle=True,
+            random_state=self.seed,
         )
 
         stats = [] if _stats is None else list(_stats)
@@ -1680,7 +1725,11 @@ class CNN:
 
         # Source train/val split for early stopping
         Xs_tr, Xs_va, ys_tr, ys_va = train_test_split(
-            X_src, y_src_bin, test_size=src_val_frac, stratify=y_src_bin
+            X_src,
+            y_src_bin,
+            test_size=src_val_frac,
+            stratify=y_src_bin,
+            random_state=self.seed,
         )
 
         # Build class-specific source training arrays for the generator
@@ -2222,6 +2271,7 @@ class CNN:
             src_sweep=dd["src_sweep_tr"],
             tar_all=dd["X_tgt"],
             batch_size=batch_size,
+            seed=self.seed,
         )
 
         input_shape = (self.num_stats, self.windows.size * self.center.size, 1)
@@ -2404,6 +2454,7 @@ class CNN:
             tar_all=dd["X_tgt"],
             batch_size=batch_size,
             tgt_ratio=tgt_ratio,
+            seed=self.seed,
         )
 
         val_X = dd["val_X"]
@@ -2614,6 +2665,7 @@ class CNN:
             tar_all=dd["X_tgt"],
             batch_size=batch_size,
             tgt_ratio=tgt_ratio,
+            seed=self.seed,
         )
 
         val_X = dd["val_X"]
@@ -2810,10 +2862,11 @@ class CNN:
             df_test = pl.read_parquet(self.predict_data)
             if "test" in self.predict_data:
                 df_test = df_test.sample(
-                    with_replacement=False, fraction=1.0, shuffle=True
+                    with_replacement=False, fraction=1.0, shuffle=True, seed=self.seed
                 )
         except Exception:
             df_test = pl.read_csv(self.predict_data, separator=",")
+        self._check_finite(df_test, self.predict_data)
 
         df_test = df_test.with_columns(
             pl.when(pl.col("model") != "neutral")
@@ -3005,10 +3058,11 @@ class CNN:
             df_test = pl.read_parquet(self.predict_data)
             if "test" in self.predict_data:
                 df_test = df_test.sample(
-                    with_replacement=False, fraction=1.0, shuffle=True
+                    with_replacement=False, fraction=1.0, shuffle=True, seed=self.seed
                 )
         except Exception:
             df_test = pl.read_csv(self.predict_data, separator=",")
+        self._check_finite(df_test, self.predict_data)
 
         df_test = df_test.with_columns(
             pl.when(pl.col("model") != "neutral")
@@ -3360,9 +3414,11 @@ class DAParquetSequence(Sequence):
         batch_size,
         tgt_ratio=1.0,
         shuffle=True,
+        seed=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
+        self._rng = np.random.default_rng(seed)
         assert (
             batch_size % 2 == 0
         ), "batch_size must be even (keeps math tidy; total per step = 2*batch_size)."
@@ -3415,7 +3471,7 @@ class DAParquetSequence(Sequence):
         return self.n_batches
 
     def _reset_epoch(self):
-        rng = np.random.default_rng()
+        rng = self._rng
         # independent shuffles for classifier and discriminator source pools
         base = np.arange(self.src_pool_tag.size, dtype=np.int64)
         self.src_pool_cls = rng.permutation(base)  # for classifier (labels used)
