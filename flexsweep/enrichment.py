@@ -1,79 +1,56 @@
 import os
-import sys
+import re
 import time
 
-import polars_bio as pb
 from numba import njit
 
 from . import Parallel, delayed, np, pl
 
 
+_NO_CASE_DISTANCE = 100_000_000_000  # Perl distance_file value off case-gene chromosomes
+
+
 def compute_distances(vip_gene_ids: list, annotation_file: str) -> pl.DataFrame:
     """
-    Compute distance from each gene to its nearest VIP (case) gene.
+    Distance from each gene to the nearest case (VIP) gene, as the Perl
+    ``distance_file.txt``: absolute difference of integer 1-based gene centres
+    ``(start + 1 + end) // 2`` (BED 0-based start) on the same chromosome, and
+    1e11 for genes on chromosomes without case genes.
 
     Parameters
     ----------
-    vip_gene_ids    : list of VIP gene ID strings
-    annotation_file : path to BED file (chrom  start  end  gene_id  strand), tab-separated, no header
+    vip_gene_ids    : case gene IDs (ids absent from the BED are ignored)
+    annotation_file : BED (chrom start end gene_id strand), tab-separated, no header
 
     Returns
     -------
-    pl.DataFrame with columns: gene_id, distance
+    pl.DataFrame with columns gene_id, distance (Int64), one row per BED gene, sorted.
     """
-    case_genes = set(vip_gene_ids)
-
-    df_annotation = pl.read_csv(
+    df = pl.read_csv(
         annotation_file,
         separator="\t",
         has_header=False,
         new_columns=["chrom", "start", "end", "gene_id", "strand"],
         schema_overrides={"chrom": pl.Utf8},
-    )
-
-    # Use gene centre as a 1-bp point feature
-    df_annotation = df_annotation.with_columns(
-        [
-            ((pl.col("start") + pl.col("end")) // 2).cast(pl.Int64).alias("start"),
-            ((pl.col("start") + pl.col("end")) // 2 + 1).cast(pl.Int64).alias("end"),
-        ]
-    )
-
-    df_cases_annot = df_annotation.filter(pl.col("gene_id").is_in(case_genes))
-
-    df_all_pts = df_annotation.select(["chrom", "start", "end", "gene_id"])
-    df_case_pts = df_cases_annot.select(["chrom", "start", "end", "gene_id"])
-    df_all_pts.config_meta.set(coordinate_system_zero_based=True)
-    df_case_pts.config_meta.set(coordinate_system_zero_based=True)
-
-    result = (
-        pb.nearest(
-            df_all_pts,
-            df_case_pts,
-            cols1=["chrom", "start", "end"],
-            cols2=["chrom", "start", "end"],
-            suffixes=("_1", "_2"),
-            output_type="polars.LazyFrame",
-        )
-        .select(
-            [
-                pl.col("gene_id_1").alias("gene_id"),
-                pl.col("distance"),
-            ]
-        )
-        .collect()
-    )
-
-    # polars_bio.nearest() returns gap distance (b−a−1); closestBed -d returns
-    # start-to-start distance (b−a). Add 1 for non-overlapping pairs to match Perl.
-    result = result.with_columns(
-        pl.when(pl.col("distance") > 0)
-        .then(pl.col("distance") + 1)
-        .otherwise(pl.col("distance"))
-        .alias("distance")
-    )
-
-    return result.sort("gene_id")
+    ).with_columns(((pl.col("start") + 1 + pl.col("end")) // 2).alias("centre"))
+    case = set(vip_gene_ids)
+    genes, dists = [], []
+    for (_chrom,), sub in df.group_by("chrom"):
+        centre = sub["centre"].to_numpy()
+        cv = np.sort(sub.filter(pl.col("gene_id").is_in(case))["centre"].to_numpy())
+        if cv.size == 0:
+            d = np.full(centre.size, _NO_CASE_DISTANCE, dtype=np.int64)
+        else:
+            k = np.searchsorted(cv, centre)
+            left = np.abs(centre - cv[np.clip(k - 1, 0, cv.size - 1)])
+            right = np.abs(cv[np.clip(k, 0, cv.size - 1)] - centre)
+            d = np.minimum(left, right).astype(np.int64)
+        genes.extend(sub["gene_id"].to_list())
+        dists.append(d)
+    return pl.DataFrame(
+        {"gene_id": genes, "distance": np.concatenate(dists) if dists else []},
+        schema={"gene_id": pl.Utf8, "distance": pl.Int64},
+    ).sort("gene_id")
 
 
 @njit(cache=True)
@@ -83,9 +60,10 @@ def iterative_control_set_fast(
     vip_number: int,
     tolerance: float,
     max_rep: int,
-    seed: int = None,
+    rng: np.random.Generator,
     skip_factor_idx: int = 8,
     n_batches: int = 10,
+    max_tries: int = 100_000_000,
 ) -> np.ndarray:
     """
     JIT-compiled bootstrap builder for the nomatchomega_fast variant.
@@ -107,14 +85,20 @@ def iterative_control_set_fast(
     vip_number      : number of VIP genes
     tolerance       : ± fraction for confounder matching (e.g. 0.05)
     max_rep         : dynamic rep-limit numerator
-    seed            : RNG seed for this parallel call
+    rng             : numpy Generator (PCG64) for this chain; gene indices are drawn
+                      from it in blocks of 4096, uniform on [0, n_nonvips)
     skip_factor_idx : 0-based factor index to leave unconstrained
     n_batches       : number of sequential internal batches (≡ Perl Iterations_number/10)
+    max_tries       : consecutive rejected proposals after which the chain gives up
+                      (the running means can reach a state no pair can satisfy)
 
     Returns
     -------
-    np.ndarray of shape (n_batches * 10, vip_number), dtype int64.
-    Each row is one control set of nonvip_X row indices.
+    (sets, used_counts, stuck_at): sets is an int64 array (n_batches * 10, vip_number),
+    each row one control set of nonvip_X row indices; used_counts (n_nonvips,) counts how
+    often each control gene was accepted (Perl %used_genes = genes with count > 0);
+    stuck_at is -1, or the number of accepted control genes when max_tries consecutive
+    proposals were rejected (sets is then empty).
     """
     n_nonvips = nonvip_X.shape[0]
     n_factors = nonvip_X.shape[1]
@@ -145,7 +129,34 @@ def iterative_control_set_fast(
     fake_seed = 100
     sc_gn = 0
 
-    np.random.seed(seed)
+    # Factors checked, most-rejecting first. Acceptance is an AND over factors, so the
+    # order never changes a decision; skip_factor_idx (+-1e18 bounds) never rejects.
+    constrained = np.empty(n_factors, dtype=np.int64)
+    n_con = 0
+    for f in range(n_factors):
+        if f != skip_factor_idx:
+            constrained[n_con] = f
+            n_con += 1
+    constrained = constrained[:n_con]
+    order = constrained.copy()
+    # Factor-major copy: a check reads one factor of two random genes, and a factor
+    # column (n_nonvips * 8 bytes) stays in L1 where a gene row would not.
+    X_t = np.ascontiguousarray(nonvip_X.T)
+    rej_counts = np.zeros(n_factors, dtype=np.int64)
+    n_accepted = 0
+
+    # Quantities that only change on acceptance: the repetition limit and the
+    # numerator of the new running mean without the candidate pair.
+    rep_limit = max_rep * (sc_gn + 1) / vip_number
+    denom = sc_gn + 2 + fake_seed
+    base = np.empty(n_factors)
+    for f in range(n_factors):
+        base[f] = fake_seed * vip_vec[f] + current_means[f] * sc_gn
+
+    block = 4096
+    draws = rng.integers(0, n_nonvips, size=block)
+    k_draw = 0
+    n_tries = 0
 
     out = np.empty((n_batches * 10, vip_number), dtype=np.int64)
     out_row = 0
@@ -154,25 +165,33 @@ def iterative_control_set_fast(
         target_len = init_fake + 11 * vip_number * r  # grows each batch
 
         while sc_gn < target_len:
-            # if sc_gn % 1000 == 0:
-            #     print("batch", r, "progress", sc_gn, "/", target_len)
-            i1 = np.random.randint(0, n_nonvips)
-            i2 = np.random.randint(0, n_nonvips)
+            n_tries += 1
+            if n_tries > max_tries:
+                return out[:0], used_counts, sc_gn
+            # Next two values of the i.i.d. uniform stream; i2 == i1 takes the next one.
+            if k_draw == block:
+                draws = rng.integers(0, n_nonvips, size=block)
+                k_draw = 0
+            i1 = draws[k_draw]
+            k_draw += 1
+            i2 = i1
             while i2 == i1:
-                i2 = np.random.randint(0, n_nonvips)
+                if k_draw == block:
+                    draws = rng.integers(0, n_nonvips, size=block)
+                    k_draw = 0
+                i2 = draws[k_draw]
+                k_draw += 1
 
-            rep_limit = max_rep * (sc_gn + 1) / vip_number
             if used_counts[i1] >= rep_limit or used_counts[i2] >= rep_limit:
                 continue
 
-            denom = sc_gn + 2 + fake_seed
+            # Perl: mean of the pair, weighted by 2 (= the pair sum, exactly).
             ok = True
-            for f in range(n_factors):
-                sub = (nonvip_X[i1, f] + nonvip_X[i2, f]) * 0.5
-                new_m = (
-                    fake_seed * vip_vec[f] + current_means[f] * sc_gn + sub * 2.0
-                ) / denom
+            for k in range(n_con):
+                f = order[k]
+                new_m = (base[f] + (X_t[f, i1] + X_t[f, i2])) / denom
                 if new_m < inf_vec[f] or new_m > sup_vec[f]:
+                    rej_counts[f] += 1
                     ok = False
                     break
 
@@ -190,14 +209,26 @@ def iterative_control_set_fast(
                 used_counts[i2] += 1
 
                 for f in range(n_factors):
-                    sub = (nonvip_X[i1, f] + nonvip_X[i2, f]) * 0.5
                     current_means[f] = (
-                        fake_seed * vip_vec[f] + current_means[f] * sc_gn + sub * 2.0
+                        base[f] + (nonvip_X[i1, f] + nonvip_X[i2, f])
                     ) / denom
 
                 sc_gn += 2
                 if fake_seed > 0:
                     fake_seed -= 1
+
+                rep_limit = max_rep * (sc_gn + 1) / vip_number
+                denom = sc_gn + 2 + fake_seed
+                for f in range(n_factors):
+                    base[f] = fake_seed * vip_vec[f] + current_means[f] * sc_gn
+
+                n_accepted += 1
+                n_tries = 0
+                if n_accepted % 256 == 0:
+                    keys = np.empty(n_con, dtype=np.int64)
+                    for k in range(n_con):
+                        keys[k] = -rej_counts[constrained[k]]
+                    order = constrained[np.argsort(keys, kind="mergesort")]
 
         # Slice 10 sets from the end of good_idx for batch r
         total = sc_gn
@@ -214,7 +245,18 @@ def iterative_control_set_fast(
                 out[out_row + (n_sets - 1 - p), j] = good_idx[inf_i + j]
         out_row += n_sets
 
-    return out[:out_row]
+    return out[:out_row], used_counts, -1
+
+
+def _chain_layout(total_batches: int, nthreads: int) -> list:
+    """
+    Batches (of 10 control sets) per bootstrap chain: one chain per thread, batches
+    split evenly. A chain's cost is about linear in its number of batches, so this
+    gives every thread the same work. The control sets depend on (seed, nthreads).
+    """
+    n_chains = max(1, min(max(1, nthreads), total_batches))
+    base, extra = divmod(total_batches, n_chains)
+    return [base + 1] * extra + [base] * (n_chains - extra)
 
 
 def run_bootstrap_nomatchomega(
@@ -234,6 +276,10 @@ def run_bootstrap_nomatchomega(
     offset_factor_idx: int = 27,
     offset_value: float = 2.0,
     n_batches: int = 10,
+    return_used: bool = False,
+    distance_genes: list | None = None,
+    max_tries: int = 100_000_000,
+    max_restarts: int = 10,
 ):
     """
     Step 6: nomatchomega_fast variant of the matched bootstrap control set
@@ -246,7 +292,13 @@ def run_bootstrap_nomatchomega(
         state (used_counts, current_means, fake_seed persist across batches),
         matching Perl's within-process continuous state.
       - Target for batch r: 100 + 11 * vip_number * r (grows each batch).
-      - Total control sets = runs_number * n_batches * 10.
+      - Total control sets = runs_number * n_batches * 10 (Perl Runs_number x
+        Iterations_number x 10). The batches are spread over independent chains sized
+        to ``nthreads`` (see :func:`_chain_layout`); Perl ran 10 chains of 10 batches.
+        Each chain gets its own PCG64 generator from ``SeedSequence(seed).spawn``, so
+        the sets depend on (seed, nthreads).
+      - ``return_used=True`` also returns the Perl ``used_genes``: case genes plus every
+        control gene accepted by a chain (the genome-shuffle universe).
 
     Parameters
     ----------
@@ -259,12 +311,17 @@ def run_bootstrap_nomatchomega(
     flip              : if True, swap VIP and control pools
     max_rep           : max times a control gene may be sampled on average
     nthreads          : number of parallel workers
-    control_genes     : optional explicit candidate control gene IDs. If None, all genes in factors_file that are not case genes are used. Pass the "no"-labelled genes from genes_set_file to match Perl behaviour exactly.
+    control_genes     : optional explicit candidate control gene IDs. If None, all genes in factors_file that are not case genes are used. run_enrichment passes the universe minus case and excluded genes.
+    distance_genes    : genes the control-eligibility distance is measured from
+                        (default case_genes). The Perl distance_file.txt uses every
+                        listed case gene, also those dropped from the universe.
     distance_file     : optional path to pre-computed distance TSV (gene_id \\t distance, no header). When provided, distances are read directly instead of calling compute_distances(). Use Perl's distance_genes_set_file.txt for exact control pool matching.
     skip_factor_idx   : 0-based factor index to leave unconstrained (default 8 = Perl factor 9, dN/dS / omega).
     offset_factor_idx : 0-based factor index to apply +offset_value to (default 27 = Perl column 28).
     offset_value      : value added to offset_factor_idx column (default 2.0).
     n_batches         : sequential internal batches per parallel call (≡ Perl Iterations_number/10; default 10).
+    max_tries         : consecutive rejected proposals after which a chain counts as stuck (default 1e8).
+    max_restarts      : restarts of a stuck chain on a new seed-derived stream before a RuntimeError (default 10).
 
     Returns
     -------
@@ -298,7 +355,9 @@ def run_bootstrap_nomatchomega(
             new_columns=["gene_id", "distance"],
         )
     else:
-        distance_df = compute_distances(case_genes, annotation_file)
+        distance_df = compute_distances(
+            case_genes if distance_genes is None else distance_genes, annotation_file
+        )
     set_by_dist = set(
         distance_df.filter(pl.col("distance") >= min_dist)["gene_id"].to_list()
     )
@@ -330,37 +389,70 @@ def run_bootstrap_nomatchomega(
         nonvip_X_off = nonvip_X
 
     print(
-        f"There are {df_set.height} genes of interest and {df_control_pool.height} potential control genes at distance of at least {min_dist} bases."
+        f"Bootstrap: {runs_number * n_batches * 10} control sets for {df_set.height} "
+        f"case genes from {df_control_pool.height} candidates >= {min_dist:,} bp away",
+        flush=True,
     )
-
     if df_control_pool.height <= 1.5 * df_set.height:
         print(
-            "The number of control genes is less than 1.5× the number of VIPs. FDR may be high."
+            "Warning: fewer than 1.5x as many control candidates as case genes; "
+            "the FDR may be high.",
+            flush=True,
         )
 
-    def _run_one_batch(run_idx: int) -> np.ndarray:
-        _batch_seed = int(
-            np.random.default_rng(None if seed is None else seed + run_idx).integers(
-                0, 2**31
+    chain_batches = _chain_layout(runs_number * n_batches, nthreads)
+    target = 100 + 11 * vip_number * max(chain_batches)
+
+    # One independent PCG64 stream per chain (seed None -> fresh OS entropy).
+    chain_seeds = np.random.SeedSequence(seed).spawn(len(chain_batches))
+
+    def _run_one_chain(run_idx: int, chain_n_batches: int):
+        # A chain can reach a running-mean state no pair satisfies, mostly in its first
+        # few hundred genes. Such a chain restarts from scratch on a new stream derived
+        # from the seed (attempt 0 is the chain's own stream), so runs stay reproducible.
+        stuck = []
+        for attempt in range(max_restarts + 1):
+            ss = chain_seeds[run_idx]
+            if attempt > 0:
+                ss = np.random.SeedSequence(ss.entropy, spawn_key=ss.spawn_key + (attempt,))
+            idx, used_counts, stuck_at = iterative_control_set_fast(
+                vip_X_off,
+                nonvip_X_off,
+                vip_number,
+                tolerance,
+                max_rep,
+                np.random.Generator(np.random.PCG64(ss)),
+                skip_factor_idx,
+                chain_n_batches,
+                max_tries,
             )
+            if stuck_at < 0:
+                return nonvip_genes[idx], used_counts > 0, stuck
+            stuck.append(int(stuck_at))
+        raise RuntimeError(
+            f"Bootstrap stuck: chain {run_idx} found no matched pair in {max_tries:,} "
+            f"consecutive proposals in all {max_restarts + 1} attempts (stuck after "
+            f"{', '.join(f'{n:,}' for n in stuck)} of up to {target:,} control genes). "
+            f"The {len(nonvip_genes)} control candidates cannot keep the factor means "
+            f"within +-{tolerance:.0%} of the case means; lower --min_distance or raise "
+            "--tolerance."
         )
-        idx = iterative_control_set_fast(
-            vip_X_off,
-            nonvip_X_off,
-            vip_number,
-            tolerance,
-            max_rep,
-            _batch_seed,
-            skip_factor_idx,
-            n_batches,
-        )
-        return nonvip_genes[idx]
 
-    batch_results = Parallel(n_jobs=nthreads, backend="loky", verbose=10)(
-        delayed(_run_one_batch)(run_idx) for run_idx in range(runs_number)
+    batch_results = Parallel(n_jobs=nthreads, backend="loky", verbose=0)(
+        delayed(_run_one_chain)(i, nb) for i, nb in enumerate(chain_batches)
     )
+    for i, r in enumerate(batch_results):
+        if r[2]:
+            print(
+                f"Warning: bootstrap chain {i} got stuck {len(r[2])} time(s) (after "
+                f"{', '.join(f'{n:,}' for n in r[2])} control genes) and was restarted "
+                "with a new seed",
+                flush=True,
+            )
 
-    np_control = np.concatenate(batch_results, axis=0)
+    np_control = np.concatenate([r[0] for r in batch_results], axis=0)
+    used_mask = np.logical_or.reduce([r[1] for r in batch_results])
+    used_genes = sorted(set(df_set["gene_id"].to_list()) | set(nonvip_genes[used_mask]))
     df_bootstrap_control = pl.DataFrame(np_control)
     df_bootstrap_control = df_bootstrap_control.with_columns(
         (
@@ -369,29 +461,27 @@ def run_bootstrap_nomatchomega(
         ).alias("sample_id")
     ).select("sample_id", *df_bootstrap_control.columns)
 
+    if return_used:
+        return df_set.select("gene_id"), df_bootstrap_control, used_genes
     return df_set.select("gene_id"), df_bootstrap_control
 
 
-def build_gene_neighbors(coord_file: str, valid_genes: list, dist: int) -> pl.DataFrame:
+def _sniff_sep(path: str) -> str:
+    """Tab if the first line of a (optionally gzipped) table has a tab, else space."""
+    import gzip as _gz
+
+    _open = _gz.open if path.endswith(".gz") else open
+    with _open(path, "rt") as fh:
+        return "\t" if "\t" in fh.readline() else " "
+
+
+def _ordered_genes(coord_file: str, valid_genes) -> list:
     """
-    Find all gene neighbours within ±dist bp using polars-bio overlap.
-
-    Uses the full gene body intervals (not centre approximation). Each gene's
-    interval is expanded by dist on both sides, then overlapped against all
-    gene centre points — equivalent to the original pybedtools bed.window(w=dist).
-
-    Parameters
-    ----------
-    coord_file   : path to BED gene coordinates (chrom  start  end  gene_id  strand)
-    valid_genes  : list of gene IDs to include (QC-passing universe)
-    dist         : window radius in bp (e.g. 500_000)
-
-    Returns
-    -------
-    pl.DataFrame with columns: gene_id, neighbors (space-joined string)
+    Valid autosomal genes in chromosomal order, as shuffle_sweep_script_nocut.pl:
+    chromosome 1..22, then 10 kb bin of the gene centre (computed on 1-based
+    coordinates, ``(start + 1 + end) / 2`` from the 0-based BED), then file order.
     """
-    valid = set(valid_genes)
-
+    valid_genes = set(valid_genes)
     df_coords = (
         pl.read_csv(
             coord_file,
@@ -400,91 +490,133 @@ def build_gene_neighbors(coord_file: str, valid_genes: list, dist: int) -> pl.Da
             new_columns=["chrom", "start", "end", "gene_id", "strand"],
             schema_overrides={"chrom": pl.Utf8},
         )
+        .with_row_index("_line")
+        .filter(pl.col("gene_id").is_in(valid_genes))
+        .filter(pl.col("chrom").is_in([str(i) for i in range(1, 23)]))
         .with_columns(
-            [
-                pl.col("start").cast(pl.Int64),
-                pl.col("end").cast(pl.Int64),
-            ]
+            ((pl.col("start") + 1 + pl.col("end")) / 2 / 10000).floor().cast(pl.Int64).alias("bin"),
+            pl.col("chrom").cast(pl.Int32).alias("_chrom_int"),
         )
-        .filter(pl.col("gene_id").is_in(valid))
-        .with_columns(((pl.col("start") + pl.col("end")) // 2).alias("center"))
     )
-
-    # Expand each gene body by ±dist (pybedtools window equivalent)
-    df_windows = df_coords.select(
-        [
-            pl.col("chrom"),
-            (pl.col("start") - dist).alias("win_start"),
-            (pl.col("end") + dist).alias("win_end"),
-            pl.col("gene_id"),
-        ]
-    )
-
-    # Target: 1-bp gene centres for overlap detection
-    df_centers = df_coords.select(
-        [
-            pl.col("chrom"),
-            pl.col("center").alias("start"),
-            (pl.col("center") + 1).alias("end"),
-            pl.col("gene_id"),
-        ]
-    )
-
-    df_windows.config_meta.set(coordinate_system_zero_based=True)
-    df_centers.config_meta.set(coordinate_system_zero_based=True)
-
-    pairs = (
-        pb.overlap(
-            df_windows,
-            df_centers,
-            cols1=["chrom", "win_start", "win_end"],
-            cols2=["chrom", "start", "end"],
-            suffixes=("_1", "_2"),
-            output_type="polars.LazyFrame",
-        )
-        .select(
-            [
-                pl.col("gene_id_1").alias("gene_id"),
-                pl.col("gene_id_2").alias("neighbor"),
-            ]
-        )
-        .filter(pl.col("gene_id") != pl.col("neighbor"))
-        .collect()
-    )
-
-    df_neighbors = pairs.group_by("gene_id").agg(
-        pl.col("neighbor").sort().str.join(" ").alias("neighbors")
-    )
-
-    df_all_genes = df_coords.select("gene_id")
-    return (
-        df_all_genes.join(df_neighbors, on="gene_id", how="left")
-        .with_columns(pl.col("neighbors").fill_null(""))
-        .sort("gene_id")
-    )
+    ordered = df_coords.sort(["_chrom_int", "bin", "_line"])["gene_id"].to_list()
+    if not ordered:
+        raise ValueError("No valid genes found in coord_file")
+    return ordered
 
 
-def build_gene_neighbors_numpy(
-    coord_file: str, valid_genes: list, dist: int
-) -> pl.DataFrame:
+def _shuffle_segments(ordered_genes: list, strong_signal_genes: set, seg_size: int) -> list:
     """
-    Find all gene neighbours within ±dist bp using pure NumPy (10 kb binning).
-
-    Gene centres are binned to a 10 kb grid. For each gene, numpy.searchsorted
-    finds all genes whose binned centre falls within [center - dist, center + dist].
-
-    Parameters
-    ----------
-    coord_file  : path to BED gene coordinates (chrom  start  end  gene_id  strand)
-    valid_genes : list of gene IDs to include (QC-passing universe)
-    dist        : neighbourhood radius in bp (e.g. 500_000)
-
-    Returns
-    -------
-    pl.DataFrame with columns: gene_id, neighbors (space-joined string)
+    Cut the ordered genes every ``seg_size`` genes, skipping cuts flanked on both sides
+    by strong-signal genes (Perl shuffle_sweep_script_nocut.pl).
     """
-    valid = set(valid_genes)
+    n_genes = len(ordered_genes)
+    segments = []
+    seg_start = 0
+    for i in range(seg_size, n_genes, seg_size):
+        both_strong = (
+            ordered_genes[i - 1] in strong_signal_genes
+            and ordered_genes[min(i, n_genes - 1)] in strong_signal_genes
+        )
+        if not both_strong:
+            segments.append(np.arange(seg_start, i, dtype=np.int32))
+            seg_start = i
+    if seg_start < n_genes:
+        segments.append(np.arange(seg_start, n_genes, dtype=np.int32))
+    return segments
 
+
+_NO_SWEEP_RANK = 10_000_000  # rank given to genes absent from a (shuffled) table
+
+# count_sweeps_script.pl: control sets used per round, and the p-value bounds on the
+# Pop_interest lines that send the count to the next round (20 -> 100 -> 5000 sets).
+_PERL_DEPTH = ((20, 0.05, 0.95), (100, 0.01, 0.99), (5000, None, None))
+
+
+def _read_rank_table(path: str) -> pl.DataFrame:
+    """Merged rank table (gene_id + one rank column per population), all as strings."""
+    return pl.read_csv(
+        path, has_header=False, separator=_sniff_sep(path), infer_schema_length=0
+    )
+
+
+def _rank_bins(rank_table: pl.DataFrame, n_pops: int, th: np.ndarray) -> np.ndarray:
+    """
+    Threshold bin of every gene in the first ``n_pops`` rank columns: index of the
+    smallest threshold >= rank (``len(th)`` = passes none), as simplify_zipped_sweeps.pl.
+    """
+    ranks = (
+        rank_table.select(rank_table.columns[1 : n_pops + 1])
+        .with_columns(pl.all().cast(pl.Int64).fill_null(_NO_SWEEP_RANK))
+        .to_numpy()
+    )
+    return np.searchsorted(th, ranks, side="left").astype(np.int16)
+
+
+def _strong_signal_genes(rank_table: pl.DataFrame, max_rank: int) -> set:
+    """Genes ranked <= max_rank in any column (shuffle_sweep_script_nocut.pl 'bad' genes)."""
+    min_rank = rank_table.select(
+        pl.min_horizontal(
+            [pl.col(c).cast(pl.Int64, strict=False) for c in rank_table.columns[1:]]
+        )
+    ).to_series()
+    return set(rank_table.filter(min_rank <= max_rank)[:, 0].to_list())
+
+
+def _gene_index(gene_ids: list, vip_genes, control_sets) -> tuple:
+    """
+    Map case genes and control sets onto row indices of ``gene_ids``.
+
+    Case genes absent from the table are ignored (they can never be in a sweep);
+    control genes absent from it raise, since that means the control sets were built
+    for another gene universe.
+    """
+    g2i = {g: i for i, g in enumerate(gene_ids)}
+    V = np.array(sorted({g2i[g] for g in vip_genes if g in g2i}), dtype=np.int32)
+    flat = np.asarray(control_sets, dtype=object)
+    if flat.ndim != 2:
+        raise ValueError("control sets must all have the same length")
+    missing = {g for g in flat.ravel() if g not in g2i}
+    if missing:
+        raise ValueError(
+            f"{len(missing)} control genes are not in the rank table, e.g. "
+            f"{sorted(missing)[:5]}"
+        )
+    M = np.array([[g2i[g] for g in row] for row in flat], dtype=np.int32)
+    return V, M
+
+
+def _count_bins(bins: np.ndarray, M: np.ndarray, V: np.ndarray, n_thr: int) -> tuple:
+    """
+    Sweep counts per population column of ``bins`` and threshold.
+
+    :returns: ``vip`` (P, T) case-gene counts and ``ctrl`` (P, T, S) counts per control
+        set; a control gene present k times in a set counts k times (Perl
+        ``$iterated{$gene}``).
+    """
+    n_sets = M.shape[0]
+    offs = (np.arange(n_sets, dtype=np.int64) * (n_thr + 1))[:, None]
+    n_pops = bins.shape[1]
+    vip = np.empty((n_pops, n_thr), dtype=np.int64)
+    ctrl = np.empty((n_pops, n_thr, n_sets), dtype=np.int32)
+    for k in range(n_pops):
+        b = bins[:, k].astype(np.int64)
+        h = np.bincount((b[M] + offs).ravel(), minlength=n_sets * (n_thr + 1))
+        ctrl[k] = np.cumsum(h.reshape(n_sets, n_thr + 1)[:, :n_thr], axis=1).T
+        vip[k] = np.cumsum(np.bincount(b[V], minlength=n_thr + 1)[:n_thr])
+    return vip, ctrl
+
+
+def _gene_neighbors(coord_file: str, gene_ids: list, valid_genes, cluster_distance: int) -> tuple:
+    """
+    Neighbour lists as get_all_neighbors.pl: valid genes on the same chromosome whose
+    10 kb bins of the gene centre (``int((start1 + end) / 2)``, 1-based) are at most
+    ``ceil(cluster_distance / 10 kb)`` bins apart, the gene itself excluded.
+
+    :returns: CSR arrays ``(ptr, idx)`` over the rows of ``gene_ids``; ``ptr`` has one
+        extra empty row, so an extra never-in-sweep row (genome shuffles) has no neighbours.
+    """
+    valid_genes = set(valid_genes)
+    g2i = {g: i for i, g in enumerate(gene_ids)}
     df = (
         pl.read_csv(
             coord_file,
@@ -493,958 +625,489 @@ def build_gene_neighbors_numpy(
             new_columns=["chrom", "start", "end", "gene_id", "strand"],
             schema_overrides={"chrom": pl.Utf8},
         )
-        .with_columns(
-            [
-                pl.col("start").cast(pl.Int64),
-                pl.col("end").cast(pl.Int64),
-            ]
-        )
-        .filter(pl.col("gene_id").is_in(valid))
-        .with_columns(((pl.col("start") + pl.col("end")) // 2).alias("center"))
-        .with_columns(((pl.col("center") / 10000).floor() * 10000).alias("bin"))
-        .select(["chrom", "bin", "gene_id"])
-        .sort(["chrom", "bin"])
+        .filter(pl.col("gene_id").is_in(valid_genes))
+        .unique("gene_id", keep="first", maintain_order=True)
+        .with_columns((((pl.col("start") + 1 + pl.col("end")) // 2) // 10_000).alias("bin"))
     )
-
-    results = []
-    for chrom, sub in df.group_by("chrom", maintain_order=True):
-        bins = sub["bin"].to_numpy()
-        genes = sub["gene_id"].to_list()
-        n = len(genes)
-        left_idx = np.searchsorted(bins, bins - dist, side="left")
-        right_idx = np.searchsorted(bins, bins + dist, side="right")
-        for i in range(n):
-            neighbors = [g for g in genes[left_idx[i] : right_idx[i]] if g != genes[i]]
-            results.append((genes[i], " ".join(neighbors)))
-
-    return pl.DataFrame(results, schema=["gene_id", "neighbors"], orient="row").sort(
-        "gene_id"
-    )
-
-
-def simplify_sweeps_gz(
-    rank_file: str,
-    thresholds: list,
-    col_index: int = 1,
-    df: "pl.DataFrame | None" = None,
-) -> pl.DataFrame:
-    """
-    Assign each gene the most stringent threshold it passes (smallest cutoff c
-    such that rank <= c).
-
-    Parameters
-    ----------
-    rank_file  : TSV with gene_id in column 0 and rank values in subsequent
-                 columns (no header).  For single-population files the rank is
-                 in column 1.  For multi-population files (e.g. all_ihsfreqafr
-                 with ESN/GWD/LWK/MSL/YRI in columns 1-5) pass col_index to
-                 select the population column (1-based, default 1).
-    thresholds : list of int rank thresholds
-    col_index  : 1-based index of the rank column to use (default 1 = second
-                 column, i.e. first rank column after gene_id).
-    df         : optional pre-loaded pl.DataFrame (same column layout as the file).
-                 When provided, rank_file is ignored and df is used directly —
-                 enables in-memory shuffle workflows without disk I/O.
-
-    Returns
-    -------
-    pl.DataFrame with columns: gene_id, selected_cutoff (genes with no hit excluded)
-    """
-    if df is not None:
-        df_raw = df
-    else:
-        # Auto-detect delimiter: try tab first, fall back to space.
-        # (AFR/pop rank files use space; some single-pop files may use tab.)
-        import gzip as _gzip
-
-        _open = _gzip.open if rank_file.endswith(".gz") else open
-        with _open(rank_file, "rt") as _fh:
-            _raw = _fh.readline()
-        _sep = "\t" if "\t" in _raw else " "
-        df_raw = pl.read_csv(
-            rank_file,
-            separator=_sep,
-            has_header=False,
-            infer_schema_length=0,  # read all as Utf8 first to handle variable cols
-        )
-    col_name = df_raw.columns[col_index]
-    df = df_raw.select(
-        [
-            pl.col(df_raw.columns[0]).alias("gene_id").cast(pl.Utf8),
-            pl.col(col_name).alias("rank").cast(pl.Int64),
-        ]
-    )
-    cuts = np.sort(np.array(thresholds, dtype=int))
-
-    expr = None
-    for c in cuts:
-        if expr is None:
-            expr = pl.when(pl.col("rank") <= c).then(pl.lit(c))
-        else:
-            expr = expr.when(pl.col("rank") <= c).then(pl.lit(c))
-
-    return (
-        df.with_columns(expr.otherwise(None).alias("selected_cutoff"))
-        .drop_nulls("selected_cutoff")
-        .select(["gene_id", "selected_cutoff"])
-    )
-
-
-def simplify_sweeps_gz_list(rank_file: str, thresholds: list) -> pl.DataFrame:
-    """
-    For a single-population rank file, return all thresholds each gene passes
-    as a comma-separated string.
-
-    Parameters
-    ----------
-    rank_file  : TSV with columns gene_id, rank (no header)
-    thresholds : list of int rank thresholds
-
-    Returns
-    -------
-    pl.DataFrame with columns: gene_id, cutoffs (comma-separated string)
-    """
-    df = pl.read_csv(
-        rank_file, separator="\t", has_header=False, new_columns=["gene_id", "rank"]
-    )
-    cuts = np.sort(thresholds)[::-1]
-
-    df_cut = df.with_columns(
-        pl.when(pl.col("rank").is_not_null())
-        .then(
-            pl.struct(pl.col("rank")).map_elements(
-                lambda s: ",".join(str(c) for c in cuts if s["rank"] <= c),
-                return_dtype=pl.Utf8,
-            )
-        )
-        .alias("cutoffs")
-    )
-    return df_cut.filter(pl.col("cutoffs") != "")
-
-
-def _count_sweep_events(query_genes: set, sweep_genes: set, neighbor_map: dict) -> int:
-    """
-    Count distinct sweep events = connected components of the neighbour graph
-    restricted to `sweep_genes`, that are touched by at least one gene from
-    `query_genes`.
-
-    Each connected component in the sub-graph of sweep_genes (using neighbor_map
-    edges) is a single sweep event.  We count components that share at least one
-    gene with query_genes.
-    """
-    visited: set = set()
-    count = 0
-    for g in query_genes:
-        if g not in sweep_genes or g in visited:
+    k_max = -(-int(cluster_distance) // 10_000)
+    by_bin: dict = {}
+    for c, b, g in df.select("chrom", "bin", "gene_id").iter_rows():
+        by_bin.setdefault((c, b), []).append(g)
+    nbrs = [[] for _ in range(len(gene_ids) + 1)]
+    for c, b, g in df.select("chrom", "bin", "gene_id").iter_rows():
+        if g not in g2i:
             continue
-        # DFS to find the connected component of g within sweep_genes
-        stack = [g]
-        while stack:
-            node = stack.pop()
-            if node in visited or node not in sweep_genes:
+        lst = nbrs[g2i[g]]
+        for d in range(-k_max, k_max + 1):
+            for h in by_bin.get((c, b + d), ()):
+                if h != g and h in g2i:
+                    lst.append(g2i[h])
+    ptr = np.zeros(len(nbrs) + 1, dtype=np.int64)
+    ptr[1:] = np.cumsum([len(x) for x in nbrs])
+    idx = np.array([i for x in nbrs for i in x], dtype=np.int32)
+    return ptr, idx
+
+
+@njit(cache=True)
+def _count_bins_clust(bins, M, V_order, nb_ptr, nb_idx, n_thr):
+    """
+    Sweep counts as count_sweeps_script.pl with ``Count_sweeps yes``, per population
+    column of ``bins`` (threshold bin per gene, ``n_thr`` = in no sweep).
+
+    Case genes, in ``V_order``: a gene in a sweep that is not yet done counts 1 at every
+    threshold it passes and marks its in-sweep neighbours done, so they are never
+    counted. Control set s, genes in set order: a gene in a sweep that is not yet done,
+    together with its not-yet-done in-sweep neighbours present in the set, adds at each
+    threshold the mean multiplicity in the set of those of them that pass it; all of
+    them are then done. ``done`` is per population.
+
+    :returns: ``vip`` (P, T) and ``ctrl`` (P, T, S), float64.
+    """
+    n_genes, n_pops = bins.shape
+    n_sets, n_len = M.shape
+    vip = np.zeros((n_pops, n_thr))
+    ctrl = np.zeros((n_pops, n_thr, n_sets))
+    done = np.zeros((n_genes, n_pops), dtype=np.bool_)
+    for gi in range(V_order.shape[0]):
+        g = V_order[gi]
+        for p in range(n_pops):
+            b = bins[g, p]
+            if b >= n_thr or done[g, p]:
                 continue
-            visited.add(node)
-            stack.extend(neighbor_map.get(node, set()) - visited)
-        count += 1
-    return count
+            done[g, p] = True
+            for t in range(b, n_thr):
+                vip[p, t] += 1.0
+            for k in range(nb_ptr[g], nb_ptr[g + 1]):
+                w = nb_idx[k]
+                if bins[w, p] < n_thr:
+                    done[w, p] = True
+    stamp = np.zeros((n_genes, n_pops), dtype=np.int32)  # == s + 1: done in set s
+    in_set = np.zeros(n_genes, dtype=np.int32)  # == s + 1: gene present in set s
+    mult = np.zeros(n_genes, dtype=np.int64)
+    num = np.zeros(n_thr)
+    den = np.zeros(n_thr)
+    for s in range(n_sets):
+        tag = s + 1
+        for j in range(n_len):
+            g = M[s, j]
+            if in_set[g] != tag:
+                in_set[g] = tag
+                mult[g] = 0
+            mult[g] += 1
+        for j in range(n_len):
+            g = M[s, j]
+            for p in range(n_pops):
+                b = bins[g, p]
+                if b >= n_thr or stamp[g, p] == tag:
+                    continue
+                stamp[g, p] = tag
+                num[:] = 0.0
+                den[:] = 0.0
+                for t in range(b, n_thr):
+                    num[t] += mult[g]
+                    den[t] += 1.0
+                for k in range(nb_ptr[g], nb_ptr[g + 1]):
+                    w = nb_idx[k]
+                    if in_set[w] != tag:
+                        continue
+                    bw = bins[w, p]
+                    if bw >= n_thr or stamp[w, p] == tag:
+                        continue
+                    stamp[w, p] = tag
+                    for t in range(bw, n_thr):
+                        num[t] += mult[w]
+                        den[t] += 1.0
+                for t in range(n_thr):
+                    if den[t] > 0.0:
+                        ctrl[p, t, s] += num[t] / den[t]
+    return vip, ctrl
 
 
-def count_sweeps_singlepop(
-    vip_genes: list,
-    control_sets: list,
-    simplified_sweeps: pl.DataFrame,
-    neighbors: pl.DataFrame,
-    thresholds: list,
-    use_clust: bool = True,
-    count_sweeps: bool = False,
-    neighbor_col: str = None,
-) -> pl.DataFrame:
+def _case_order(gene_ids: list, vip_genes) -> np.ndarray:
     """
-    Count sweeps overlapping VIPs vs control sets for a single population.
-
-    Parameters
-    ----------
-    vip_genes        : list of VIP gene ID strings
-    control_sets     : list of lists of control gene IDs (one list per control set)
-    simplified_sweeps: pl.DataFrame from simplify_sweeps_gz (gene_id, selected_cutoff)
-    neighbors        : pl.DataFrame from build_gene_neighbors_numpy (gene_id, neighbors)
-    thresholds       : sorted list of int rank thresholds
-    use_clust        : expand gene sets by neighbours before counting (de-duplication)
-    count_sweeps     : if True, count distinct sweep events (connected components of the neighbour graph within sweep genes) rather than individual genes.
-    neighbor_col     : column name for neighbours (auto-detected if None)
-
-    Returns
-    -------
-    pl.DataFrame with columns: threshold, vip_count, ctrl_mean, ctrl_ci_lo, ctrl_ci_hi, ratio, ci_lo_ratio, ci_hi_ratio, p_value
+    Row indices of the case genes sorted by gene id: the order of Perl VIPs/file_1
+    (bootstrap_test_script_nomatchomega_fast.pl writes ``sort keys %vips``), which
+    decides which gene of a cluster is counted with Count_sweeps yes.
     """
-    cuts = sorted(int(x) for x in thresholds)
-    _sw = simplified_sweeps.select(["gene_id", "selected_cutoff"])
-    sel_map = dict(zip(_sw["gene_id"].to_list(), _sw["selected_cutoff"].to_list()))
-    neighbor_map: dict = {}
-    if use_clust or count_sweeps:
-        if neighbor_col is None:
-            if "neighbors" in neighbors.columns:
-                neighbor_col = "neighbors"
-            elif "gene_id_b" in neighbors.columns:
-                neighbor_col = "gene_id_b"
-        if neighbor_col and neighbor_col in neighbors.columns:
-            for row in neighbors.iter_rows(named=True):
-                raw = row.get(neighbor_col, None)
-                neighbor_map[row["gene_id"]] = set(raw.split(" ")) if raw else set()
+    g2i = {g: i for i, g in enumerate(gene_ids)}
+    return np.array([g2i[g] for g in sorted(set(vip_genes)) if g in g2i], dtype=np.int64)
 
-    def expand(ids: set) -> set:
-        if not use_clust or not neighbor_map:
-            return ids
-        visited: set = set()
-        expanded: set = set()
-        for g in ids:
-            if g in visited:
-                continue
-            cluster = neighbor_map.get(g, set()) | {g}
-            expanded |= cluster
-            visited |= cluster
-        return expanded
 
-    vip_set = expand(set(vip_genes))
+def _add_scopes(vip: np.ndarray, ctrl: np.ndarray, populations: list, groups: list) -> tuple:
+    """
+    Append one scope per group and ``All``. As count_sweeps_script.pl
+    (``set_recurrent_score``, ``control_all_scores``), a group or All count is the SUM
+    of its populations' counts: a gene in a sweep in k member populations counts k times.
+    Every group label gets a scope, also single-population groups.
+    """
+    names = list(populations)
+    vips, ctrls = [vip], [ctrl]
+    members: dict = {}
+    for i, g in enumerate(groups):
+        members.setdefault(g, []).append(i)
+    for g, idx in members.items():
+        names.append(g)
+        vips.append(vip[idx].sum(axis=0, keepdims=True))
+        ctrls.append(ctrl[idx].sum(axis=0, keepdims=True))
+    names.append("All")
+    vips.append(vip.sum(axis=0, keepdims=True))
+    ctrls.append(ctrl.sum(axis=0, keepdims=True))
+    return np.concatenate(vips), np.concatenate(ctrls), names
 
-    # Keep raw lists for counting (duplicates matter — Perl bootstrap samples with
-    # replacement and scores = sum of repetition counts for sweep genes in ctrl list).
-    # Only the set-expanded version is needed for use_clust / count_sweeps paths.
-    ctrl_lists = [list(ctrl) for ctrl in control_sets]  # raw lists with dups
-    ctrl_sets_expanded = [expand(set(ctrl)) for ctrl in control_sets]  # for clust paths
 
-    # Vectorized path for the common case (use_clust=False, count_sweeps=False):
-    # build a numpy int32 matrix once, then use boolean indexing per threshold.
-    # This replaces O(n_sets × n_genes × n_thresholds) Python loops with numpy ops.
-    if not use_clust and not count_sweeps and ctrl_lists:
-        _all_genes = sorted({g for ctrl in ctrl_lists for g in ctrl})
-        _g2i = {g: i for i, g in enumerate(_all_genes)}
-        _n_vocab = len(_all_genes)
-        _ctrl_matrix = np.array(
-            [[_g2i[g] for g in ctrl] for ctrl in ctrl_lists], dtype=np.int32
-        )  # shape: (n_ctrl_sets, n_genes_per_set)
+def _adaptive_depth(vip, ctrl, names: list, pop_interest: str, adaptive: bool = True) -> int:
+    """
+    Number of control sets count_sweeps_script.pl ends up using: 20, then 100 if a
+    Pop_interest line has p <= 0.05 or >= 0.95, then up to 5000 if one has p <= 0.01 or
+    >= 0.99. Pop_interest is a regular expression matched against ``"<scope>:"``.
+    """
+    n_total = ctrl.shape[2]
+    if not adaptive:
+        return n_total
+    sel = [k for k, nm in enumerate(names) if re.search(pop_interest, f"{nm}:")]
+    for n, lo, hi in _PERL_DEPTH:
+        n_eff = min(n, n_total)
+        if lo is None or not sel:
+            return n_eff
+        p = (ctrl[sel, :, :n_eff] > vip[sel][:, :, None]).mean(axis=2)
+        if not np.any((p <= lo) | (p >= hi)):
+            return n_eff
+    return n_total
+
+
+def _pop_counts(rank_table, vip_genes, control_sets, thresholds, populations, neighbors=None) -> tuple:
+    """
+    Per-population counts; ``neighbors`` = CSR from :func:`_gene_neighbors` switches to
+    Count_sweeps yes (:func:`_count_bins_clust`), and ``V`` is then the case genes in
+    Perl order (:func:`_case_order`).
+    """
+    th = np.array(sorted(int(x) for x in thresholds), dtype=np.int64)
+    bins = _rank_bins(rank_table, len(populations), th)
+    gene_ids = rank_table[:, 0].to_list()
+    V, M = _gene_index(gene_ids, vip_genes, control_sets)
+    if neighbors is None:
+        vip, ctrl = _count_bins(bins, M, V, len(th))
     else:
-        _ctrl_matrix = None
-        _g2i = None
-        _n_vocab = 0
-
-    rows = []
-    if not use_clust and not count_sweeps and _ctrl_matrix is not None:
-        # === FAST PATH: batch all thresholds in one tensor operation ===
-        # Build cutoff vector aligned to control-gene vocab (_g2i)
-        _cutoff_arr = np.full(_n_vocab, np.iinfo(np.int32).max, dtype=np.int32)
-        for g, c in sel_map.items():
-            if g in _g2i:
-                _cutoff_arr[_g2i[g]] = int(c)
-
-        # VIP cutoffs from sel_map directly (independent of _g2i — covers all VIPs)
-        _vip_sorted = sorted(vip_set)
-        _vip_cutoffs = np.array(
-            [int(sel_map.get(g, np.iinfo(np.int32).max)) for g in _vip_sorted],
-            dtype=np.int32,
-        )
-
-        _thresh_arr = np.array(cuts, dtype=np.int32)  # (T,)
-        _sweep_mask = _cutoff_arr[None, :] <= _thresh_arr[:, None]  # (T, V) bool
-        _all_ctrl = _sweep_mask[:, _ctrl_matrix].sum(axis=2)  # (T, S)
-        _all_vip = (_vip_cutoffs[None, :] <= _thresh_arr[:, None]).sum(axis=1)  # (T,)
-        _all_means = _all_ctrl.mean(axis=1)  # (T,)
-        _all_ci = np.percentile(_all_ctrl, [2.5, 97.5], axis=1)  # (2, T)
-        _all_pvals = (_all_ctrl > _all_vip[:, None]).mean(axis=1)  # (T,)
-
-        for t_idx, t in enumerate(cuts):
-            vip_count = int(_all_vip[t_idx])
-            ctrl_mean = float(_all_means[t_idx])
-            ci_low = float(_all_ci[0, t_idx])
-            ci_high = float(_all_ci[1, t_idx])
-            p_val = float(_all_pvals[t_idx])
-            denom = ctrl_mean + 0.1
-            rows.append(
-                {
-                    "threshold": t,
-                    "vip_count": vip_count,
-                    "ctrl_mean": ctrl_mean,
-                    "ctrl_ci_lo": ci_low,
-                    "ctrl_ci_hi": ci_high,
-                    "ratio": (vip_count + 0.1) / denom,
-                    "ci_lo_ratio": (ci_low + 0.1) / denom,
-                    "ci_hi_ratio": (ci_high + 0.1) / denom,
-                    "p_value": p_val,
-                }
-            )
-    else:
-        # === SLOW PATHS: per-threshold loop (use_clust=True or count_sweeps=True) ===
-        sweep_dict = {t: {g for g, c in sel_map.items() if c <= t} for t in cuts}
-        for t in cuts:
-            S = sweep_dict[t]
-            if count_sweeps:
-                ctrl_counts = [
-                    _count_sweep_events(C, S, neighbor_map) for C in ctrl_sets_expanded
-                ]
-                vip_count = _count_sweep_events(vip_set, S, neighbor_map)
-            else:
-                # use_clust=True: expand by neighbours, count unique genes
-                vip_count = len(vip_set & S)
-                ctrl_counts = [len(C & S) for C in ctrl_sets_expanded]
-
-            ctrl_counts_arr = np.asarray(ctrl_counts)
-            ctrl_mean = float(np.mean(ctrl_counts_arr)) if ctrl_counts_arr.size else 0.0
-            if ctrl_counts_arr.size > 1:
-                ci_low, ci_high = np.percentile(ctrl_counts_arr, [2.5, 97.5])
-            else:
-                ci_low = ci_high = ctrl_mean
-            denom = ctrl_mean + 0.1
-            p_val = (
-                float(np.mean(ctrl_counts_arr > vip_count))
-                if ctrl_counts_arr.size > 0
-                else float("nan")
-            )
-            rows.append(
-                {
-                    "threshold": t,
-                    "vip_count": vip_count,
-                    "ctrl_mean": ctrl_mean,
-                    "ctrl_ci_lo": float(ci_low),
-                    "ctrl_ci_hi": float(ci_high),
-                    "ratio": float((vip_count + 0.1) / denom),
-                    "ci_lo_ratio": float((ci_low + 0.1) / denom),
-                    "ci_hi_ratio": float((ci_high + 0.1) / denom),
-                    "p_value": p_val,
-                }
-            )
-
-    return pl.DataFrame(rows)
+        V = _case_order(gene_ids, vip_genes)
+        vip, ctrl = _count_bins_clust(bins, M, V, neighbors[0], neighbors[1], len(th))
+    return th, bins, V, M, vip, ctrl
 
 
-def _resolve_target_pops(pop_interest: str, populations: list, groups: list) -> list:
-    """Return the list of population names matching pop_interest."""
-    if pop_interest == "All":
-        return populations
-    if pop_interest in populations:
-        return [pop_interest]
-    # treat as group name
-    return [p for p, g in zip(populations, groups) if g == pop_interest]
-
-
-def _group_sweep_sets(
-    pops_in_group: list,
-    simplified_sweeps_by_pop: dict,
-    thresholds: list,
-) -> pl.DataFrame:
-    """
-    Build a unified simplified-sweeps DataFrame for a group of populations:
-    a gene is 'in sweep at threshold t' if it is in ANY member population's sweep set.
-    The selected_cutoff is the minimum (most stringent) cutoff across member pops.
-    """
-    cuts = sorted(int(x) for x in thresholds)
-    # For each gene collect the minimum selected_cutoff across member pops
-    gene_cutoff: dict = {}
-    for pop in pops_in_group:
-        df_pop = simplified_sweeps_by_pop.get(pop)
-        if df_pop is None:
-            continue
-        for gene_id, cutoff in df_pop.select(
-            ["gene_id", "selected_cutoff"]
-        ).iter_rows():
-            if gene_id not in gene_cutoff or cutoff < gene_cutoff[gene_id]:
-                gene_cutoff[gene_id] = cutoff
-    if not gene_cutoff:
-        return pl.DataFrame(
-            {"gene_id": [], "selected_cutoff": []},
-            schema={"gene_id": pl.Utf8, "selected_cutoff": pl.Int64},
-        )
-    return pl.DataFrame(
-        list(gene_cutoff.items()),
-        schema=["gene_id", "selected_cutoff"],
-        orient="row",
-    )
-
-
-def count_sweeps_multipop(
+def count_sweeps_fast(
+    rank_table: pl.DataFrame,
     vip_genes: list,
-    control_sets: list,
-    simplified_sweeps_by_pop: dict,
-    neighbors: pl.DataFrame,
+    control_sets,
     thresholds: list,
     populations: list,
     groups: list,
-    pop_interest: str,
-    count_sweeps: bool = False,
-    use_clust: bool = True,
-    nthreads: int = 1,
+    pop_interest: str = "All",
+    adaptive: bool = True,
+    neighbors: tuple | None = None,
 ) -> pl.DataFrame:
     """
-    Step 7: Multi-population sweep counting with group aggregation and adaptive depth.
+    Enrichment curves for every population, group and ``All``, as count_sweeps_script.pl
+    with ``Count_sweeps no`` (genes counted individually), or ``Count_sweeps yes`` when
+    ``neighbors`` (:func:`_gene_neighbors`) is given (neighbouring genes in a sweep count
+    once; see :func:`_count_bins_clust`).
 
-    Populations are processed in parallel. For a group or 'All', the sweep sets
-    of member populations are unioned before counting (each sweep counted once per
-    group, not once per population). Adaptive depth escalates from 100 → 1000 →
-    all control sets depending on observed p-values.
+    - population: case genes in a sweep (rank <= threshold) vs the same count in each
+      control set (genes counted with their multiplicity in the set);
+    - group / All: sums of their populations' counts;
+    - control sets used: first 20, 100 or all, decided by the p-values of the
+      ``pop_interest`` scope (see :func:`_adaptive_depth`); ``adaptive=False`` uses all;
+    - ``ctrl_ci_lo``/``ctrl_ci_hi``: sorted control counts at ``int(0.025 n)`` and
+      ``int(0.975 n)``; ``p_value``: fraction of control sets with a larger count.
 
-    Parameters
-    ----------
-    vip_genes               : list of VIP gene IDs
-    control_sets            : list of lists of control gene IDs (up to 10 000)
-    simplified_sweeps_by_pop: dict mapping population name → pl.DataFrame (output of simplify_sweeps_gz per pop)
-    neighbors               : pl.DataFrame from build_gene_neighbors_numpy
-    thresholds              : list of int rank thresholds
-    populations             : ordered list of population codes
-    groups                  : group label for each population (same length)
-    pop_interest            : single pop name, group name, or "All"
-    count_sweeps            : if True count distinct sweep events (connected components of the neighbour graph within sweep genes); if False count genes in sweeps (default; matches Perl behaviour)
-    use_clust               : expand gene sets by neighbours before counting (de-duplication; maps to Perl Count_sweeps parameter)
-    nthreads                : parallel workers
-
-    Returns
-    -------
-    pl.DataFrame with columns: scope, threshold, vip_count, ctrl_mean, ctrl_ci_lo, ctrl_ci_hi, ratio, ci_lo_ratio, ci_hi_ratio, p_value. scope is the population name, group name, or "All".
+    :param rank_table: Merged rank table (:func:`_read_rank_table`); rank columns in
+        ``populations`` order.
+    :param control_sets: Control sets, (n_sets, n_case) gene ids.
+    :returns: One row per scope and threshold; ``n_sets`` is the number of control sets used.
     """
-    target_pops = _resolve_target_pops(pop_interest, populations, groups)
-    if not target_pops:
-        raise ValueError(
-            f"pop_interest '{pop_interest}' not found in populations or groups"
-        )
-
-    # Determine scopes to evaluate:
-    # - each individual target population
-    # - each group that appears among target pops (if > 1 pop in group)
-    # - "All" if pop_interest == "All" or covers multiple groups
-    # Group/All scopes use gene union across member pops (min cutoff), which matches
-    # the Perl recurrence-weighted formula: each gene counted once regardless of
-    # how many populations it appears in.
-    scopes: dict = {}  # scope_name → simplified_sweeps df
-
-    for pop in target_pops:
-        if pop in simplified_sweeps_by_pop:
-            scopes[pop] = simplified_sweeps_by_pop[pop]
-
-    # Group-level scopes
-    group_to_pops: dict = {}
-    for pop in target_pops:
-        g = groups[populations.index(pop)]
-        group_to_pops.setdefault(g, []).append(pop)
-
-    for grp, members in group_to_pops.items():
-        if len(members) > 1:
-            scopes[grp] = _group_sweep_sets(
-                members, simplified_sweeps_by_pop, thresholds
-            )
-
-    # "All" scope
-    if pop_interest == "All" and len(target_pops) > 1:
-        scopes["All"] = _group_sweep_sets(
-            target_pops, simplified_sweeps_by_pop, thresholds
-        )
-
-    # Adaptive depth rounds: 100 → 1000 → all
-    adaptive_limits = [100, 1000, len(control_sets)]
-
-    all_results = []
-
-    for round_idx, n_ctrl in enumerate(adaptive_limits):
-        ctrl_subset = control_sets[:n_ctrl]
-
-        # Run each scope in parallel
-        def _count_scope(scope_name, sw_df):
-            df = count_sweeps_singlepop(
-                vip_genes=vip_genes,
-                control_sets=ctrl_subset,
-                simplified_sweeps=sw_df,
-                neighbors=neighbors,
-                thresholds=thresholds,
-                use_clust=use_clust,
-                count_sweeps=count_sweeps,
-            )
-            return scope_name, df
-
-        scope_items = list(scopes.items())
-        results_round = Parallel(n_jobs=nthreads, backend="loky")(
-            delayed(_count_scope)(name, df) for name, df in scope_items
-        )
-
-        # Collect into a single DataFrame for this round
-        frames = []
-        for scope_name, df in results_round:
-            frames.append(df.with_columns(pl.lit(scope_name).alias("scope")))
-
-        combined = pl.concat(frames).select(
-            [
-                "scope",
-                "threshold",
-                "vip_count",
-                "ctrl_mean",
-                "ctrl_ci_lo",
-                "ctrl_ci_hi",
-                "ratio",
-                "ci_lo_ratio",
-                "ci_hi_ratio",
-                "p_value",
-            ]
-        )
-        all_results = combined  # overwrite — later rounds have more control sets
-
-        # Adaptive depth decision
-        p_values = combined["p_value"].drop_nulls().to_list()
-        if round_idx == 0:
-            # Escalate if any p ≤ 0.05 or p ≥ 0.95
-            if not any(p <= 0.05 or p >= 0.95 for p in p_values):
-                break  # not significant at any threshold — stop here
-        elif round_idx == 1:
-            # Escalate if any p ≤ 0.002 or p ≥ 0.998
-            if not any(p <= 0.002 or p >= 0.998 for p in p_values):
-                break  # weakly significant only — no need for full 10 000 sets
-        # round_idx == 2: always final
-
-        # Don't escalate beyond what we have
-        if n_ctrl >= len(control_sets):
-            break
-
-    return all_results
+    th, _, _, _, vip, ctrl = _pop_counts(
+        rank_table, vip_genes, control_sets, thresholds, populations, neighbors
+    )
+    vip, ctrl, names = _add_scopes(vip, ctrl, populations, groups)
+    n = _adaptive_depth(vip, ctrl, names, pop_interest, adaptive)
+    return _curve_frame(names, th, vip, ctrl[:, :, :n])
 
 
-def shuffle_genome(
-    coord_file: str,
-    valid_genes: list,
-    sweep_files: list,
-    n_shuffles: int,
-    shuffling_segments_number: int,
-    output_dir: str = None,
-    max_rank_boundary: int = 2000,
-    seed: int = None,
+def _curve_frame(names: list, th: np.ndarray, vip: np.ndarray, ctrl: np.ndarray) -> pl.DataFrame:
+    n = ctrl.shape[2]
+    ctrl_mean = ctrl.mean(axis=2)
+    srt = np.sort(ctrl, axis=2)
+    ci_lo = srt[:, :, int(0.025 * n)].astype(np.float64)
+    ci_hi = srt[:, :, min(int(0.975 * n), n - 1)].astype(np.float64)
+    denom = ctrl_mean + 0.1
+    n_thr = len(th)
+    return pl.DataFrame(
+        {
+            "scope": np.repeat(names, n_thr),
+            "threshold": np.tile(th, len(names)),
+            "vip_count": vip.ravel(),
+            "ctrl_mean": ctrl_mean.ravel(),
+            "ctrl_ci_lo": ci_lo.ravel(),
+            "ctrl_ci_hi": ci_hi.ravel(),
+            "ratio": ((vip + 0.1) / denom).ravel(),
+            "ci_lo_ratio": ((ci_lo + 0.1) / denom).ravel(),
+            "ci_hi_ratio": ((ci_hi + 0.1) / denom).ravel(),
+            "p_value": (ctrl > vip[:, :, None]).mean(axis=2).ravel(),
+            "n_sets": np.full(len(names) * n_thr, n, dtype=np.int64),
+        }
+    )
+
+
+def _all_stat(vip_all, ctrl_all, n, th, p_cutoff, min_vip_count, min_threshold, max_threshold) -> float:
+    """
+    estimate_FPR.pl statistic on the ``All:`` lines: sum over thresholds of
+    (All score - All control mean), keeping lines with p <= p_cutoff, score >= enough
+    and min_threshold <= threshold <= max_threshold.
+    """
+    c = ctrl_all[:, :n]
+    av = c.mean(axis=1)
+    p = (c > vip_all[:, None]).mean(axis=1)
+    keep = (p <= p_cutoff) & (vip_all >= min_vip_count) & (th >= min_threshold) & (th <= max_threshold)
+    return float(vip_all[keep].sum() - av[keep].sum())
+
+
+def _draw_shuffle_block(
+    segments: list, n_genes: int, rng: np.random.Generator, n: int = 8
 ) -> list:
     """
-    Step 8: Shuffle genomic positions of sweep signals to build an FDR null.
+    One shuffle_sweep_script_nocut.pl call: every segment is mirrored to the opposite
+    end of the genome with probability 1/2 (``rand(10) > 5``) once, then ``n`` shuffles
+    reorder those same segments. Position i of a shuffle takes the ranks of gene ``out[i]``.
+    """
+    mirror = rng.random(len(segments)) * 10 > 5
+    segs = [np.int32(n_genes - 1) - s if m else s for s, m in zip(segments, mirror)]
+    return [np.concatenate([segs[k] for k in rng.permutation(len(segs))]) for _ in range(n)]
 
-    Genes are ordered by chromosomal position and divided into segments.
-    Segments are randomly reordered (and optionally reversed), building
-    n_shuffles independent gene→gene permutation maps. For each original
-    sweep file and each permutation, a shuffled dataset is produced.
 
-    n_shuffles must be a multiple of 8. Each call to the outer loop produces
-    8 independent shufflings per outer iteration.
+def _fdr_shuffles(
+    rank_table: pl.DataFrame,
+    coord_file: str,
+    universe,
+    thresholds: list,
+    shuffling_segs: int,
+    n_shuffles: int,
+    seed: int | None,
+    shuffle_blocks: int | None = None,
+) -> tuple:
+    """
+    Genome shuffles as exdef_pipeline.pl: genes = ``universe`` (Perl: valid genes used by
+    the bootstrap) in chromosomal order; a cut every ``shuffling_segs`` genes unless both
+    flanking genes rank <= max(thresholds) (Perl maxi_rank, the first threshold of the
+    descending list) in some population; ``n_shuffles / 8`` blocks of 8.
+    ``shuffle_blocks`` = B replaces the segment size by ``int(n_genes / B)``, the
+    commented-out line of shuffle_sweep_script_nocut.pl (B blocks, Enard & Petrov 2020).
 
-    Parameters
-    ----------
-    coord_file               : path to BED gene coordinates (no header)
-    valid_genes              : list of gene IDs to include (QC-passing universe)
-    sweep_files              : list of original sweep file paths (all window sizes)
-    n_shuffles               : total number of shuffled replicates (multiple of 8)
-    shuffling_segments_number: number of genomic segments to cut the genome into
-    output_dir               : directory to write shuffled sweep files.
-                               If None (default), data is kept in memory and a
-                               list of {sweep_file: pl.DataFrame} dicts is returned
-                               (one dict per replicate) — no files written to disk.
-    max_rank_boundary        : genes ranked <= this are considered "strong signal"
-                               and candidate cut points flanked by two such genes
-                               are marked invalid
-
-    Returns
-    -------
-    output_dir is not None  → list of str (paths to written shuffled files)
-    output_dir is None      → list of dict[str, pl.DataFrame], one per replicate.
-                              Each dict maps sweep_file path → shuffled DataFrame
-                              with the same column layout as the original file.
-                              Pass directly to estimate_fdr as
-                              shuffled_sweep_files_by_shuffle.
+    :returns: ``(ordered_genes, shuffles)`` with ``shuffles`` (n_shuffles, n_genes).
     """
     if n_shuffles % 8 != 0:
         raise ValueError("n_shuffles must be a multiple of 8")
-    in_memory = output_dir is None
-    if not in_memory:
-        os.makedirs(output_dir, exist_ok=True)
-
-    # --- 1. Valid gene universe ---
-    valid_genes = set(valid_genes)
-
-    # --- 2. Load coordinates and build chromosomal order ---
-    df_coords = (
-        pl.read_csv(
-            coord_file,
-            separator="\t",
-            has_header=False,
-            new_columns=["chrom", "start", "end", "gene_id", "strand"],
-            schema_overrides={"chrom": pl.Utf8},
-        )
-        .filter(pl.col("gene_id").is_in(valid_genes))
-        .with_columns(((pl.col("start") + pl.col("end")) // 2).alias("center"))
-        .with_columns(
-            ((pl.col("center") / 10000).floor() * 10000).cast(pl.Int64).alias("bin")
-        )
-    )
-
-    # Build ordered gene list (autosomes 1–22, numeric chromosome order)
-    ordered_genes = (
-        df_coords.filter(pl.col("chrom").is_in([str(i) for i in range(1, 23)]))
-        .with_columns(pl.col("chrom").cast(pl.Int32).alias("_chrom_int"))
-        .sort(["_chrom_int", "bin"])["gene_id"]
-        .to_list()
-    )
-
-    n_genes = len(ordered_genes)
-    if n_genes == 0:
-        raise ValueError("No valid genes found in coord_file")
-
-    gene_to_idx = {g: i for i, g in enumerate(ordered_genes)}
-    # Perl: $seg_size = $segcut (direct segment size, not count).
-    # shuffling_segments_number IS the number of genes per segment, not the
-    # number of segments.  Segments grow until a valid cut is found.
-    seg_size = max(1, shuffling_segments_number)
-
-    # --- 3. Load sweep data for cut-point validation ---
-    # A gene is "strong signal" if its rank <= max_rank_boundary in ANY sweep file
-    strong_signal_genes: set = set()
-    sweep_data_by_file: dict = (
-        {}
-    )  # file → dict gene_id → tab-separated line (disk mode)
-    rank_matrix_by_file: dict = {}  # file → (gene_col, rank_cols, numpy int32 matrix)
-
-    for sf in sweep_files:
-        gene_ranks: dict = {}
-        _first_line = open(sf).readline()
-        _sep = "\t" if "\t" in _first_line else " "
-        df_sw = pl.read_csv(
-            sf,
-            has_header=False,
-            separator=_sep,
-            infer_schema_length=0,
-        )
-        # column_1 = gene_id, remaining columns = per-population ranks
-        # A gene is strong-signal if its rank in ANY population <= max_rank_boundary
-        if df_sw.width >= 2:
-            # Vectorized: cast rank columns to Int64, take row-wise min, filter
-            _rank_exprs = [
-                pl.col(c).cast(pl.Int64, strict=False) for c in df_sw.columns[1:]
-            ]
-            strong_signal_genes |= set(
-                df_sw.filter(pl.min_horizontal(_rank_exprs) <= max_rank_boundary)[
-                    :, 0
-                ].to_list()
-            )
-            # Disk-mode: store tab-separated lines for gene remapping
-            if not in_memory:
-                for row in df_sw.iter_rows():
-                    gene_ranks[row[0]] = "\t".join(str(v) for v in row)
-
-            # In-memory fast path (S1): pre-align sweep data to ordered_genes order
-            # as a numpy int32 matrix so each shuffle is a single fancy-index op.
-            _gcol = df_sw.columns[0]
-            _rcols = df_sw.columns[1:]
-            _odf = pl.DataFrame({"_g": ordered_genes, "_pos": list(range(n_genes))})
-            _aligned = _odf.join(df_sw.rename({_gcol: "_g"}), on="_g", how="left").sort(
-                "_pos"
-            )
-            rank_matrix_by_file[sf] = (
-                _gcol,
-                list(_rcols),
-                _aligned.select(list(_rcols))
-                .with_columns(
-                    [
-                        pl.col(c).cast(pl.Int32, strict=False).fill_null(10_000_000)
-                        for c in _rcols
-                    ]
-                )
-                .to_numpy(),  # shape: (n_genes, n_pops)
-            )
-        sweep_data_by_file[sf] = gene_ranks
-
-    # --- 4. Detect valid cut points ---
-    # Candidate cuts: every seg_size genes
-    # Invalid: both the gene just before AND just after the cut are strong-signal genes
-    cut_valid = []  # list of (cut_index, is_valid)
-    for i in range(seg_size, n_genes, seg_size):
-        gene_before = ordered_genes[i - 1]
-        gene_after = ordered_genes[min(i, n_genes - 1)]
-        both_strong = (
-            gene_before in strong_signal_genes and gene_after in strong_signal_genes
-        )
-        cut_valid.append((i, not both_strong))
-
-    # --- 5. Build segments respecting valid cuts (as numpy arrays for fast mirror) ---
-    segments = []
-    seg_start = 0
-    for cut_idx, is_valid in cut_valid:
-        if is_valid:
-            segments.append(np.arange(seg_start, cut_idx, dtype=np.int32))
-            seg_start = cut_idx
-    # tail segment
-    if seg_start < n_genes:
-        segments.append(np.arange(seg_start, n_genes, dtype=np.int32))
-
+    ordered = _ordered_genes(coord_file, universe)
+    strong = _strong_signal_genes(rank_table, max(int(x) for x in thresholds))
+    seg_size = len(ordered) // shuffle_blocks if shuffle_blocks else shuffling_segs
+    segments = _shuffle_segments(ordered, strong, max(1, seg_size))
     rng = np.random.default_rng(seed)
-    written_paths = []
-    inmem_replicates = []
-    n_outer = n_shuffles // 8
-
-    for outer in range(n_outer):
-        # Produce 8 independent shufflings for this outer iteration
-        for inner in range(8):
-            shuffle_id = outer * 8 + inner + 1
-
-            # Shuffle segment order
-            seg_order = list(range(len(segments)))
-            rng.shuffle(seg_order)
-
-            # Per-segment: either keep forward indices or mirror to opposite end of genome.
-            # Matches Perl dice mechanism: dice>5 → use inds[n-1-i] instead of inds[i].
-            # Segments are numpy arrays — mirror is a single broadcast subtract (no loop).
-            collected = []
-            for si in seg_order:
-                seg = segments[si].copy()
-                if rng.integers(0, 2) == 1:
-                    seg = (
-                        np.int32(n_genes - 1) - seg
-                    )  # mirror position (numpy broadcast)
-                collected.append(seg)
-            shuffled_indices = np.concatenate(collected)
-
-            # Produce one shuffled dataset per original sweep file
-            replicate_dict = {}
-            for sf in sweep_files:
-                if in_memory:
-                    # S1: numpy fancy-index — single op replaces perm_map + gene loop
-                    _gcol, _rcols, _rmat = rank_matrix_by_file[sf]
-                    _reindexed = _rmat[shuffled_indices]  # (n_genes, n_pops)
-                    replicate_dict[sf] = pl.DataFrame(
-                        {_gcol: ordered_genes}
-                        | {_rcols[j]: _reindexed[:, j] for j in range(len(_rcols))}
-                    )
-                else:
-                    # Disk mode: build perm_map and remap gene by gene (string-based)
-                    perm_map = {
-                        ordered_genes[i]: ordered_genes[int(shuffled_indices[i])]
-                        for i in range(min(n_genes, len(shuffled_indices)))
-                    }
-                    gene_ranks = sweep_data_by_file[sf]
-                    rows = []
-                    for orig_gene in ordered_genes:
-                        shuffled_gene = perm_map.get(orig_gene, orig_gene)
-                        sweep_line = gene_ranks.get(shuffled_gene)
-                        if sweep_line is None:
-                            continue
-                        parts = sweep_line.split("\t")
-                        parts[0] = orig_gene
-                        rows.append(parts)
-                    base = os.path.basename(sf)
-                    out_path = os.path.join(
-                        output_dir, f"fake_{base}_shuffle{shuffle_id}"
-                    )
-                    with open(out_path, "w") as fout:
-                        for parts in rows:
-                            fout.write("\t".join(parts) + "\n")
-                    written_paths.append(out_path)
-
-            if in_memory:
-                inmem_replicates.append(replicate_dict)
-
-    return inmem_replicates if in_memory else written_paths
+    shuffles = [
+        idx
+        for _ in range(n_shuffles // 8)
+        for idx in _draw_shuffle_block(segments, len(ordered), rng)
+    ]
+    return ordered, np.stack(shuffles).astype(np.int32)
 
 
-def estimate_fdr(
-    real_results: pl.DataFrame,
-    shuffled_sweep_files_by_shuffle: list,
+def _fdr_null_chunk(
+    ord_bins, ord_rows, n_rows, shuffles, M, V, th, populations, groups,
+    pop_interest, adaptive, filt, neighbors=None,
+) -> np.ndarray:
+    """FDR null statistics for a block of shuffles (one joblib task)."""
+    out = np.empty(len(shuffles))
+    bins = np.full((n_rows, ord_bins.shape[1]), len(th), dtype=np.int16)
+    for r, idx in enumerate(shuffles):
+        bins[ord_rows] = ord_bins[idx]
+        if neighbors is None:
+            vip, ctrl = _count_bins(bins, M, V, len(th))
+        else:  # neighbours stay genomic; only the ranks move
+            vip, ctrl = _count_bins_clust(bins, M, V, neighbors[0], neighbors[1], len(th))
+        vip, ctrl, names = _add_scopes(vip, ctrl, populations, groups)
+        n = _adaptive_depth(vip, ctrl, names, pop_interest, adaptive)
+        out[r] = _all_stat(vip[-1], ctrl[-1], n, th, *filt)
+    return out
+
+
+def estimate_fdr_fast(
+    rank_table: pl.DataFrame,
+    coord_file: str,
+    shuffle_genes,
     vip_genes: list,
-    control_sets: list,
-    neighbors: pl.DataFrame,
+    control_sets,
     thresholds: list,
     populations: list,
     groups: list,
-    pop_interest: str,
-    simplified_sweeps_by_pop_fn=None,
-    count_sweeps: bool = False,
-    use_clust: bool = True,
+    n_shuffles: int,
+    shuffling_segs: int,
+    seed: int | None = None,
     nthreads: int = 1,
-    p_cutoff: float = 0.05,
-    max_threshold: int = None,
+    pop_interest: str = "All",
+    adaptive: bool = True,
+    p_cutoff: float = 1.0,
+    max_threshold: int | None = None,
     min_threshold: int = 0,
-    min_vip_count: int = 0,
+    min_vip_count: int = 1,
+    neighbors: tuple | None = None,
+    shuffle_blocks: int | None = None,
 ) -> pl.DataFrame:
     """
-    Step 9: Estimate FDR by comparing real results to a null distribution built
-    from genome-shuffled sweep files (output of shuffle_genome).
+    Whole-curve FDR p-value from genome shuffles, as shuffle_sweep_script_nocut.pl +
+    count_sweeps_script.pl + ``estimate_FPR.pl ... All:``.
+    ``neighbors`` switches the real and shuffled counts to Count_sweeps yes;
+    ``shuffle_blocks`` cuts the genome into that many blocks (see :func:`_fdr_shuffles`).
 
-    Matches the behaviour of estimate_FPR.pl: for each scope (population / group /
-    "All"), the test statistic is sum(vip_count − ctrl_mean) across rows that pass
-    the significance and threshold filters.  FDR p-value = fraction of null
-    replicates where that statistic ≥ the real statistic.
+    Each shuffle is counted like the real data (same control sets, adaptive depth keyed
+    on ``pop_interest``) and scored with the All-line statistic of :func:`_all_stat`.
+    Shuffles are drawn in the main process and counted in ``nthreads`` blocks.
 
-    Parameters
-    ----------
-    real_results                    : pl.DataFrame — output of count_sweeps_multipop on the real data (columns: scope, threshold, vip_count, ctrl_mean, p_value)
-    shuffled_sweep_files_by_shuffle : list of lists — each inner list holds paths for one shuffle replicate. Layout A: one file per population [[esn_s1, gwd_s1, ...], ...]. Layout B: one multi-population file per replicate [[multi_s1], [multi_s2], ...].
-    vip_genes                       : list of VIP gene IDs
-    control_sets                    : control sets from run_bootstrap
-    neighbors                       : pl.DataFrame from build_gene_neighbors_numpy
-    thresholds                      : list of int thresholds
-    populations                     : ordered population list
-    groups                          : group label per population
-    pop_interest                    : single pop, group name, or "All"
-    simplified_sweeps_by_pop_fn     : callable(sweep_file, col_index) → pl.DataFrame, or callable(sweep_file) → dict[pop, pl.DataFrame] for multi-pop files. Defaults to simplify_sweeps_gz.
-    use_clust                       : expand by neighbours before counting
-    nthreads                        : parallel workers
-    p_cutoff                        : p-value threshold for "significant" rows in the test statistic (Perl: cutoff, default 0.05)
-    max_threshold                   : upper bound on rank threshold included in the statistic (Perl: limit; None = no limit)
-    min_threshold                   : lower bound on rank threshold (Perl: cutoff2, default 0)
-    min_vip_count                   : minimum vip_count for a row to contribute to the statistic (Perl: enough, default 0)
-
-    Returns
-    -------
-    pl.DataFrame with columns: scope, p_value, n_replicates, real_stat, max_null_stat. One row per scope. real_stat = sum(vip_count − ctrl_mean) for significant rows. p_value = fraction of null replicates where null_stat ≥ real_stat.
+    :param shuffle_genes: Genes that are shuffled (Perl: valid genes used by the
+        bootstrap, i.e. case genes and every accepted control gene); others count as
+        not in a sweep in the shuffles.
+    :returns: One row: ``scope`` ("All"), ``p_value`` (#null >= real / n, as Perl),
+        ``n_replicates``, ``real_stat``, ``max_null_stat`` (max(0, nulls), as Perl
+        ``rand_max``), ``p_value_perm`` ((#null >= real + 1) / (n + 1)).
     """
-    target_pops = _resolve_target_pops(pop_interest, populations, groups)
+    import math
 
-    if simplified_sweeps_by_pop_fn is None:
+    th, bins, V, M, vip, ctrl = _pop_counts(
+        rank_table, vip_genes, control_sets, thresholds, populations, neighbors
+    )
+    if max_threshold is None:
+        max_threshold = int(th.max())
+    filt = (p_cutoff, min_vip_count, min_threshold, max_threshold)
+    vip_s, ctrl_s, names = _add_scopes(vip, ctrl, populations, groups)
+    n_real = _adaptive_depth(vip_s, ctrl_s, names, pop_interest, adaptive)
+    real_stat = _all_stat(vip_s[-1], ctrl_s[-1], n_real, th, *filt)
 
-        def simplified_sweeps_by_pop_fn(sweep_file, col_index=1):
-            return simplify_sweeps_gz(sweep_file, thresholds, col_index=col_index)
+    ordered, shuffles = _fdr_shuffles(
+        rank_table, coord_file, shuffle_genes, thresholds, shuffling_segs, n_shuffles, seed,
+        shuffle_blocks,
+    )
+    gene_ids = rank_table[:, 0].to_list()
+    g2i = {g: i for i, g in enumerate(gene_ids)}
+    ord_rows = np.array([g2i.get(g, -1) for g in ordered], dtype=np.int64)
+    ord_bins = np.full((len(ordered), len(populations)), len(th), dtype=np.int16)
+    ord_bins[ord_rows >= 0] = bins[ord_rows[ord_rows >= 0]]
+    # Shuffled genes absent from the rank table map to an extra, never-counted row.
+    n_rows = len(gene_ids) + 1
+    ord_rows[ord_rows < 0] = len(gene_ids)
 
-    def _run_one_shuffle(shuffle_data) -> pl.DataFrame:
-        """Run count_sweeps_multipop on one shuffled replicate.
-
-        shuffle_data is either:
-          - list[str]           — file paths (disk mode)
-          - dict[str, pl.DataFrame] — {sweep_file: df} (in-memory mode from
-                                      shuffle_genome(output_dir=None))
-        """
-        simplified_by_pop = {}
-
-        if isinstance(shuffle_data, dict):
-            # In-memory mode: shuffle_data maps sweep_file → shuffled DataFrame.
-            # Use simplify_sweeps_gz with df= kwarg to avoid any disk I/O.
-            # If more than one sweep file, union the simplified sets per pop.
-            sf_keys = list(shuffle_data.keys())
-            for i, pop in enumerate(target_pops):
-                col_idx = i + 1
-                frames = []
-                for sf in sf_keys:
-                    df_shuf = shuffle_data[sf]
-                    if col_idx < len(df_shuf.columns):
-                        frames.append(
-                            simplify_sweeps_gz(
-                                sf, thresholds, col_index=col_idx, df=df_shuf
-                            )
-                        )
-                if frames:
-                    simplified_by_pop[pop] = (
-                        pl.concat(frames)
-                        .group_by("gene_id")
-                        .agg(pl.col("selected_cutoff").min())
-                        if len(frames) > 1
-                        else frames[0]
-                    )
-        elif len(shuffle_data) == 1:
-            # Single multi-pop file (disk mode)
-            for i, pop in enumerate(target_pops):
-                try:
-                    result = simplified_sweeps_by_pop_fn(shuffle_data[0], i + 1)
-                except TypeError:
-                    full = simplified_sweeps_by_pop_fn(shuffle_data[0])
-                    if isinstance(full, dict):
-                        simplified_by_pop = {
-                            p: full[p] for p in target_pops if p in full
-                        }
-                    break
-                simplified_by_pop[pop] = result
-        else:
-            # One file per population (disk mode)
-            for i, pop in enumerate(target_pops):
-                if i < len(shuffle_data):
-                    try:
-                        simplified_by_pop[pop] = simplified_sweeps_by_pop_fn(
-                            shuffle_data[i], i + 1
-                        )
-                    except TypeError:
-                        simplified_by_pop[pop] = simplified_sweeps_by_pop_fn(
-                            shuffle_data[i]
-                        )
-        # For FDR, _compute_stat sums individual population rows (not group/All rows).
-        # Only compute per-population scopes here — skip group/All overhead.
-        frames = []
-        for pop in target_pops:
-            if pop not in simplified_by_pop:
-                continue
-            df_pop = count_sweeps_singlepop(
-                vip_genes=vip_genes,
-                control_sets=control_sets,
-                simplified_sweeps=simplified_by_pop[pop],
-                neighbors=neighbors,
-                thresholds=thresholds,
-                use_clust=use_clust,
-                count_sweeps=count_sweeps,
-            )
-            frames.append(df_pop.with_columns(pl.lit(pop).alias("scope")))
-        return pl.concat(frames) if frames else pl.DataFrame()
-
-    null_results = Parallel(n_jobs=nthreads, backend="loky", verbose=1)(
-        delayed(_run_one_shuffle)(shuf_files)
-        for shuf_files in shuffled_sweep_files_by_shuffle
+    chunk = max(1, math.ceil(n_shuffles / max(1, nthreads)))
+    null = Parallel(n_jobs=nthreads, backend="loky")(
+        delayed(_fdr_null_chunk)(
+            ord_bins, ord_rows, n_rows, shuffles[i : i + chunk], M, V, th,
+            populations, groups, pop_interest, adaptive, filt, neighbors,
+        )
+        for i in range(0, n_shuffles, chunk)
+    )
+    null = np.concatenate(null)
+    k = int(np.sum(null >= real_stat))
+    return pl.DataFrame(
+        {
+            "scope": ["All"],
+            "p_value": [k / n_shuffles],
+            "n_replicates": [n_shuffles],
+            "real_stat": [real_stat],
+            "max_null_stat": [max(0.0, float(null.max()))],
+            "p_value_perm": [(k + 1) / (n_shuffles + 1)],
+        }
     )
 
-    # --- Compute FDR per scope, matching estimate_FPR.pl ---
-    # Test statistic = sum(vip_count − ctrl_mean) for rows passing all filters.
-    # FDR p-value = fraction of null replicates where null_stat ≥ real_stat.
 
-    def _compute_stat(df: pl.DataFrame, scope: str) -> float:
-        """Perl estimate_FPR.pl: total_diff = sum(vip_count) - sum(ctrl_mean) for sig rows.
+def load_case_control(
+    gene_set: str, valid_genes: list, exclude: set
+) -> tuple[list, list, int]:
+    """
+    Split the gene universe into case and control-candidate genes.
 
-        For scope == "All": Perl accumulates counts PER population (sum-based), not a
-        gene union. Summing individual population rows reproduces this exactly.
-        """
-        if "scope" in df.columns:
-            if scope == "All":
-                # Perl "All:" = sum of individual population contributions.
-                # Each gene in k populations contributes k to the total, not 1.
-                s = df.filter(pl.col("scope").is_in(populations))
-            else:
-                s = df.filter(pl.col("scope") == scope)
-        else:
-            s = df
-        _pred = (
-            (pl.col("p_value") <= p_cutoff)
-            & (pl.col("vip_count") >= min_vip_count)
-            & (pl.col("threshold") >= min_threshold)
+    :param gene_set: Text file with one case gene id per line (no header). Blank lines
+        are skipped; only the first whitespace-separated field of a line is used.
+    :param valid_genes: Gene universe (factors ∩ sweep file genes).
+    :param exclude: Gene ids removed from both sets (HLA, histones).
+    :returns: ``(case, control, n_dropped)``: case = listed ids in the universe and not
+        excluded; control = every other universe gene not excluded (both in
+        ``valid_genes`` order); ``n_dropped`` = listed ids not kept as cases.
+    """
+    with open(gene_set) as fh:
+        listed = {line.split()[0] for line in fh if line.strip()}
+    case_set = {g for g in listed if g not in exclude} & set(valid_genes)
+    case = [g for g in valid_genes if g in case_set]
+    control = [g for g in valid_genes if g not in case_set and g not in exclude]
+    return case, control, len(listed) - len(case)
+
+
+def _check_enrichment_inputs(
+    sweep_files: list, populations: list, groups: list, thresholds: list
+) -> None:
+    """Fail before the bootstrap if populations, groups and rank columns disagree."""
+    import gzip as _gz
+
+    if len(groups) != len(populations):
+        raise ValueError(
+            f"groups has {len(groups)} labels for {len(populations)} populations; "
+            "give one group label per population, in the same order"
         )
-        if max_threshold is not None:
-            _pred = _pred & (pl.col("threshold") <= max_threshold)
-        s = s.filter(_pred)
-        if s.is_empty():
-            return 0.0
-        return float((s["vip_count"].cast(pl.Float64) - s["ctrl_mean"]).sum())
+    if not thresholds:
+        raise ValueError("thresholds is empty")
+    for f in sweep_files:
+        _open_fn = _gz.open if f.endswith(".gz") else open
+        with _open_fn(f, "rt") as fh:
+            n_rank_cols = len(fh.readline().split()) - 1
+        if n_rank_cols != len(populations):
+            raise ValueError(
+                f"{f} has {n_rank_cols} rank columns but {len(populations)} "
+                "populations were given; rank columns are read by position"
+            )
 
-    # Determine which scope(s) to report FDR for.
-    # Matches estimate_FPR.pl: only the scope matching pop_interest is reported
-    # (Perl uses regex match: if($pop =~ $splitter_line[1])).
-    if "scope" in real_results.columns:
-        all_scopes = real_results["scope"].unique().to_list()
-        scopes = [s for s in all_scopes if s == pop_interest]
-        if not scopes:
-            scopes = [pop_interest]  # fallback if scope not found
+
+def _load_bootstrap(folder: str, case_genes: list, universe: set) -> tuple:
+    """Load case_set.txt / control_set.txt written by a previous enrichment run."""
+    df_case = pl.read_csv(os.path.join(folder, "case_set.txt"))
+    df_control = pl.read_csv(os.path.join(folder, "control_set.txt"), infer_schema_length=0)
+    case = df_case["gene_id"].to_list()
+    extra = sorted(set(case) - set(case_genes))
+    if extra:
+        raise ValueError(
+            f"{folder}/case_set.txt has {len(extra)} genes that are not case genes of "
+            f"this gene set (e.g. {extra[:5]}); rerun the bootstrap"
+        )
+    width = df_control.width - 1
+    if width != len(case):
+        raise ValueError(
+            f"control sets have {width} genes but case_set.txt has {len(case)}"
+        )
+    ctrl_genes = set(df_control.drop("sample_id").to_numpy().ravel())
+    outside = sorted(ctrl_genes - universe)
+    if outside:
+        raise ValueError(
+            f"{len(outside)} control genes are outside this gene universe "
+            f"(e.g. {outside[:5]}); rerun the bootstrap"
+        )
+    used_path = os.path.join(folder, "used_genes.txt")
+    if os.path.isfile(used_path):
+        with open(used_path) as fh:
+            used = sorted({ln.split()[0] for ln in fh if ln.strip()})
     else:
-        scopes = [pop_interest]
-
-    rows = []
-    for scope in sorted(scopes):
-        real_stat = _compute_stat(real_results, scope)
-        null_stats = [_compute_stat(df, scope) for df in null_results]
-
-        n_reps = len(null_stats)
-        pval = (
-            float(np.sum(np.array(null_stats) >= real_stat) / n_reps)
-            if n_reps > 0
-            else float("nan")
+        used = sorted(set(case) | ctrl_genes)
+        print(
+            f"{used_path} not found: shuffling case + control-set genes ({len(used)}); "
+            "genes accepted by the sampler but absent from every set are missed",
+            flush=True,
         )
-        max_null = float(np.max(null_stats)) if null_stats else float("nan")
-
-        rows.append(
-            {
-                "scope": scope,
-                "p_value": pval,
-                "n_replicates": n_reps,
-                "real_stat": real_stat,
-                "max_null_stat": max_null,
-            }
-        )
-
-    return pl.DataFrame(rows)
+    print(
+        f"Reusing bootstrap from {folder}: {len(case)} case genes, "
+        f"{df_control.height} control sets, {len(used)} used genes",
+        flush=True,
+    )
+    return df_case, df_control, used
 
 
 def run_enrichment(
@@ -1457,7 +1120,7 @@ def run_enrichment(
     thresholds: list,
     pop_interest: str = "All",
     cluster_distance: int = 500_000,
-    n_runs: int = 10,
+    n_control_sets: int = 1000,
     tolerance: float = 0.05,
     min_distance: int = 1_250_000,
     flip: bool = False,
@@ -1467,13 +1130,19 @@ def run_enrichment(
     shuffling_segs: int = 2,
     bootstrap_dir: str = None,
     distance_file: str = None,
-) -> list:
+    seed: int | None = None,
+    reuse_bootstrap: str | None = None,
+    output_folder: str | None = None,
+    count_sweeps: bool = False,
+    shuffle_blocks: int | None = None,
+) -> tuple:
     """
     Run the full gene-set sweep enrichment pipeline.
 
     Steps:
 
-    1. Load gene set and derive valid gene universe (factors ∩ sweep_files[0]).
+    1. Derive the gene universe (factors ∩ sweep_files[0]) and split it into
+       case genes (listed in ``gene_set``) and control candidates (the rest).
     2. Bootstrap control sets matched on confounding factors
        (or load pre-computed sets from ``bootstrap_dir``).
     3. For each sweep file: count sweep overlaps, shuffle genome for null
@@ -1481,17 +1150,25 @@ def run_enrichment(
 
     :param sweep_files: Paths to sweep rank files (gene_id + per-population
         rank columns, tab- or space-separated, optionally gzipped).
-    :param gene_set: TSV with ``gene_id`` and ``yes``/``no`` label columns
-        (no header). Genes labelled ``yes`` are VIPs.
+    :param gene_set: Text file with one case (VIP) gene id per line, no header.
+        Control candidates are all other genes of the universe
+        (see :func:`load_case_control`).
     :param factors_file: TSV confounding factors file (gene_id + factor
         columns, no header).
     :param annotation_file: BED gene coordinates file (0-based, no header).
     :param populations: Population codes matching sweep file column order.
     :param groups: Group label per population (same length as populations).
     :param thresholds: Rank cutoffs for enrichment curve (e.g. [6000, ..., 20]).
-    :param pop_interest: Population, group name, or ``'All'`` for FDR scope.
-    :param cluster_distance: Max bp between genes to count as neighbours.
-    :param n_runs: Bootstrap batches.
+    :param pop_interest: Perl ``Pop_interest``: regular expression on the scope labels
+        (population, group or ``All``) whose p-values decide how many control sets are
+        used, for the real data and for every shuffle (20, 100 or all; see
+        :func:`_adaptive_depth`). The FDR statistic always uses the ``All`` scope
+        (``estimate_FPR.pl ... All:``).
+    :param cluster_distance: Neighbour distance (bp) for ``count_sweeps``
+        (get_all_neighbors.pl, 10 kb bins of the gene centre); unused otherwise.
+    :param n_control_sets: Number of matched control sets (multiple of 10; Perl
+        Runs_number x Iterations_number x 10 = 1000). The sampling is split into one
+        chain per thread, so the sets depend on ``seed`` and ``nthreads``.
     :param tolerance: Allowed ± fraction deviation in factor averages for
         control gene matching.
     :param min_distance: Minimum bp distance from VIPs for control eligibility.
@@ -1500,24 +1177,42 @@ def run_enrichment(
     :param nthreads: Parallel workers (joblib).
     :param n_shuffles: FDR shuffle replicates (must be a multiple of 8).
     :param shuffling_segs: Genes per genomic shuffle segment.
+    :param shuffle_blocks: If given, cut the shuffled genome into this many blocks of
+        ``int(n_genes / shuffle_blocks)`` genes instead of ``shuffling_segs``-gene
+        segments (the commented-out Perl line; 100 blocks in Enard & Petrov 2020).
+    :param count_sweeps: Perl ``Count_sweeps yes``: neighbouring genes in the same sweep
+        (within ``cluster_distance``) count once, in the real data and in every shuffle
+        (see :func:`_count_bins_clust`). Default: every gene counts (``Count_sweeps no``).
     :param bootstrap_dir: Folder with pre-computed ``VIPs/`` and ``nonVIPs/``
         sub-dirs. When non-empty, the bootstrap step is skipped.
     :param distance_file: Optional pre-computed distance TSV (gene_id \\t distance,
         no header). Passed to ``run_bootstrap_nomatchomega`` to bypass internal
         distance computation and match Perl's control pool exactly.
-    :returns: List of FDR DataFrames, one per entry in ``sweep_files``.
+    :param seed: Seeds the bootstrap and the genome shuffles. If None, one is drawn
+        and printed so the run can be repeated.
+    :param reuse_bootstrap: Output folder of a previous run; its ``case_set.txt`` and
+        ``control_set.txt`` are loaded instead of running the bootstrap (same gene set
+        and universe required).
+    :param output_folder: If given, write ``case_set.txt``, ``control_set.txt``,
+        ``used_genes.txt`` (genome-shuffle universe), ``enrichment_curves.txt`` and
+        ``fdr.txt`` there.
+    :returns: ``(df_case, df_control, df_curves, df_fdr)``: case genes, control sets,
+        enrichment curves (every population, group and ``All``) and one FDR row per
+        sweep file.
     """
     import gzip as _gz
 
+    _check_enrichment_inputs(sweep_files, populations, groups, thresholds)
+    if n_shuffles % 8 != 0:
+        raise ValueError("n_shuffles must be a multiple of 8")
+    if n_control_sets < 10 or n_control_sets % 10 != 0:
+        raise ValueError("n_control_sets must be a positive multiple of 10")
+    if seed is None:
+        seed = int(np.random.default_rng().integers(0, 2**31 - 1))
+    print(f"Seed: {seed}", flush=True)
     _t_start = time.time()
 
-    # --- Load gene set and derive valid universe from factors ∩ sweep_files[0] ---
-    _df_geneset = pl.read_csv(
-        gene_set,
-        has_header=False,
-        separator="\t",
-        new_columns=["gene_id", "label"],
-    )
+    # --- Derive valid universe from factors ∩ sweep_files[0] ---
     _exclude = set(hla_genes + hist_genes)
 
     with open(factors_file, "rt") as _fh:
@@ -1538,20 +1233,16 @@ def run_enrichment(
     )
     _valid_genes_list = sorted(_factors_ids & _sweep_ids)
 
-    _case_genes = (
-        _df_geneset.filter(
-            (pl.col("label") == "yes")
-            & ~pl.col("gene_id").is_in(_exclude)
-            & pl.col("gene_id").is_in(_valid_genes_list)
-        )
-        .drop_nulls()["gene_id"]
-        .to_list()
+    _case_genes, _control_genes, _n_dropped = load_case_control(
+        gene_set, _valid_genes_list, _exclude
     )
-    _control_genes = _df_geneset.filter(
-        (pl.col("label") == "no")
-        & ~pl.col("gene_id").is_in(_exclude)
-        & pl.col("gene_id").is_in(_valid_genes_list)
-    )["gene_id"].to_list()
+    with open(gene_set) as _fh:  # distances are measured from every listed case gene
+        _listed_genes = sorted({_l.split()[0] for _l in _fh if _l.strip()})
+    print(
+        f"Gene set: {len(_case_genes)} case genes, {len(_control_genes)} control "
+        f"candidates ({_n_dropped} listed ids outside the universe or excluded)",
+        flush=True,
+    )
     # --- Step 6: Bootstrap ---
     if bootstrap_dir is not None:
         _vip_file = os.path.join(bootstrap_dir, "VIPs", "file_1")
@@ -1573,13 +1264,27 @@ def run_enrichment(
                 for j in range(_n_ctrl_genes)
             }
         )
-        print("TIMING_BOOTSTRAP: 0.000", flush=True)
+        _used_path = os.path.join(bootstrap_dir, "used_genes.txt")
+        if os.path.isfile(_used_path):
+            with open(_used_path) as _fh:
+                _used_genes = sorted({l.split()[0] for l in _fh if l.strip()})
+        else:
+            _used_genes = sorted(
+                set(_vip_list_raw) | {g for r in _ctrl_sets_raw for g in r}
+            )
+        print(f"Bootstrap: loaded from {bootstrap_dir}", flush=True)
+    elif reuse_bootstrap is not None:
+        df_case, df_control, _used_genes = _load_bootstrap(
+            reuse_bootstrap, _case_genes, set(_valid_genes_list)
+        )
+
     else:
-        df_case, df_control = run_bootstrap_nomatchomega(
+        df_case, df_control, _used_genes = run_bootstrap_nomatchomega(
             case_genes=_case_genes,
             factors_file=factors_file,
             annotation_file=annotation_file,
-            runs_number=n_runs,
+            runs_number=n_control_sets // 10,
+            n_batches=1,  # chains of 10-set batches are laid out over nthreads
             tolerance=tolerance,
             min_dist=min_distance,
             flip=flip,
@@ -1587,89 +1292,352 @@ def run_enrichment(
             nthreads=nthreads,
             control_genes=_control_genes,
             distance_file=distance_file,
+            distance_genes=_listed_genes,
+            seed=seed,
+            return_used=True,
         )
-        print(f"TIMING_BOOTSTRAP: {time.time() - _t_start:.3f}", flush=True)
+
 
     _t_post_bootstrap = time.time()
 
-    # --- Step 7: Sweep counting ---
-    df_n = build_gene_neighbors_numpy(
-        annotation_file, _valid_genes_list, cluster_distance
-    )
-
+    # --- Steps 7-9: curves, genome shuffles and FDR (vectorized) ---
     _vip_list = df_case["gene_id"].to_list()
-    _ctrl_sets = df_control.drop("sample_id").to_numpy().tolist()
+    _ctrl_sets = df_control.drop("sample_id").to_numpy()
+    # Perl shuffles the valid genes listed in used_genes.txt (case + accepted controls).
+    _shuffle_genes = sorted(set(_used_genes) & set(_valid_genes_list))
 
     fdr_results = []
     curve_results = []
     for _rank_file in sweep_files:
-        _size = os.path.basename(_rank_file).rsplit("_", 1)[-1]
-
-        _simplified_by_pop = {
-            pop: simplify_sweeps_gz(_rank_file, thresholds, col_index=i + 1)
-            for i, pop in enumerate(populations)
-        }
-
-        results = count_sweeps_multipop(
-            vip_genes=_vip_list,
-            control_sets=_ctrl_sets,
-            simplified_sweeps_by_pop=_simplified_by_pop,
-            neighbors=df_n,
-            thresholds=thresholds,
-            populations=populations,
-            groups=groups,
-            # FDR requires all-population scopes; matches Perl "All:"
-            pop_interest="All",
-            use_clust=False,
-            count_sweeps=False,
-            nthreads=nthreads,
+        _label = os.path.basename(_rank_file).rsplit("_", 1)[-1]
+        _rank_table = _read_rank_table(_rank_file)
+        _neighbors = None
+        if count_sweeps:
+            _neighbors = _gene_neighbors(
+                annotation_file, _rank_table[:, 0].to_list(), _valid_genes_list,
+                cluster_distance,
+            )
+            print(
+                f"Count_sweeps yes: neighbours within {cluster_distance:,} bp "
+                f"(mean {len(_neighbors[1]) / max(1, len(_valid_genes_list)):.1f} per gene)",
+                flush=True,
+            )
+        results = count_sweeps_fast(
+            _rank_table, _vip_list, _ctrl_sets, thresholds, populations, groups,
+            pop_interest=pop_interest, neighbors=_neighbors,
         )
-
-        # --- Step 8: Genome shuffling (in-memory) ---
-        shuffled_data = shuffle_genome(
-            coord_file=annotation_file,
-            valid_genes=_valid_genes_list,
-            sweep_files=[_rank_file],
+        fdr = estimate_fdr_fast(
+            _rank_table,
+            annotation_file,
+            _shuffle_genes,
+            _vip_list,
+            _ctrl_sets,
+            thresholds,
+            populations,
+            groups,
             n_shuffles=n_shuffles,
-            shuffling_segments_number=shuffling_segs,
-            output_dir=None,
-        )
-
-        # --- Step 9: FDR estimation ---
-        fdr = estimate_fdr(
-            real_results=results,
-            shuffled_sweep_files_by_shuffle=shuffled_data,
-            vip_genes=_vip_list,
-            control_sets=_ctrl_sets,
-            neighbors=df_n,
-            thresholds=thresholds,
-            populations=populations,
-            groups=groups,
-            pop_interest="All",  # matches Perl estimate_FPR.pl hardcoded "All:"
-            use_clust=False,
-            count_sweeps=False,
+            shuffling_segs=shuffling_segs,
+            seed=seed,
             nthreads=nthreads,
-            p_cutoff=1.0,
+            pop_interest=pop_interest,
+            p_cutoff=1.0,  # matches Perl estimate_FPR.pl call in the pipeline
             max_threshold=max(thresholds),
             min_threshold=0,
             min_vip_count=1,
+            neighbors=_neighbors,
+            shuffle_blocks=shuffle_blocks,
         )
-
         row = fdr.row(0, named=True)
         print(
-            f"FDR {_size}: {row['p_value']:.4f} {row['n_replicates']} "
-            f"{row['real_stat']:.2f} {row['max_null_stat']:.2f}",
+            f"FDR {_label}: p={row['p_value']:.4f} (perm {row['p_value_perm']:.4f}), "
+            f"{row['n_replicates']} shuffles of {len(_shuffle_genes)} genes, "
+            f"real={row['real_stat']:.2f} max_null={row['max_null_stat']:.2f}",
             flush=True,
         )
+        curve_results.append(results.with_columns(pl.lit(_rank_file).alias("dataset")))
+        fdr_results.append(fdr.with_columns(pl.lit(_rank_file).alias("dataset")))
 
-        results = results.with_columns(pl.lit(_rank_file).alias("dataset"))
-        fdr = fdr.with_columns(pl.lit(_rank_file).alias("dataset"))
-        curve_results.append(results)
-        fdr_results.append(fdr)
+    df_curves, df_fdr = pl.concat(curve_results), pl.concat(fdr_results)
+    if output_folder is not None:
+        os.makedirs(output_folder, exist_ok=True)
+        df_case.write_csv(os.path.join(output_folder, "case_set.txt"))
+        df_control.write_csv(os.path.join(output_folder, "control_set.txt"))
+        with open(os.path.join(output_folder, "used_genes.txt"), "w") as _fh:
+            _fh.write("\n".join(_used_genes) + "\n")
+        df_curves.write_csv(os.path.join(output_folder, "enrichment_curves.txt"))
+        df_fdr.write_csv(os.path.join(output_folder, "fdr.txt"))
 
-    print(f"TIMING_POSTBOOTSTRAP: {time.time() - _t_post_bootstrap:.3f}", flush=True)
-    print(f"TIMING_TOTAL: {time.time() - _t_start:.3f}", flush=True)
-    return df_case, df_control, pl.concat(curve_results), pl.concat(fdr_results)
+    print(
+        f"Time: bootstrap {_t_post_bootstrap - _t_start:.1f} s, curves + FDR "
+        f"{time.time() - _t_post_bootstrap:.1f} s, total {time.time() - _t_start:.1f} s",
+        flush=True,
+    )
+    return df_case, df_control, df_curves, df_fdr
+
+
+
+def _ratio_ci(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Add the 95% interval of the enrichment ratio as ``CI_low_ratio``/``CI_up_ratio``.
+
+    The case count is held fixed and divided by the 2.5/97.5% percentiles of the
+    control-set counts, with the same +0.1 smoothing as ``ratio``:
+    ``(vip + 0.1) / (ctrl_ci_hi + 0.1)`` to ``(vip + 0.1) / (ctrl_ci_lo + 0.1)``
+    (the high control percentile gives the low ratio bound). The interval reflects
+    variation across matched control sets, not resampling of the case genes.
+    """
+    num = pl.col("vip_count") + 0.1
+    return df.with_columns(
+        (num / (pl.col("ctrl_ci_hi") + 0.1)).alias("CI_low_ratio"),
+        (num / (pl.col("ctrl_ci_lo") + 0.1)).alias("CI_up_ratio"),
+    )
+
+
+def _curve_svg_path(output_folder: str, dataset: str) -> str:
+    """Enrichment-curve SVG path for one sweep file (``dataset`` is its full path)."""
+    os.makedirs(output_folder, exist_ok=True)
+    stem = os.path.basename(dataset)
+    for ext in (".gz", ".txt", ".tsv"):
+        if stem.endswith(ext):
+            stem = stem[: -len(ext)]
+    return os.path.join(output_folder, f"enrichment_curves_{stem}.svg")
+
+
+def plot_enrichment(
+    curves: "str | pl.DataFrame",
+    scopes: list[str] | None = None,
+    facet: bool = False,
+    ci: bool = False,
+    title: str = "",
+    output_folder: str | None = None,
+    show: bool = False,
+) -> dict:
+    """
+    Plot enrichment curves (case/control ratio against rank threshold).
+
+    :param curves: ``enrichment_curves.txt`` written by ``flexsweep enrichment``, or the
+        curves DataFrame returned by :func:`run_enrichment`.
+    :param scopes: Scopes to draw (population codes, group labels or ``All``).
+        Default: every scope in the table.
+    :param facet: One panel per scope instead of one panel with all lines.
+    :param ci: Shade the 95% interval of the ratio across matched control sets
+        (see :func:`_ratio_ci`).
+    :param title: Figure title.
+    :param output_folder: If given, save one SVG per sweep file as
+        ``enrichment_curves_<sweep file name>.svg``.
+    :param show: Call ``matplotlib.pyplot.show()`` after plotting.
+    :returns: ``{dataset: matplotlib Figure}``, one figure per sweep file.
+    :raises ValueError: If a requested scope is not in the table.
+    """
+    import matplotlib.pyplot as plt
+
+    df_curves = curves if isinstance(curves, pl.DataFrame) else pl.read_csv(curves)
+    if scopes is not None:
+        available = set(df_curves["scope"].cast(pl.Utf8).unique().to_list())
+        unknown = [sc for sc in scopes if sc not in available]
+        if unknown:
+            raise ValueError(
+                f"scopes {unknown} not in the curves table; available: {sorted(available)}"
+            )
+
+    figs = {}
+    for dataset in sorted(df_curves["dataset"].unique().to_list()):
+        figs[dataset] = _plot_curves(
+            df_curves.filter(pl.col("dataset") == dataset),
+            plot_title=title,
+            ci=ci,
+            population=scopes,
+            facet=facet,
+        )
+        if output_folder is not None:
+            figs[dataset].savefig(_curve_svg_path(output_folder, dataset))
+    if show:
+        plt.show()
+    return figs
+
+
+_NPG_COLORS = [
+    "#E64B35",
+    "#4DBBD5",
+    "#00A087",
+    "#3C5488",
+    "#F39B7F",
+    "#8491B4",
+    "#91D1C2",
+    "#DC0000",
+    "#7E6148",
+    "#B09C85",
+]
+
+def _plot_curves(
+    df_curves,
+    plot_title: str = "",
+    ci: bool = False,
+    population: list[str] | None = None,
+    target_groups: list[str] | None = None,
+    facet: bool = False,
+):
+    import matplotlib.pyplot as plt
+
+    df = df_curves.with_columns(
+        [
+            pl.col("ratio").cast(pl.Float64, strict=False),
+            pl.col("threshold").cast(pl.Float64, strict=False),
+            pl.col("ctrl_ci_lo").cast(pl.Float64, strict=False),
+            pl.col("ctrl_ci_hi").cast(pl.Float64, strict=False),
+            pl.col("vip_count").cast(pl.Float64, strict=False),
+        ]
+    )
+
+    filters = [
+        pl.col("threshold").is_not_null(),
+        pl.col("ratio") >= 0,
+    ]
+
+    if population is not None:
+        filters.append(pl.col("scope").is_in(population))
+
+    if target_groups is not None:
+        filters.append(pl.col("scope").is_in(target_groups))
+
+    df = df.filter(pl.all_horizontal(filters))
+
+    df = _ratio_ci(df)
+
+    df = df.sort("threshold")
+
+    threshold_levels = sorted(df["threshold"].unique().to_list())
+    threshold_labels = [
+        str(int(t)) if t == int(t) else str(t) for t in threshold_levels
+    ]
+    label_to_x = {lbl: i for i, lbl in enumerate(threshold_labels)}
+
+    df = df.with_columns(
+        pl.col("threshold")
+        .map_elements(
+            lambda v: label_to_x[str(int(v)) if v == int(v) else str(v)],
+            return_dtype=pl.Int32,
+        )
+        .alias("x_pos")
+    )
+
+    scopes = df["scope"].unique().sort().to_list()
+    color_map = {
+        scope: _NPG_COLORS[i % len(_NPG_COLORS)] for i, scope in enumerate(scopes)
+    }
+
+    if facet:
+        pops = scopes
+        ncols = min(3, len(pops))
+        nrows = int(np.ceil(len(pops) / ncols))
+
+        fig, axes = plt.subplots(
+            nrows, ncols, figsize=(6 * ncols, 4 * nrows), squeeze=False
+        )
+        ax_flat = axes.flatten()
+
+        for idx, pop in enumerate(pops):
+            ax = ax_flat[idx]
+            pop_df = df.filter(pl.col("scope") == pop)
+
+            _draw_lines(ax, pop_df, scopes, color_map, ci)
+            _style_ax(ax, threshold_labels, subtitle=pop)
+
+        for idx in range(len(pops), len(ax_flat)):
+            ax_flat[idx].set_visible(False)
+
+        handles = [
+            plt.Line2D(
+                [0], [0], color=color_map[s], linewidth=2, marker="o", label=s
+            )
+            for s in scopes
+        ]
+        # one row below the panels, so it never covers a curve
+        fig.legend(
+            handles=handles,
+            title="Population",
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.0),
+            ncol=len(handles),
+            frameon=False,
+        )
+
+    else:
+        fig, ax = plt.subplots(figsize=(9, 5))
+
+        _draw_lines(ax, df, scopes, color_map, ci)
+        _style_ax(ax, threshold_labels)
+
+        handles = [
+            plt.Line2D(
+                [0], [0], color=color_map[s], linewidth=2, marker="o", label=s
+            )
+            for s in scopes
+        ]
+        ax.legend(handles=handles, title="Population", frameon=False)
+
+    fig.suptitle(plot_title, fontsize=14, fontweight="bold", y=1.01)
+    fig.text(
+        0.5,
+        0.98,
+        "Rank Threshold vs. Enrichment Ratio",
+        ha="center",
+        fontsize=10,
+        color="grey",
+        transform=fig.transFigure,
+    )
+
+    # facet: keep ~0.8 in at the bottom for the legend row
+    fig.tight_layout(rect=(0, 0.8 / fig.get_figheight() if facet else 0, 1, 1))
+    return fig
+
+def _draw_lines(ax, df, scopes, color_map, ci):
+    """Plot one line per scope onto *ax*."""
+    ax.set_yscale("log")
+    ax.axhline(y=1, linestyle="--", color="grey", linewidth=0.8, zorder=0)
+
+    for scope in scopes:
+        sub = df.filter(pl.col("scope") == scope).sort("x_pos")
+        if sub.is_empty():
+            continue
+        x = sub["x_pos"].to_list()
+        y = sub["ratio"].to_list()
+        color = color_map[scope]
+
+        ax.plot(
+            x, y, color=color, linewidth=1.5, marker="o", markersize=4, label=scope
+        )
+
+        if ci:
+            y_lo = sub["CI_low_ratio"].to_list()
+            y_hi = sub["CI_up_ratio"].to_list()
+            ax.fill_between(x, y_lo, y_hi, color=color, alpha=0.15, linewidth=0)
+
+def _style_ax(ax, threshold_labels, subtitle=None):
+    """Apply common axis styling."""
+    import matplotlib.ticker as ticker
+
+    ax.set_xticks(range(len(threshold_labels)))
+    ax.set_xticklabels(threshold_labels, rotation=45, ha="right", fontsize=8)
+    ax.set_xlabel("Rank Threshold")
+    ax.set_ylabel("Enrichment Ratio (Obs/Exp)")
+
+    ax.yaxis.set_major_locator(
+        ticker.LogLocator(base=10.0, subs=(1.0, 2.0, 3.0, 5.0), numticks=20)
+    )
+    # ScalarFormatter: shows "10" instead of "10^1"
+    ax.yaxis.set_major_formatter(ticker.ScalarFormatter())
+
+    # # Optional: Minor ticks for visual density without labels
+    ax.yaxis.set_minor_locator(
+        ticker.LogLocator(base=10.0, subs="auto", numticks=20)
+    )
+    ax.yaxis.set_minor_formatter(ticker.NullFormatter())
+    ax.grid(True, which="both", linestyle=":", linewidth=0.5, alpha=0.6)
+
+    ax.spines[["top", "right"]].set_visible(False)
+    if subtitle:
+        ax.set_title(subtitle, fontsize=10)
 
 
 thresholds = [
