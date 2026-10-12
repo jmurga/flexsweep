@@ -1,6 +1,8 @@
 import glob
+import gzip
 import os
 import re
+import warnings
 from collections import OrderedDict
 from itertools import chain
 
@@ -43,48 +45,170 @@ def _chrom_id(s):
     return chrom
 
 
+_CONTIG_LINE = re.compile(r"^##contig=<(.*)>\s*$")
+_CONTIG_FIELD = re.compile(r'([A-Za-z_][A-Za-z0-9_.]*)=("(?:[^"\\]|\\.)*"|[^,]*)')
+
+# chr1 length -> build, used to infer the reference assembly from ##contig lines
+_CHR1_LENGTH_TO_BUILD = {248956422: "GRCh38", 249250621: "GRCh37"}
+
+
+def parse_contig_headers(headers: list[str]) -> dict[str, dict[str, str]]:
+    """Parse ``##contig=<...>`` header lines into ``{ID: {key: value}}``.
+
+    Keys may appear in any order (e.g. 1000 Genomes phase 3 writes
+    ``##contig=<ID=1,assembly=b37,length=249250621>``). Quoted values are unquoted.
+    """
+    contigs = {}
+    for line in headers:
+        m = _CONTIG_LINE.match(line.rstrip("\n"))
+        if not m:
+            continue
+        fields = {k: v.strip('"') for k, v in _CONTIG_FIELD.findall(m.group(1))}
+        if "ID" in fields:
+            contigs[fields["ID"]] = fields
+    return contigs
+
+
+def infer_genome_build(contigs: dict[str, dict[str, str]]) -> str | None:
+    """Infer the human reference build from parsed contig headers, or None."""
+    for cid, fields in contigs.items():
+        if _chrom_id(cid) == "1" and "length" in fields:
+            build = _CHR1_LENGTH_TO_BUILD.get(int(fields["length"]))
+            if build is not None:
+                return build
+    for fields in contigs.values():
+        assembly = fields.get("assembly", "").lower()
+        if assembly in ("b37", "grch37", "hg19"):
+            return "GRCh37"
+        if assembly in ("b38", "grch38", "hg38"):
+            return "GRCh38"
+    return None
+
+
+def check_vcf_file(path: str) -> None:
+    """Fail early with a clear message if a VCF/BCF is not bgzip-compressed and indexed."""
+    if path.endswith(".gz"):
+        with open(path, "rb") as fh:
+            block = fh.read(18)
+        # BGZF = gzip member with FEXTRA flag and a 'BC' extra subfield
+        if block[:4] != b"\x1f\x8b\x08\x04" or block[12:14] != b"BC":
+            raise ValueError(
+                f"{path} is not bgzip-compressed (plain gzip cannot be indexed). "
+                f"Recompress with: zcat {path} | bgzip > fixed.vcf.gz && tabix -p vcf fixed.vcf.gz"
+            )
+    if not (os.path.exists(path + ".tbi") or os.path.exists(path + ".csi")):
+        raise FileNotFoundError(
+            f"No index found for {path} (.tbi or .csi). Index it with: tabix -p vcf {path}"
+        )
+
+
+def _first_record_chrom(path: str) -> str | None:
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt") as fh:
+        for line in fh:
+            if not line.startswith("#"):
+                return line.split("\t", 1)[0]
+    return None
+
+
+def _last_position(path: str, contig: str) -> int:
+    """Largest POS of ``contig`` in a VCF/BCF (used when ``##contig`` has no length)."""
+    region = contig if (os.path.exists(path + ".tbi") or os.path.exists(path + ".csi")) else None
+    callset = read_vcf(path, fields=["variants/CHROM", "variants/POS"], region=region)
+    if callset is None:
+        raise ValueError(f"{path}: no records for contig '{contig}'")
+    pos = callset["variants/POS"][callset["variants/CHROM"] == contig]
+    if pos.size == 0:
+        raise ValueError(f"{path}: no records for contig '{contig}'")
+    return int(pos.max())
+
+
 def get_contig_from_vcf_filename(path):
+    """Return ``(contig_name, contig_length)`` for a single-chromosome VCF/BCF.
+
+    The contig is resolved in this order:
+
+    1. The CHROM of the first record, if a ``##contig`` line has exactly that ID
+       (works for any naming: ``22``, ``chr22``, ``NC_000022.11``, ``scaffold_12``).
+    2. The chromosome ID in the filename (e.g. ``yri_chr22.vcf.gz``), matched to the
+       ``##contig`` IDs after normalizing ``chr``/``contig``/``super`` prefixes.
+    3. The single ``##contig`` line of the header.
+    4. The CHROM of the first record, with no ``##contig`` line.
+
+    The length comes from ``length=`` in the matching ``##contig`` line (keys may be
+    in any order). If it is missing, the largest POS of that contig is used and a
+    warning is emitted: windows then end at the last variant instead of the
+    chromosome end.
+
+    Raises
+    ------
+    ValueError
+        If the contig cannot be resolved or has no records.
     """
-    Returns:
-        (contig_name, contig_length)
-    """
+    contigs = parse_contig_headers(read_vcf_headers(path).headers)
+    first = _first_record_chrom(path)
+    file_chr = _chrom_id(os.path.basename(path))
 
-    # Read headers
-    headers = read_vcf_headers(path)
+    if first is not None and first in contigs:
+        contig = first
+    else:
+        matches = [
+            cid for cid in contigs if file_chr is not None and _chrom_id(cid) == file_chr
+        ]
+        if len(matches) > 1:
+            raise ValueError(
+                f"{path}: ambiguous ##contig match for chromosome {file_chr}: {matches}"
+            )
+        if matches:
+            contig = matches[0]
+        elif len(contigs) == 1:
+            contig = next(iter(contigs))
+        elif first is not None:
+            contig = first
+        else:
+            found = ", ".join(list(contigs)[:30]) or "none"
+            raise ValueError(
+                f"{path}: cannot resolve the chromosome: the file has no records, the "
+                f"filename has no chromosome ID, and the header has {len(contigs)} "
+                f"##contig lines ({found})."
+            )
 
-    # Parse contigs
-    contig_pattern = re.compile(r"##contig=<ID=([^,]+),length=(\d+)>")
+    length = contigs.get(contig, {}).get("length")
+    if length is not None:
+        return contig, int(length)
 
-    contigs = {
-        m.group(1): int(m.group(2))
-        for line in headers.headers
-        if (m := contig_pattern.match(line))
-    }
+    length = _last_position(path, contig)
+    warnings.warn(
+        f"{path}: ##contig '{contig}' has no length= in the header; using the last "
+        f"variant position ({length}) as the contig end. Add the length with "
+        f"bcftools reheader --fai to scan up to the chromosome end.",
+        UserWarning,
+        stacklevel=2,
+    )
+    return contig, length
 
-    # Extract chrom from filename
-    fname = os.path.basename(path)
-    file_chr = _chrom_id(fname)
 
-    if file_chr is None:
-        return None, None
+def check_genome_build(vcf_files: list[str], recombination_map: str | None) -> None:
+    """Warn if the bundled deCODE map (GRCh38) is used with non-GRCh38 VCFs."""
+    if recombination_map is None:
+        return
+    from .simulate_discoal import DECODE_MAP
 
-    # Match against header contigs
-    matches = []
-
-    for contig_name, length in contigs.items():
-        contig_chr = _chrom_id(contig_name)
-
-        if contig_chr == file_chr:
-            matches.append((contig_name, length))
-
-    # Resolve
-    if len(matches) == 1:
-        return matches[0]
-
-    if len(matches) > 1:
-        raise ValueError(f"Ambiguous contig match: {matches}")
-
-    return None, None
+    try:
+        is_decode = os.path.samefile(recombination_map, DECODE_MAP)
+    except OSError:
+        return
+    if not is_decode:
+        return
+    for f in vcf_files:
+        build = infer_genome_build(parse_contig_headers(read_vcf_headers(f).headers))
+        if build is not None and build != "GRCh38":
+            warnings.warn(
+                f"{f} looks like {build}, but the bundled deCODE recombination map is "
+                f"GRCh38. Positions will not match: lift the VCF over to GRCh38 or pass "
+                f"a {build} map via --recombination_map.",
+                stacklevel=2,
+            )
 
 
 class Data:
@@ -251,10 +375,7 @@ class Data:
         ):
             raise IOError("VCF file must be vcf or bcf format")
 
-        if not os.path.exists(self.data + ".tbi"):
-            raise FileNotFoundError(
-                f"Please index the vcf/bcf file before continue using: tabix -p vcf {self.data}"
-            )
+        check_vcf_file(self.data)
         # check_contig_length = (
         # f"{'zcat' if '.gz' in self.data else 'cat'} {self.data} | tail -n 1"
         # )
