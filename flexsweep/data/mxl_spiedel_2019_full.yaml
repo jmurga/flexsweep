@@ -1,0 +1,35 @@
+time_units: generations
+demes:
+  - name: MXL
+    description: MXL relate
+    epochs:
+      - {end_time: 357143.0000, start_size: 59578.494}
+      - {end_time: 257031.0000, start_size: 25904.186}
+      - {end_time: 184981.0000, start_size: 20185.220}
+      - {end_time: 133128.0000, start_size: 24485.079}
+      - {end_time: 95810.6000, start_size: 22750.126}
+      - {end_time: 68953.5000, start_size: 17871.823}
+      - {end_time: 49624.8000, start_size: 16599.219}
+      - {end_time: 35714.3000, start_size: 16472.782}
+      - {end_time: 25703.1000, start_size: 16285.054}
+      - {end_time: 18498.1000, start_size: 19799.628}
+      - {end_time: 13312.8000, start_size: 25706.544}
+      - {end_time: 9581.0600, start_size: 29149.420}
+      - {end_time: 6895.3500, start_size: 27711.578}
+      - {end_time: 4962.4800, start_size: 22014.406}
+      - {end_time: 3571.4300, start_size: 14911.352}
+      - {end_time: 2570.3100, start_size: 9464.696}
+      - {end_time: 1849.8100, start_size: 5851.026}
+      - {end_time: 1331.2800, start_size: 3482.331}
+      - {end_time: 958.1060, start_size: 2224.803}
+      - {end_time: 689.5350, start_size: 2092.357}
+      - {end_time: 496.2480, start_size: 2684.391}
+      - {end_time: 357.1430, start_size: 2985.984}
+      - {end_time: 257.0310, start_size: 3746.132}
+      - {end_time: 184.9810, start_size: 7713.324}
+      - {end_time: 133.1280, start_size: 24803.925}
+      - {end_time: 95.8106, start_size: 99692.548}
+      - {end_time: 68.9535, start_size: 301784.755}
+      - {end_time: 49.6248, start_size: 670113.732}
+      - {end_time: 35.7143, start_size: 1200232.365}
+      - {end_time: 0.0000, start_size: 3638030.516}

@@ -1,0 +1,35 @@
+time_units: generations
+demes:
+  - name: JPT
+    description: JPT relate
+    epochs:
+      - {end_time: 357143.0000, start_size: 70007.911}
+      - {end_time: 257031.0000, start_size: 26914.858}
+      - {end_time: 184981.0000, start_size: 19651.771}
+      - {end_time: 133128.0000, start_size: 24938.527}
+      - {end_time: 95810.6000, start_size: 21708.927}
+      - {end_time: 68953.5000, start_size: 16481.035}
+      - {end_time: 49624.8000, start_size: 15627.491}
+      - {end_time: 35714.3000, start_size: 17336.671}
+      - {end_time: 25703.1000, start_size: 18803.779}
+      - {end_time: 18498.1000, start_size: 23111.875}
+      - {end_time: 13312.8000, start_size: 28364.288}
+      - {end_time: 9581.0600, start_size: 31086.988}
+      - {end_time: 6895.3500, start_size: 28922.632}
+      - {end_time: 4962.4800, start_size: 22569.288}
+      - {end_time: 3571.4300, start_size: 15532.292}
+      - {end_time: 2570.3100, start_size: 10371.809}
+      - {end_time: 1849.8100, start_size: 7051.480}
+      - {end_time: 1331.2800, start_size: 4427.443}
+      - {end_time: 958.1060, start_size: 2267.769}
+      - {end_time: 689.5350, start_size: 1091.479}
+      - {end_time: 496.2480, start_size: 1081.296}
+      - {end_time: 357.1430, start_size: 2296.580}
+      - {end_time: 257.0310, start_size: 4599.181}
+      - {end_time: 184.9810, start_size: 7878.669}
+      - {end_time: 133.1280, start_size: 17682.465}
+      - {end_time: 95.8106, start_size: 80821.535}
+      - {end_time: 68.9535, start_size: 322142.116}
+      - {end_time: 49.6248, start_size: 796335.582}
+      - {end_time: 35.7143, start_size: 1528103.349}
+      - {end_time: 0.0000, start_size: 4943544.719}

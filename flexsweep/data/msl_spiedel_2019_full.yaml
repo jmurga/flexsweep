@@ -1,0 +1,35 @@
+time_units: generations
+demes:
+  - name: MSL
+    description: MSL relate
+    epochs:
+      - {end_time: 357143.0000, start_size: 65648.933}
+      - {end_time: 257031.0000, start_size: 28936.190}
+      - {end_time: 184981.0000, start_size: 21872.744}
+      - {end_time: 133128.0000, start_size: 25807.517}
+      - {end_time: 95810.6000, start_size: 23279.310}
+      - {end_time: 68953.5000, start_size: 17672.403}
+      - {end_time: 49624.8000, start_size: 15178.100}
+      - {end_time: 35714.3000, start_size: 13853.639}
+      - {end_time: 25703.1000, start_size: 13443.101}
+      - {end_time: 18498.1000, start_size: 15319.519}
+      - {end_time: 13312.8000, start_size: 20120.158}
+      - {end_time: 9581.0600, start_size: 24452.867}
+      - {end_time: 6895.3500, start_size: 25664.453}
+      - {end_time: 4962.4800, start_size: 23179.591}
+      - {end_time: 3571.4300, start_size: 19028.554}
+      - {end_time: 2570.3100, start_size: 15986.086}
+      - {end_time: 1849.8100, start_size: 14512.693}
+      - {end_time: 1331.2800, start_size: 13720.771}
+      - {end_time: 958.1060, start_size: 12946.090}
+      - {end_time: 689.5350, start_size: 11772.185}
+      - {end_time: 496.2480, start_size: 10673.634}
+      - {end_time: 357.1430, start_size: 10340.470}
+      - {end_time: 257.0310, start_size: 11501.947}
+      - {end_time: 184.9810, start_size: 15992.682}
+      - {end_time: 133.1280, start_size: 37742.970}
+      - {end_time: 95.8106, start_size: 158531.365}
+      - {end_time: 68.9535, start_size: 482146.129}
+      - {end_time: 49.6248, start_size: 1059807.030}
+      - {end_time: 35.7143, start_size: 1998944.557}
+      - {end_time: 0.0000, start_size: 5542032.995}

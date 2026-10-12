@@ -1,0 +1,35 @@
+time_units: generations
+demes:
+  - name: GWD
+    description: GWD relate
+    epochs:
+      - {end_time: 357143.0000, start_size: 61470.522}
+      - {end_time: 257031.0000, start_size: 27196.675}
+      - {end_time: 184981.0000, start_size: 21518.519}
+      - {end_time: 133128.0000, start_size: 25700.730}
+      - {end_time: 95810.6000, start_size: 23116.363}
+      - {end_time: 68953.5000, start_size: 18063.127}
+      - {end_time: 49624.8000, start_size: 16033.915}
+      - {end_time: 35714.3000, start_size: 14560.449}
+      - {end_time: 25703.1000, start_size: 13593.679}
+      - {end_time: 18498.1000, start_size: 15325.248}
+      - {end_time: 13312.8000, start_size: 19538.043}
+      - {end_time: 9581.0600, start_size: 24225.980}
+      - {end_time: 6895.3500, start_size: 25695.315}
+      - {end_time: 4962.4800, start_size: 23013.053}
+      - {end_time: 3571.4300, start_size: 18394.255}
+      - {end_time: 2570.3100, start_size: 14663.058}
+      - {end_time: 1849.8100, start_size: 12731.361}
+      - {end_time: 1331.2800, start_size: 11945.233}
+      - {end_time: 958.1060, start_size: 11060.430}
+      - {end_time: 689.5350, start_size: 9623.546}
+      - {end_time: 496.2480, start_size: 8186.079}
+      - {end_time: 357.1430, start_size: 7648.944}
+      - {end_time: 257.0310, start_size: 9211.835}
+      - {end_time: 184.9810, start_size: 15799.486}
+      - {end_time: 133.1280, start_size: 48670.800}
+      - {end_time: 95.8106, start_size: 206831.222}
+      - {end_time: 68.9535, start_size: 554144.335}
+      - {end_time: 49.6248, start_size: 986022.150}
+      - {end_time: 35.7143, start_size: 1440668.931}
+      - {end_time: 0.0000, start_size: 3607321.420}

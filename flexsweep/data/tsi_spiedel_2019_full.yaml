@@ -1,0 +1,35 @@
+time_units: generations
+demes:
+  - name: TSI
+    description: TSI relate
+    epochs:
+      - {end_time: 357143.0000, start_size: 60475.799}
+      - {end_time: 257031.0000, start_size: 23824.726}
+      - {end_time: 184981.0000, start_size: 20725.732}
+      - {end_time: 133128.0000, start_size: 24267.015}
+      - {end_time: 95810.6000, start_size: 22333.892}
+      - {end_time: 68953.5000, start_size: 16881.740}
+      - {end_time: 49624.8000, start_size: 15030.497}
+      - {end_time: 35714.3000, start_size: 15254.553}
+      - {end_time: 25703.1000, start_size: 16501.323}
+      - {end_time: 18498.1000, start_size: 21075.704}
+      - {end_time: 13312.8000, start_size: 26882.443}
+      - {end_time: 9581.0600, start_size: 29609.802}
+      - {end_time: 6895.3500, start_size: 27552.308}
+      - {end_time: 4962.4800, start_size: 21406.217}
+      - {end_time: 3571.4300, start_size: 14648.967}
+      - {end_time: 2570.3100, start_size: 9544.790}
+      - {end_time: 1849.8100, start_size: 6050.105}
+      - {end_time: 1331.2800, start_size: 3505.451}
+      - {end_time: 958.1060, start_size: 1909.760}
+      - {end_time: 689.5350, start_size: 1626.725}
+      - {end_time: 496.2480, start_size: 2765.028}
+      - {end_time: 357.1430, start_size: 4990.817}
+      - {end_time: 257.0310, start_size: 8587.908}
+      - {end_time: 184.9810, start_size: 17167.441}
+      - {end_time: 133.1280, start_size: 60397.561}
+      - {end_time: 95.8106, start_size: 291312.479}
+      - {end_time: 68.9535, start_size: 834214.820}
+      - {end_time: 49.6248, start_size: 1632797.014}
+      - {end_time: 35.7143, start_size: 2749337.410}
+      - {end_time: 0.0000, start_size: 7721041.847}

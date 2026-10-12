@@ -1,0 +1,35 @@
+time_units: generations
+demes:
+  - name: GBR
+    description: GBR relate
+    epochs:
+      - {end_time: 357143.0000, start_size: 63307.968}
+      - {end_time: 257031.0000, start_size: 24351.045}
+      - {end_time: 184981.0000, start_size: 19561.968}
+      - {end_time: 133128.0000, start_size: 23994.856}
+      - {end_time: 95810.6000, start_size: 22678.925}
+      - {end_time: 68953.5000, start_size: 17193.829}
+      - {end_time: 49624.8000, start_size: 15755.574}
+      - {end_time: 35714.3000, start_size: 16350.984}
+      - {end_time: 25703.1000, start_size: 17676.089}
+      - {end_time: 18498.1000, start_size: 22207.121}
+      - {end_time: 13312.8000, start_size: 27722.026}
+      - {end_time: 9581.0600, start_size: 29710.619}
+      - {end_time: 6895.3500, start_size: 26912.250}
+      - {end_time: 4962.4800, start_size: 20364.027}
+      - {end_time: 3571.4300, start_size: 13433.602}
+      - {end_time: 2570.3100, start_size: 8592.246}
+      - {end_time: 1849.8100, start_size: 5325.165}
+      - {end_time: 1331.2800, start_size: 3070.480}
+      - {end_time: 958.1060, start_size: 1943.499}
+      - {end_time: 689.5350, start_size: 2151.898}
+      - {end_time: 496.2480, start_size: 3591.077}
+      - {end_time: 357.1430, start_size: 5395.303}
+      - {end_time: 257.0310, start_size: 7052.007}
+      - {end_time: 184.9810, start_size: 9416.019}
+      - {end_time: 133.1280, start_size: 17055.358}
+      - {end_time: 95.8106, start_size: 71667.018}
+      - {end_time: 68.9535, start_size: 308043.003}
+      - {end_time: 49.6248, start_size: 754542.724}
+      - {end_time: 35.7143, start_size: 1381467.339}
+      - {end_time: 0.0000, start_size: 3718273.829}

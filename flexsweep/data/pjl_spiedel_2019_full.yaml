@@ -1,0 +1,35 @@
+time_units: generations
+demes:
+  - name: PJL
+    description: PJL relate
+    epochs:
+      - {end_time: 357143.0000, start_size: 62287.134}
+      - {end_time: 257031.0000, start_size: 27224.515}
+      - {end_time: 184981.0000, start_size: 20755.500}
+      - {end_time: 133128.0000, start_size: 24889.615}
+      - {end_time: 95810.6000, start_size: 22015.472}
+      - {end_time: 68953.5000, start_size: 16527.942}
+      - {end_time: 49624.8000, start_size: 15020.789}
+      - {end_time: 35714.3000, start_size: 15647.591}
+      - {end_time: 25703.1000, start_size: 16963.183}
+      - {end_time: 18498.1000, start_size: 21417.496}
+      - {end_time: 13312.8000, start_size: 27253.303}
+      - {end_time: 9581.0600, start_size: 29925.247}
+      - {end_time: 6895.3500, start_size: 27778.704}
+      - {end_time: 4962.4800, start_size: 21781.462}
+      - {end_time: 3571.4300, start_size: 14944.868}
+      - {end_time: 2570.3100, start_size: 9808.056}
+      - {end_time: 1849.8100, start_size: 6295.762}
+      - {end_time: 1331.2800, start_size: 3867.873}
+      - {end_time: 958.1060, start_size: 2150.602}
+      - {end_time: 689.5350, start_size: 1712.675}
+      - {end_time: 496.2480, start_size: 3282.994}
+      - {end_time: 357.1430, start_size: 7540.079}
+      - {end_time: 257.0310, start_size: 13518.738}
+      - {end_time: 184.9810, start_size: 23184.750}
+      - {end_time: 133.1280, start_size: 54983.483}
+      - {end_time: 95.8106, start_size: 151551.891}
+      - {end_time: 68.9535, start_size: 302231.679}
+      - {end_time: 49.6248, start_size: 439301.686}
+      - {end_time: 35.7143, start_size: 525864.653}
+      - {end_time: 0.0000, start_size: 993368.273}

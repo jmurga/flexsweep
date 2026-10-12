@@ -1,0 +1,35 @@
+time_units: generations
+demes:
+  - name: PUR
+    description: PUR relate
+    epochs:
+      - {end_time: 357143.0000, start_size: 55387.363}
+      - {end_time: 257031.0000, start_size: 27663.742}
+      - {end_time: 184981.0000, start_size: 20683.293}
+      - {end_time: 133128.0000, start_size: 24836.452}
+      - {end_time: 95810.6000, start_size: 22869.166}
+      - {end_time: 68953.5000, start_size: 17991.048}
+      - {end_time: 49624.8000, start_size: 16558.978}
+      - {end_time: 35714.3000, start_size: 15803.830}
+      - {end_time: 25703.1000, start_size: 14721.947}
+      - {end_time: 18498.1000, start_size: 17014.268}
+      - {end_time: 13312.8000, start_size: 21826.627}
+      - {end_time: 9581.0600, start_size: 25940.876}
+      - {end_time: 6895.3500, start_size: 25839.126}
+      - {end_time: 4962.4800, start_size: 21716.847}
+      - {end_time: 3571.4300, start_size: 15526.648}
+      - {end_time: 2570.3100, start_size: 9977.570}
+      - {end_time: 1849.8100, start_size: 6029.305}
+      - {end_time: 1331.2800, start_size: 3474.659}
+      - {end_time: 958.1060, start_size: 2265.129}
+      - {end_time: 689.5350, start_size: 2698.968}
+      - {end_time: 496.2480, start_size: 5019.390}
+      - {end_time: 357.1430, start_size: 8270.409}
+      - {end_time: 257.0310, start_size: 11443.376}
+      - {end_time: 184.9810, start_size: 13659.373}
+      - {end_time: 133.1280, start_size: 14627.582}
+      - {end_time: 95.8106, start_size: 17922.946}
+      - {end_time: 68.9535, start_size: 46405.866}
+      - {end_time: 49.6248, start_size: 180869.767}
+      - {end_time: 35.7143, start_size: 414741.575}
+      - {end_time: 0.0000, start_size: 1201642.886}

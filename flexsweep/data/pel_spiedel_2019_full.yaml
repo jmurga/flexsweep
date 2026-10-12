@@ -1,0 +1,35 @@
+time_units: generations
+demes:
+  - name: PEL
+    description: PEL relate
+    epochs:
+      - {end_time: 357143.0000, start_size: 71067.851}
+      - {end_time: 257031.0000, start_size: 26376.177}
+      - {end_time: 184981.0000, start_size: 19960.797}
+      - {end_time: 133128.0000, start_size: 24580.775}
+      - {end_time: 95810.6000, start_size: 22969.919}
+      - {end_time: 68953.5000, start_size: 17932.716}
+      - {end_time: 49624.8000, start_size: 16026.103}
+      - {end_time: 35714.3000, start_size: 15801.283}
+      - {end_time: 25703.1000, start_size: 16461.664}
+      - {end_time: 18498.1000, start_size: 19644.436}
+      - {end_time: 13312.8000, start_size: 24421.456}
+      - {end_time: 9581.0600, start_size: 28295.907}
+      - {end_time: 6895.3500, start_size: 28016.698}
+      - {end_time: 4962.4800, start_size: 22863.937}
+      - {end_time: 3571.4300, start_size: 15498.494}
+      - {end_time: 2570.3100, start_size: 10059.714}
+      - {end_time: 1849.8100, start_size: 6658.100}
+      - {end_time: 1331.2800, start_size: 4283.829}
+      - {end_time: 958.1060, start_size: 2704.589}
+      - {end_time: 689.5350, start_size: 1868.761}
+      - {end_time: 496.2480, start_size: 1743.515}
+      - {end_time: 357.1430, start_size: 1811.023}
+      - {end_time: 257.0310, start_size: 1544.077}
+      - {end_time: 184.9810, start_size: 1006.336}
+      - {end_time: 133.1280, start_size: 739.927}
+      - {end_time: 95.8106, start_size: 1905.096}
+      - {end_time: 68.9535, start_size: 9064.655}
+      - {end_time: 49.6248, start_size: 35053.281}
+      - {end_time: 35.7143, start_size: 82354.414}
+      - {end_time: 0.0000, start_size: 286075.558}

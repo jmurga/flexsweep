@@ -1,0 +1,35 @@
+time_units: generations
+demes:
+  - name: GIH
+    description: GIH relate
+    epochs:
+      - {end_time: 357143.0000, start_size: 62174.284}
+      - {end_time: 257031.0000, start_size: 24950.224}
+      - {end_time: 184981.0000, start_size: 20725.217}
+      - {end_time: 133128.0000, start_size: 24641.102}
+      - {end_time: 95810.6000, start_size: 22136.529}
+      - {end_time: 68953.5000, start_size: 16824.141}
+      - {end_time: 49624.8000, start_size: 15255.390}
+      - {end_time: 35714.3000, start_size: 16043.896}
+      - {end_time: 25703.1000, start_size: 17210.401}
+      - {end_time: 18498.1000, start_size: 21458.859}
+      - {end_time: 13312.8000, start_size: 26729.535}
+      - {end_time: 9581.0600, start_size: 29415.571}
+      - {end_time: 6895.3500, start_size: 27129.533}
+      - {end_time: 4962.4800, start_size: 21280.218}
+      - {end_time: 3571.4300, start_size: 14844.592}
+      - {end_time: 2570.3100, start_size: 10028.823}
+      - {end_time: 1849.8100, start_size: 6508.146}
+      - {end_time: 1331.2800, start_size: 3782.005}
+      - {end_time: 958.1060, start_size: 2167.758}
+      - {end_time: 689.5350, start_size: 1733.240}
+      - {end_time: 496.2480, start_size: 2942.180}
+      - {end_time: 357.1430, start_size: 5794.273}
+      - {end_time: 257.0310, start_size: 8706.115}
+      - {end_time: 184.9810, start_size: 10744.532}
+      - {end_time: 133.1280, start_size: 13549.732}
+      - {end_time: 95.8106, start_size: 25751.957}
+      - {end_time: 68.9535, start_size: 103304.504}
+      - {end_time: 49.6248, start_size: 328299.409}
+      - {end_time: 35.7143, start_size: 690361.722}
+      - {end_time: 0.0000, start_size: 2122060.946}

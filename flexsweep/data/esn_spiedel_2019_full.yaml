@@ -1,0 +1,35 @@
+time_units: generations
+demes:
+  - name: ESN
+    description: ESN relate
+    epochs:
+      - {end_time: 357143.0000, start_size: 66840.899}
+      - {end_time: 257031.0000, start_size: 27356.039}
+      - {end_time: 184981.0000, start_size: 20893.315}
+      - {end_time: 133128.0000, start_size: 25911.838}
+      - {end_time: 95810.6000, start_size: 22950.519}
+      - {end_time: 68953.5000, start_size: 17567.591}
+      - {end_time: 49624.8000, start_size: 15651.755}
+      - {end_time: 35714.3000, start_size: 14083.634}
+      - {end_time: 25703.1000, start_size: 12867.496}
+      - {end_time: 18498.1000, start_size: 16072.571}
+      - {end_time: 13312.8000, start_size: 21234.669}
+      - {end_time: 9581.0600, start_size: 25367.190}
+      - {end_time: 6895.3500, start_size: 25657.473}
+      - {end_time: 4962.4800, start_size: 21909.165}
+      - {end_time: 3571.4300, start_size: 17416.445}
+      - {end_time: 2570.3100, start_size: 14835.387}
+      - {end_time: 1849.8100, start_size: 13857.171}
+      - {end_time: 1331.2800, start_size: 13488.068}
+      - {end_time: 958.1060, start_size: 12937.079}
+      - {end_time: 689.5350, start_size: 11762.381}
+      - {end_time: 496.2480, start_size: 10197.963}
+      - {end_time: 357.1430, start_size: 8616.396}
+      - {end_time: 257.0310, start_size: 7395.115}
+      - {end_time: 184.9810, start_size: 7107.482}
+      - {end_time: 133.1280, start_size: 8888.462}
+      - {end_time: 95.8106, start_size: 19579.050}
+      - {end_time: 68.9535, start_size: 95510.619}
+      - {end_time: 49.6248, start_size: 326675.683}
+      - {end_time: 35.7143, start_size: 706099.998}
+      - {end_time: 0.0000, start_size: 2250701.093}

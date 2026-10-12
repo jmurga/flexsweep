@@ -1,0 +1,35 @@
+time_units: generations
+demes:
+  - name: STU
+    description: STU relate
+    epochs:
+      - {end_time: 357143.0000, start_size: 62939.237}
+      - {end_time: 257031.0000, start_size: 26666.809}
+      - {end_time: 184981.0000, start_size: 20743.101}
+      - {end_time: 133128.0000, start_size: 24818.453}
+      - {end_time: 95810.6000, start_size: 22074.081}
+      - {end_time: 68953.5000, start_size: 16918.413}
+      - {end_time: 49624.8000, start_size: 15588.708}
+      - {end_time: 35714.3000, start_size: 16115.516}
+      - {end_time: 25703.1000, start_size: 17213.185}
+      - {end_time: 18498.1000, start_size: 21679.559}
+      - {end_time: 13312.8000, start_size: 27084.710}
+      - {end_time: 9581.0600, start_size: 29729.698}
+      - {end_time: 6895.3500, start_size: 27870.680}
+      - {end_time: 4962.4800, start_size: 22377.572}
+      - {end_time: 3571.4300, start_size: 16039.984}
+      - {end_time: 2570.3100, start_size: 11068.289}
+      - {end_time: 1849.8100, start_size: 7252.915}
+      - {end_time: 1331.2800, start_size: 4215.709}
+      - {end_time: 958.1060, start_size: 2204.488}
+      - {end_time: 689.5350, start_size: 1475.327}
+      - {end_time: 496.2480, start_size: 2577.572}
+      - {end_time: 357.1430, start_size: 6352.183}
+      - {end_time: 257.0310, start_size: 12359.137}
+      - {end_time: 184.9810, start_size: 21916.463}
+      - {end_time: 133.1280, start_size: 49374.426}
+      - {end_time: 95.8106, start_size: 131298.383}
+      - {end_time: 68.9535, start_size: 254225.223}
+      - {end_time: 49.6248, start_size: 353012.610}
+      - {end_time: 35.7143, start_size: 401309.875}
+      - {end_time: 0.0000, start_size: 829784.621}

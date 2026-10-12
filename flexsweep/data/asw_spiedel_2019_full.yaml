@@ -1,0 +1,35 @@
+time_units: generations
+demes:
+  - name: ASW
+    description: ASW relate
+    epochs:
+      - {end_time: 357143.0000, start_size: 64003.031}
+      - {end_time: 257031.0000, start_size: 28696.546}
+      - {end_time: 184981.0000, start_size: 21979.761}
+      - {end_time: 133128.0000, start_size: 25190.313}
+      - {end_time: 95810.6000, start_size: 22651.698}
+      - {end_time: 68953.5000, start_size: 17959.899}
+      - {end_time: 49624.8000, start_size: 16215.866}
+      - {end_time: 35714.3000, start_size: 14684.288}
+      - {end_time: 25703.1000, start_size: 14305.660}
+      - {end_time: 18498.1000, start_size: 16030.265}
+      - {end_time: 13312.8000, start_size: 21351.280}
+      - {end_time: 9581.0600, start_size: 25296.347}
+      - {end_time: 6895.3500, start_size: 24789.906}
+      - {end_time: 4962.4800, start_size: 20321.899}
+      - {end_time: 3571.4300, start_size: 15714.820}
+      - {end_time: 2570.3100, start_size: 13231.749}
+      - {end_time: 1849.8100, start_size: 12769.402}
+      - {end_time: 1331.2800, start_size: 13190.837}
+      - {end_time: 958.1060, start_size: 14284.980}
+      - {end_time: 689.5350, start_size: 15772.423}
+      - {end_time: 496.2480, start_size: 17120.825}
+      - {end_time: 357.1430, start_size: 18397.707}
+      - {end_time: 257.0310, start_size: 20252.016}
+      - {end_time: 184.9810, start_size: 24984.010}
+      - {end_time: 133.1280, start_size: 38184.262}
+      - {end_time: 95.8106, start_size: 85411.538}
+      - {end_time: 68.9535, start_size: 222109.687}
+      - {end_time: 49.6248, start_size: 458618.824}
+      - {end_time: 35.7143, start_size: 833062.588}
+      - {end_time: 0.0000, start_size: 3750290.648}
