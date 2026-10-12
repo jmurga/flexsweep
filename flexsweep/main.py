@@ -1,3 +1,4 @@
+import glob
 import math
 import os
 import click
@@ -13,6 +14,34 @@ def parse_float_list(value):
     return None
 
 
+def _resolve_map_option(ctx, param, value):
+    """Click callback: accept 'decode' for the bundled deCODE map, else a path."""
+    if value is None:
+        return None
+    from .simulate_discoal import resolve_recombination_map
+
+    try:
+        return resolve_recombination_map(value)
+    except FileNotFoundError as e:
+        raise click.BadParameter(str(e))
+
+
+def _resolve_demes_option(ctx, param, value):
+    """Click callback: accept a shipped demes alias (constant, africa_1t12, a 1000GP code) or a path."""
+    from .simulate_discoal import resolve_demes
+
+    try:
+        return resolve_demes(value)
+    except FileNotFoundError as e:
+        raise click.BadParameter(str(e))
+
+
+MAP_HELP = (
+    "Recombination map TSV (chr, start, end, cm_mb, cm), or 'decode' for the bundled "
+    "deCODE 2019 sex-averaged map. The bundled map is GRCh38: VCF coordinates must be GRCh38."
+)
+
+
 @click.group()
 def cli():
     """CLI for Simulator and CNN."""
@@ -20,45 +49,20 @@ def cli():
 
 
 @cli.command()
-@click.option("--sample_size", type=int, required=True, help="Number of haplotypes")
-@click.option(
-    "--mutation_rate",
-    type=str,
-    required=False,
-    default="5e-9,2e-8",
-    help=(
-        "Mutation rate specification. "
-        "Please input:\n"
-        "  - Two comma-separated values: lower,upper (uniform distribution bounds):"
-        "  - Three values: min, max and mean of an exponential distribution."
-        "Example: '5e-9,2e-8' or '5e-9,2e-8,1e-8'"
-    ),
-)
-@click.option(
-    "--recombination_rate",
-    type=str,
-    required=False,
-    default="1e-10,1e-7,1e-8",
-    help=(
-        "Recombination rate specification. "
-        "Please input:"
-        "  - Two comma-separated values: lower,upper (uniform distribution bounds):"
-        "  - Three values: min, max and mean of an exponential distribution."
-        "Example: '1e-9,4e-8' or '1e-10,1e-7,1e-8'"
-    ),
-)
-@click.option(
-    "--locus_length",
-    type=int,
-    required=False,
-    default=int(1.2e6),
-    help="Length of the simulated locus in base pairs.",
-)
+@click.option("--sample_size", type=int, required=True, help="Number of haplotypes.")
 @click.option(
     "--demes",
     type=str,
     required=True,
-    help="Path to the demes YAML file describing demography.",
+    callback=_resolve_demes_option,
+    help=(
+        "Demes YAML file describing demography, or a shipped model: "
+        "constant, africa_1t12, or any of the 26 1000 Genomes population codes "
+        "(acb, asw, beb, cdx, ceu, chb, chs, clm, esn, fin, gbr, gih, gwd, ibs, itu, "
+        "jpt, khv, lwk, msl, mxl, pel, pjl, pur, stu, tsi, yri; case-insensitive). The "
+        "population models are single-population Ne trajectories estimated with Relate "
+        "(Speidel et al. 2019)."
+    ),
 )
 @click.option(
     "--output_folder",
@@ -67,150 +71,199 @@ def cli():
     help="Directory where simulation outputs will be saved.",
 )
 @click.option(
-    "--time",
+    "--num_simulations",
+    type=int,
+    default=None,
+    help="Number of neutral replicates, and of sweep replicates. [default: 250000]",
+)
+@click.option(
+    "--locus_length",
+    type=int,
+    default=None,
+    help="Length of the simulated locus in bp. [default: 1200000]",
+)
+@click.option(
+    "--mutation_rate",
     type=str,
-    default="0,5000",
+    default=None,
     help=(
-        "Adaptive mutation time range in generations. "
-        "Two comma-separated values: start,end. "
-        "Default: '0,5000'"
+        "Per-bp mutation rate. One value: fixed for every replicate (e.g. '1.25e-8'). "
+        "Two values 'min,max': uniform. Three values 'min,max,mean': exponential with "
+        "that mean, truncated to [min, max]. [default: 5e-9,2e-8]"
+    ),
+)
+@click.option(
+    "--recombination_rate",
+    type=str,
+    default=None,
+    help=(
+        "Per-bp recombination rate. One value: fixed for every replicate (e.g. '1e-8'). "
+        "Two values 'min,max': uniform. Three values 'min,max,mean': exponential with "
+        "that mean, truncated to [min, max]. [default: 1e-9,1e-7,1e-8]"
     ),
 )
 @click.option(
     "--s",
     type=str,
-    default="0.01,0.05",
+    default=None,
+    help="Selection coefficient range 'min,max', drawn uniformly. [default: 0.01,0.05]",
+)
+@click.option(
+    "--time",
+    type=str,
+    default=None,
     help=(
-        "Selection coefficients."
-        "Two comma-separated values: min,max "
-        "Default: '0.01,0.05'"
+        "Range 'min,max' of generations since the sweep ended, drawn uniformly "
+        "(discoal -ws). [default: 0,5000]"
     ),
 )
 @click.option(
     "--saf",
     type=str,
-    default="0.0,0.1",
-    help=("Start allel frequency.Two comma-separated values: min,max Default: '0,0.1'"),
+    default=None,
+    help="Start allele frequency range 'min,max' of soft sweeps. [default: 0,0.1]",
 )
 @click.option(
     "--eaf",
     type=str,
-    default="0.5,1",
-    help=("End allel frequency.Two comma-separated values: min,max Default: '0.5,1'"),
+    default=None,
+    help="End allele frequency range 'min,max' of incomplete sweeps. [default: 0.5,1]",
 )
 @click.option(
-    "--num_simulations",
-    type=int,
-    default=int(2.5e5),
-    help="Number of neutral and sweep simulations to generate. Default: 250000.",
+    "--fixed_ratio",
+    type=float,
+    default=None,
+    help=(
+        "Fraction of complete sweeps (end frequency 1) among hard sweeps and among "
+        "soft sweeps; the rest are incomplete. [default: 0.1]"
+    ),
+)
+@click.option(
+    "--x",
+    type=str,
+    default=None,
+    help=(
+        "Sweep position along the locus as a fraction of --locus_length (discoal -x). "
+        "One value: fixed position; 'min,max': uniform per sweep replicate. [default: 0.5]"
+    ),
 )
 @click.option(
     "--nthreads",
     type=int,
-    default=1,
-    help="Number of threads for parallelization. Default: 1.",
+    default=None,
+    help="Number of parallel discoal jobs. [default: 1]",
 )
 @click.option(
     "--discoal_path",
     type=str,
     default=None,
+    help="Path to a discoal executable. [default: the bundled flexsweep.DISCOAL]",
+)
+@click.option(
+    "--seed",
+    type=int,
+    default=None,
     help=(
-        "Path to the discoal executable. If not provided, using pre-compiled flexsweep.DISCOAL."
+        "Random seed for parameter draws and discoal replicates. Per-replicate discoal "
+        "seeds are recorded in params.txt.gz. [default: unseeded]"
     ),
 )
 def simulator(
     sample_size,
-    mutation_rate,
-    recombination_rate,
-    locus_length,
     demes,
     output_folder,
-    discoal_path,
     num_simulations,
-    time,
+    locus_length,
+    mutation_rate,
+    recombination_rate,
     s,
+    time,
     saf,
     eaf,
+    fixed_ratio,
+    x,
     nthreads,
+    discoal_path,
+    seed,
 ):
     """
-    Run the discoal simulator with user-specified parameters.
+    Simulate neutral and sweep replicates with discoal.
 
-    flexsweep.Simulator class, parsing mutation and
-    recombination rate specifications from the command line, and dispatches
-    neutral and sweep simulations to discoal.
+    Options left unset take the defaults of flexsweep.Simulator.
 
     \b
     Example usage:
-        flexsweep simulate --sample_size 20 --demes model.yaml --output_folder ./sims --nthreads 24
-
+        flexsweep simulator --sample_size 216 --demes yri --output_folder ./sims --nthreads 24 --seed 1
     """
     import flexsweep as fs
 
-    # If not provided explicitly, use default path from flexsweep
-    if discoal_path is None:
-        discoal_path = fs.DISCOAL
+    def _rate_spec(values, name):
+        # One value: fixed; two values: uniform [min, max];
+        # three values: exponential(mean) truncated to [min, max]
+        if values is not None and len(values) == 1:
+            return {"dist": "fixed", "value": values[0]}
+        if values is not None and len(values) == 2:
+            return {"dist": "uniform", "min": values[0], "max": values[1]}
+        if values is not None and len(values) == 3:
+            return {
+                "dist": "exponential",
+                "min": values[0],
+                "max": values[1],
+                "mean": values[2],
+            }
+        raise click.BadParameter(
+            "expected 'value' (fixed), 'min,max' (uniform) or 'min,max,mean' "
+            "(truncated exponential)",
+            param_hint=f"--{name}",
+        )
 
-    mutation_rate_list = parse_float_list(mutation_rate)
-    recombination_rate_list = parse_float_list(recombination_rate)
+    def _range(value, name):
+        values = parse_float_list(value)
+        if values is None or len(values) != 2:
+            raise click.BadParameter("expected 'min,max'", param_hint=f"--{name}")
+        return values
 
-    # Build mutation rate distribution spec
-    if len(mutation_rate_list) == 2:
-        mu_rate = {
-            "dist": "uniform",
-            "min": mutation_rate_list[0],
-            "max": mutation_rate_list[1],
-        }
-    elif len(mutation_rate_list) == 3:
-        mu_rate = {
-            "dist": "exponential",
-            "min": mutation_rate_list[0],
-            "max": mutation_rate_list[1],
-            "mean": mutation_rate_list[2],
-        }
+    # Only options given on the command line are passed; the rest keep the
+    # Simulator defaults, so CLI and Python share one set of defaults.
+    kwargs = {}
+    if num_simulations is not None:
+        kwargs["num_simulations"] = num_simulations
+    if locus_length is not None:
+        kwargs["locus_length"] = locus_length
+    if mutation_rate is not None:
+        kwargs["mutation_rate"] = _rate_spec(
+            parse_float_list(mutation_rate), "mutation_rate"
+        )
+    if recombination_rate is not None:
+        kwargs["recombination_rate"] = _rate_spec(
+            parse_float_list(recombination_rate), "recombination_rate"
+        )
+    for name, value in (("s", s), ("time", time), ("saf", saf), ("eaf", eaf)):
+        if value is not None:
+            kwargs[name] = _range(value, name)
+    if fixed_ratio is not None:
+        if not 0 <= fixed_ratio <= 1:
+            raise click.BadParameter("must be in [0, 1]", param_hint="--fixed_ratio")
+        kwargs["fixed_ratio"] = fixed_ratio
+    if x is not None:
+        xs = parse_float_list(x)
+        if xs is None or len(xs) not in (1, 2) or not all(0 <= v <= 1 for v in xs):
+            raise click.BadParameter(
+                "expected 'x' or 'min,max' in [0, 1]", param_hint="--x"
+            )
+        kwargs["x"] = float(xs[0]) if len(xs) == 1 else [float(v) for v in xs]
+    if nthreads is not None:
+        kwargs["nthreads"] = nthreads
+    if discoal_path is not None:
+        kwargs["discoal_path"] = discoal_path
 
-    if len(recombination_rate_list) == 1:
-        rho_rate = {
-            "dist": "exponential",
-            "mean": recombination_rate_list[0],
-        }
-    elif len(recombination_rate_list) == 2:
-        rho_rate = {
-            "dist": "uniform",
-            "lower": recombination_rate_list[0],
-            "upper": recombination_rate_list[1],
-        }
-    elif len(recombination_rate_list) == 3:
-        rho_rate = {
-            "dist": "exponential",
-            "min": recombination_rate_list[0],
-            "max": recombination_rate_list[1],
-            "mean": recombination_rate_list[2],
-        }
-
-    # Parse time range (not directly used in this wrapper, passed to Simulator internally)
-    time_list = parse_float_list(time)
-    s_list = parse_float_list(s)
-    saf_list = parse_float_list(saf)
-    eaf_list = parse_float_list(eaf)
-
-    # Instantiate Simulator and run simulations
     simulator = fs.Simulator(
         sample_size=sample_size,
-        mutation_rate=mu_rate,
-        recombination_rate=rho_rate,
-        locus_length=locus_length,
         demes=demes,
         output_folder=output_folder,
-        discoal_path=fs.DISCOAL,
-        num_simulations=num_simulations,
-        nthreads=nthreads,
+        seed=seed,
+        **kwargs,
     )
-
-    simulator.time = time_list
-    simulator.s = s_list
-    simulator.f_i = saf_list
-    simulator.f_t = eaf_list
     simulator.create_params()
     simulator.simulate_batch()
 
@@ -321,13 +374,6 @@ def simulator(
     default=False,
     help="Save raw statistics.",
 )
-@click.option(
-    "--only_normalize",
-    type=bool,
-    required=False,
-    default=False,
-    help="Only normalizing raw statistics.",
-)
 def fvs_discoal(
     simulations_path,
     stats,
@@ -339,7 +385,6 @@ def fvs_discoal(
     save_stats,
     suffix,
     nthreads,
-    only_normalize,
 ):
     """
     Estimate summary statistics from discoal simulations and build feature vectors.
@@ -355,35 +400,23 @@ def fvs_discoal(
 
     stats_list = stats.split(",") if stats is not None else None
 
-    if only_normalize:
-        fs.fv._normalize_raw_stats(
-            simulations_path,
-            nthreads,
-            center_list,
-            windows_list,
-            step,
-            r_bins=r_bins_list,
-            suffix=suffix,
-            vcf=False,
-        )
-    else:
-        print("Estimating summary statistics")
-        fs.fv.summary_statistics(
-            simulations_path,
-            stats=stats_list,
-            vcf=False,
-            nthreads=nthreads,
-            windows=windows_list,
-            step=step,
-            centers=center_list,
-            locus_length=locus_length,
-            recombination_map=None,
-            r_bins=r_bins_list,
-            min_rate=0.0,
-            suffix=suffix,
-            func=None,
-            save_stats=save_stats,
-        )
+    print("Estimating summary statistics")
+    fs.fv.summary_statistics(
+        simulations_path,
+        stats=stats_list,
+        vcf=False,
+        nthreads=nthreads,
+        windows=windows_list,
+        step=step,
+        centers=center_list,
+        locus_length=locus_length,
+        recombination_map=None,
+        r_bins=r_bins_list,
+        min_rate=0.0,
+        suffix=suffix,
+        func=None,
+        save_stats=save_stats,
+    )
 
 
 @cli.command()
@@ -440,7 +473,8 @@ def fvs_discoal(
     type=str,
     default=None,
     required=False,
-    help="Recombination map. Decode CSV format: Chr,Begin,End,cMperMb,cM",
+    callback=_resolve_map_option,
+    help=MAP_HELP,
 )
 @click.option(
     "--min_rate",
@@ -470,13 +504,6 @@ def fvs_discoal(
     default=False,
     help="Save raw statistics.",
 )
-@click.option(
-    "--only_normalize",
-    type=bool,
-    required=False,
-    default=False,
-    help="Only normalizing previous raw statistics.",
-)
 def fvs_vcf(
     vcf_path,
     stats,
@@ -490,7 +517,6 @@ def fvs_vcf(
     save_stats,
     suffix,
     nthreads,
-    only_normalize,
 ):
     """
     Estimate summary statistics from VCF files and build feature vectors.
@@ -503,44 +529,42 @@ def fvs_vcf(
         # Run summary statistics from VCFs using 8 threads, no recombination map
         flexsweep fvs-vcf --vcf_path ./data --nthreads 8
     \b
-        # Run with a recombination map
-        flexsweep fvs-vcf --vcf_path ./data --nthreads 8 --recombination_map recomb_map.csv
+        # Run with the bundled deCODE map (GRCh38)
+        flexsweep fvs-vcf --vcf_path ./data --nthreads 8 --recombination_map decode
 
-    Notes: VCF files must be bgzipped and tabix-indexed.
+    Notes: one bgzipped, tabix-indexed VCF/BCF per chromosome, REF = ancestral allele,
+    ##contig header lines with length=, GRCh38 coordinates when using the bundled map.
     """
     import flexsweep as fs
 
     r_bins_list = parse_float_list(r_bins)
 
     stats_list = stats.split(",") if stats is not None else None
-    if only_normalize:
-        fs.fv.normalize_raw_stats(
-            vcf_path,
-            nthreads,
-            center_list,
-            [windows],
-            step,
-            r_bins=r_bins_list,
-            suffix=suffix,
-            vcf=True,
-        )
-    else:
-        fs.summary_statistics(
-            vcf_path,
-            vcf=True,
-            stats=stats_list,
-            nthreads=nthreads,
-            windows=[windows],
-            step=step,
-            step_vcf=step_vcf,
-            locus_length=locus_length,
-            recombination_map=recombination_map,
-            r_bins=r_bins_list,
-            min_rate=min_rate,
-            suffix=suffix,
-            func=None,
-            save_stats=save_stats,
-        )
+
+    vcf_files = sorted(
+        glob.glob(os.path.join(vcf_path, "*vcf.gz"))
+        + glob.glob(os.path.join(vcf_path, "*bcf.gz"))
+    )
+    from flexsweep.data import check_genome_build
+
+    check_genome_build(vcf_files, recombination_map)
+
+    fs.summary_statistics(
+        vcf_path,
+        vcf=True,
+        stats=stats_list,
+        nthreads=nthreads,
+        windows=[windows],
+        step=step,
+        step_vcf=step_vcf,
+        locus_length=locus_length,
+        recombination_map=recombination_map,
+        r_bins=r_bins_list,
+        min_rate=min_rate,
+        suffix=suffix,
+        func=None,
+        save_stats=save_stats,
+    )
 
 
 @cli.command()
@@ -555,7 +579,8 @@ def fvs_vcf(
     type=str,
     default=None,
     required=False,
-    help="Recombination map. Decode CSV format: Chr,Begin,End,cMperMb,cM",
+    callback=_resolve_map_option,
+    help=MAP_HELP,
 )
 @click.option(
     "--bins", type=int, default=10, required=False, help="Recombinations bins"
@@ -583,7 +608,7 @@ def recombination_bins(vcf_path, recombination_map, bins, window_size, step, min
 
     \b
     Example usage:
-        flexsweep recombination-bins --vcf_path ./data --recombination_map decode.tsv
+        flexsweep recombination-bins --vcf_path ./data --recombination_map decode
 
     """
     import glob
@@ -632,6 +657,12 @@ def recombination_bins(vcf_path, recombination_map, bins, window_size, step, min
 
     if not vcf_files:
         raise FileNotFoundError(f"No VCF/BCF files found in directory: {vcf_path}")
+    if recombination_map is None:
+        raise click.UsageError("--recombination_map is required (a path or 'decode').")
+
+    from flexsweep.data import check_genome_build
+
+    check_genome_build(vcf_files, recombination_map)
 
     df_recombination_map = pl.read_csv(
         recombination_map,
@@ -733,7 +764,13 @@ def recombination_bins(vcf_path, recombination_map, bins, window_size, step, min
     default=None,
     help="Path to a pre-trained CNN model. If provided, the CNN will only perform prediction.",
 )
-def cnn(train_data, predict_data, output_folder, model):
+@click.option(
+    "--seed",
+    type=int,
+    default=None,
+    help="Random seed (Python, NumPy, TensorFlow, data splits). GPU runs may still differ slightly.",
+)
+def cnn(train_data, predict_data, center, windows, step, output_folder, model, seed):
     """
     Run the Flex-sweep CNN for training or prediction.
 
@@ -755,7 +792,8 @@ def cnn(train_data, predict_data, output_folder, model):
 
     os.makedirs(output_folder, exist_ok=True)
 
-    center_list = parse_float_list(center)
+    center_list = [int(x) for x in parse_float_list(center)]
+    windows = [windows]
 
     if model is None:
         if not train_data:
@@ -768,6 +806,7 @@ def cnn(train_data, predict_data, output_folder, model):
             center=center_list,
             windows=windows,
             step=step,
+            seed=seed,
         )
         fs_cnn.train()
         if predict_data is not None:
@@ -786,6 +825,7 @@ def cnn(train_data, predict_data, output_folder, model):
             center=center_list,
             windows=windows,
             step=step,
+            seed=seed,
         )
         fs_cnn.predict()
 
@@ -836,18 +876,18 @@ def cnn(train_data, predict_data, output_folder, model):
     type=float,
     required=False,
     default=1.0,
-    help="Maximum labmda",
+    help="Maximum gradient-reversal lambda",
 )
 @click.option(
     "--ramp_epochs",
-    type=float,
+    type=int,
     required=False,
     default=30,
     help="Ramping epochs",
 )
 @click.option(
     "--batch_size",
-    type=float,
+    type=int,
     required=False,
     default=64,
     help="Batch size to train",
@@ -870,6 +910,12 @@ def cnn(train_data, predict_data, output_folder, model):
     default=None,
     help="Path to a pre-trained DANN model. If provided, the DANN will only perform prediction.",
 )
+@click.option(
+    "--seed",
+    type=int,
+    default=None,
+    help="Random seed (Python, NumPy, TensorFlow, data splits). GPU runs may still differ slightly.",
+)
 def dann(
     source_data,
     target_data,
@@ -883,6 +929,7 @@ def dann(
     output_folder,
     preprocess,
     model,
+    seed,
 ):
     """
     Run the Flex-sweep DANN for training or prediction.
@@ -895,13 +942,13 @@ def dann(
 
     \b
     Predict example:
-        flexsweep dann --model ./sims/model.keras --predict_data data/test.parquet --output_folder results/
+        flexsweep dann --model ./sims/model.keras --target_data data/empirical.parquet --output_folder results/
     """
     import flexsweep as fs
 
     os.makedirs(output_folder, exist_ok=True)
 
-    center_list = parse_float_list(center)
+    center_list = [int(x) for x in parse_float_list(center)]
 
     if model is None:
         if not source_data:
@@ -915,6 +962,7 @@ def dann(
             center=center_list,
             windows=fs.np.asarray([windows]),
             step=step,
+            seed=seed,
         )
         fs_dann.train_da(
             tgt_ratio=target_ratio,
@@ -937,8 +985,25 @@ def dann(
             center=center_list,
             windows=fs.np.asarray([windows]),
             step=step,
+            seed=seed,
         )
+        # predict_da reads predict_data (train_da sets it from target_data)
+        fs_dann.predict_data = target_data
+        # train_da saves the Platt calibration next to the model; apply the same one so
+        # predict-only output matches the training-run predictions
+        cal_file = os.path.join(
+            os.path.dirname(os.path.abspath(model)), "calibration.json"
+        )
+        if os.path.exists(cal_file):
+            import json
 
+            with open(cal_file) as f:
+                fs_dann.calibration = json.load(f)
+        else:
+            click.secho(
+                f"No calibration.json next to {model}: predictions are uncalibrated.",
+                fg="yellow",
+            )
         fs_dann.predict_da(preprocess=preprocess)
 
 
@@ -946,8 +1011,27 @@ def dann(
 @click.option(
     "--prediction",
     type=str,
-    required=True,
-    help="File containing predicted sweep probabilites.",
+    default=None,
+    help="File containing predicted sweep probabilites (single-population mode).",
+)
+@click.option(
+    "--prediction_dir",
+    type=str,
+    default=None,
+    help="Folder with one prediction file per population (multi-population mode).",
+)
+@click.option(
+    "--populations",
+    type=str,
+    default=None,
+    help="Comma-separated population codes; sets the column order of the merged table.",
+)
+@click.option(
+    "--pattern",
+    type=str,
+    default="{pop}_*predictions.txt",
+    show_default=True,
+    help="Glob for each population's file in --prediction_dir; {pop} is replaced by the code.",
 )
 @click.option(
     "--feature_coordinates",
@@ -955,40 +1039,82 @@ def dann(
     required=True,
     help="Bed file contaning genomic feature coordinates.",
 )
-def rank(prediction, feature_coordinates):
+@click.option(
+    "--output",
+    type=str,
+    default=None,
+    help="Merged rank table (multi-population mode). Default: <prediction_dir>/all_ranks.txt.",
+)
+def rank(prediction, prediction_dir, populations, pattern, feature_coordinates, output):
     """
     Rank genomic features by their maximum nearby sweep probability.
 
-    Read the predictions file and a BED of genomic features, links each
-    feature to the nearest prediction window on the same chromosome, takes the **maximum**
-    sweep probability among matched windows for that feature, ranks all features by this
-    value.
+    Reads the predictions file and a BED of genomic features, links each
+    feature to the nearest prediction windows on the same chromosome, takes the
+    **maximum** sweep probability among matched windows for that feature, and ranks
+    all features by this value.
+
+    Two modes:
+
+    * ``--prediction``: one population. Writes ``<prediction>_rank_<n>.txt``
+      (``gene_id``, ``rank``; tab-separated, no header), where ``n`` is the number of
+      features tied at the highest sweep probability.
+    * ``--prediction_dir`` + ``--populations``: ranks one file per population (found
+      with ``--pattern``) and writes a single table to ``--output``: ``gene_id`` plus one
+      rank column per population in ``--populations`` order, sorted by ``gene_id``,
+      space-separated, no header. This is the ``--sweep_files`` input of
+      ``flexsweep enrichment``. Name the output so that the text after its last ``_``
+      labels the dataset (e.g. ``all_ranks_v3rbins``), since enrichment reports use it.
 
     Input formats
     -------------
-    * **prediction**: delimited text (TSV/CSV) with at least the columns
+    * **prediction**: delimited text (CSV) with at least the columns
       ``chr``, ``start``, ``end``, ``prob_sweep``. Additional columns (e.g. ``iter``)
       are ignored for ranking.
     * **feature_coordinates**: BED-like, tab-separated with no header, columns
-      ``chr``, ``start``, ``end``, and optionally an identifier (e.g. gene name) and
-      strand. Coordinates are interpreted as 0-based half-open.
+      ``chr``, ``start``, ``end``, identifier (e.g. gene id) and strand.
+      Coordinates are interpreted as 0-based half-open.
 
-    :param prediction: Path to the file containing predicted sweep probabilities.
-    :type prediction: str
-    :param feature_coordinates: Path to a BED file with genomic feature intervals.
-    :type feature_coordinates: str
-
-    :returns: None. Writes the ranked table to ``output_file`` and prints number of max ranks.
-    :rtype: None
+    \b
+    Example usage:
+        flexsweep rank \\
+            --prediction_dir predictions/ \\
+            --populations yri,ceu,chb \\
+            --feature_coordinates genes.bed \\
+            --output predictions/all_ranks_v3
 
     :notes:
-        The ranking and feature–window association are performed by
-        :func:`flexsweep.rank_probabilities`. Ties are reported as the count of features
-        sharing the global maximum probability.
+        The ranking and feature-window association are performed by
+        :func:`flexsweep.rank_probabilities`; the multi-population table by
+        :func:`flexsweep.utils.rank_merge`.
     """
     import os
 
     import flexsweep as fs
+
+    if (prediction is None) == (prediction_dir is None):
+        raise click.UsageError("Give exactly one of --prediction or --prediction_dir.")
+
+    if prediction_dir is not None:
+        if populations is None:
+            raise click.UsageError("--prediction_dir requires --populations.")
+        from flexsweep.utils import find_prediction_files, rank_merge
+
+        pops = populations.split(",")
+        try:
+            files = find_prediction_files(prediction_dir, pops, pattern)
+        except ValueError as e:
+            raise click.UsageError(str(e))
+        if output is None:
+            output = os.path.join(prediction_dir, "all_ranks.txt")
+
+        df_rank, ties = rank_merge(files, pops, feature_coordinates, output=output)
+
+        click.echo("column\tpopulation\tfile\ttied_at_max")
+        for i, (pop, f) in enumerate(zip(pops, files)):
+            click.echo(f"{i + 2}\t{pop}\t{os.path.basename(f)}\t{ties[pop]}")
+        click.echo(f"{df_rank.height} features x {len(pops)} populations -> {output}")
+        return
 
     df_rank, max_rank = fs.rank_probabilities(prediction, feature_coordinates)
 
@@ -1017,7 +1143,7 @@ def rank(prediction, feature_coordinates):
     "--gene_set",
     type=str,
     required=True,
-    help="TSV with gene_id and yes/no label columns (no header).",
+    help="Case (VIP) gene ids, one per line (no header). All other genes are control candidates.",
 )
 @click.option(
     "--factors",
@@ -1053,19 +1179,19 @@ def rank(prediction, feature_coordinates):
     "--pop_interest",
     type=str,
     default="All",
-    help="Population, group name, or 'All' for FDR scope.",
+    help="Perl Pop_interest: scope (population, group or All) whose p-values set how many control sets are used (20/100/all).",
 )
 @click.option(
     "--cluster_distance",
     type=int,
     default=500_000,
-    help="Max bp between genes to count as neighbours.",
+    help="Neighbour distance (bp) for --count_sweeps (Perl Cluster_distance); unused otherwise.",
 )
 @click.option(
-    "--n_runs",
-    type=int,
-    default=10,
-    help="Bootstrap batches (total sets = n_runs × iterations_per_run).",
+    "--count_sweeps",
+    is_flag=True,
+    default=False,
+    help="Perl Count_sweeps yes: neighbouring genes in one sweep (within --cluster_distance) count once.",
 )
 @click.option(
     "--tolerance",
@@ -1101,13 +1227,19 @@ def rank(prediction, feature_coordinates):
     "--n_shuffles",
     type=int,
     default=8,
-    help="FDR shuffle replicates (must be a multiple of 8).",
+    help="FDR genome-shuffle replicates (multiple of 8; use >= 1000 for reported p-values).",
 )
 @click.option(
     "--shuffling_segs",
     type=int,
     default=2,
     help="Genes per genomic shuffle segment.",
+)
+@click.option(
+    "--shuffle_blocks",
+    type=int,
+    default=None,
+    help="Cut the shuffled genome into this many blocks instead of --shuffling_segs-gene segments (paper: 100).",
 )
 @click.option(
     "--distance_file",
@@ -1125,7 +1257,19 @@ def rank(prediction, feature_coordinates):
     "--plot_groups",
     is_flag=True,
     default=False,
-    help="Facet populations in enrichment plot",
+    help="Plot group curves (--groups labels) instead of population curves.",
+)
+@click.option(
+    "--seed",
+    type=int,
+    default=None,
+    help="Seed for the bootstrap and the genome shuffles (printed when not given).",
+)
+@click.option(
+    "--reuse_bootstrap",
+    type=str,
+    default=None,
+    help="Output folder of a previous run: reuse its case_set.txt/control_set.txt.",
 )
 @click.option(
     "--output_folder",
@@ -1143,7 +1287,7 @@ def enrichment(
     thresholds,
     pop_interest,
     cluster_distance,
-    n_runs,
+    count_sweeps,
     tolerance,
     min_distance,
     flip,
@@ -1151,9 +1295,12 @@ def enrichment(
     nthreads,
     n_shuffles,
     shuffling_segs,
+    shuffle_blocks,
     distance_file,
     facet,
     plot_groups,
+    seed,
+    reuse_bootstrap,
     output_folder,
 ):
     """
@@ -1169,7 +1316,8 @@ def enrichment(
     * **sweep_files**: tab- or space-separated, optionally gzipped. First column
       ``gene_id``; remaining columns are per-population sweep ranks matching
       ``--populations`` order.
-    * **gene_set**: two-column TSV (no header) ``gene_id``, ``yes``/``no``.
+    * **gene_set**: one case gene id per line (no header); every other gene of
+      the universe (factors ∩ sweep file) is a control candidate.
     * **factors**: confounding factors TSV (no header); first column ``gene_id``.
     * **annotation**: BED file (0-based, no header) ``chr``, ``start``, ``end``,
       ``gene_id``.
@@ -1178,7 +1326,7 @@ def enrichment(
     Example usage:
         flexsweep enrichment \\
             --sweep_files yri_ranks.tsv \\
-            --gene_set vip_genes.tsv \\
+            --gene_set vip_genes.txt \\
             --factors confounders.tsv \\
             --annotation genes.bed \\
             --populations YRI \\
@@ -1186,195 +1334,14 @@ def enrichment(
             --thresholds 6000,5000,2000,1000,500,200,100,50,20 \\
             --nthreads 8
     """
-    import matplotlib.pyplot as plt
-    import matplotlib.ticker as ticker
+    from flexsweep.enrichment import np, plot_enrichment, run_enrichment
 
-    from flexsweep.enrichment import np, pl, run_enrichment
-
-    NPG_COLORS = [
-        "#E64B35",
-        "#4DBBD5",
-        "#00A087",
-        "#3C5488",
-        "#F39B7F",
-        "#8491B4",
-        "#91D1C2",
-        "#DC0000",
-        "#7E6148",
-        "#B09C85",
-    ]
-
-    def enrichment_plot_python(
-        df_curves,
-        plot_title: str = "",
-        ci: bool = False,
-        population: list[str] | None = None,
-        target_groups: list[str] | None = None,
-        facet: bool = False,
-    ):
-        df = df_curves.with_columns(
-            [
-                pl.col("ratio").cast(pl.Float64, strict=False),
-                pl.col("threshold").cast(pl.Float64, strict=False),
-                pl.col("ci_lo_ratio").cast(pl.Float64, strict=False),
-                pl.col("ci_hi_ratio").cast(pl.Float64, strict=False),
-                pl.col("vip_count").cast(pl.Float64, strict=False),
-            ]
+    if len(groups.split(",")) != len(populations.split(",")):
+        raise click.BadParameter(
+            f"{len(groups.split(','))} labels for {len(populations.split(','))} "
+            "populations; give one group per population, comma-separated",
+            param_hint="--groups",
         )
-
-        filters = [
-            pl.col("threshold").is_not_null(),
-            pl.col("ratio") >= 0,
-        ]
-
-        if population is not None:
-            filters.append(pl.col("scope").is_in(population))
-
-        if target_groups is not None:
-            filters.append(pl.col("scope").is_in(target_groups))
-
-        df = df.filter(pl.all_horizontal(filters))
-
-        if ci:
-            df = df.with_columns(
-                [
-                    (pl.col("ci_lo_ratio") / pl.col("vip_count")).alias("CI_low_ratio"),
-                    (pl.col("ci_hi_ratio") / pl.col("vip_count")).alias("CI_up_ratio"),
-                ]
-            )
-        else:
-            df = df.with_columns(
-                [
-                    pl.col("ci_lo_ratio").alias("CI_low_ratio"),
-                    pl.col("ci_hi_ratio").alias("CI_up_ratio"),
-                ]
-            )
-
-        df = df.sort("threshold")
-
-        threshold_levels = sorted(df["threshold"].unique().to_list())
-        threshold_labels = [
-            str(int(t)) if t == int(t) else str(t) for t in threshold_levels
-        ]
-        label_to_x = {lbl: i for i, lbl in enumerate(threshold_labels)}
-
-        df = df.with_columns(
-            pl.col("threshold")
-            .map_elements(
-                lambda v: label_to_x[str(int(v)) if v == int(v) else str(v)],
-                return_dtype=pl.Int32,
-            )
-            .alias("x_pos")
-        )
-
-        scopes = df["scope"].unique().sort().to_list()
-        color_map = {
-            scope: NPG_COLORS[i % len(NPG_COLORS)] for i, scope in enumerate(scopes)
-        }
-
-        if facet:
-            pops = scopes
-            ncols = min(3, len(pops))
-            nrows = int(np.ceil(len(pops) / ncols))
-
-            fig, axes = plt.subplots(
-                nrows, ncols, figsize=(6 * ncols, 4 * nrows), squeeze=False
-            )
-            ax_flat = axes.flatten()
-
-            for idx, pop in enumerate(pops):
-                ax = ax_flat[idx]
-                pop_df = df.filter(pl.col("scope") == pop)
-
-                _draw_lines(ax, pop_df, scopes, color_map, ci)
-                _style_ax(ax, threshold_labels, subtitle=pop)
-
-            for idx in range(len(pops), len(ax_flat)):
-                ax_flat[idx].set_visible(False)
-
-            handles = [
-                plt.Line2D(
-                    [0], [0], color=color_map[s], linewidth=2, marker="o", label=s
-                )
-                for s in scopes
-            ]
-            fig.legend(
-                handles=handles, title="Population", loc="lower right", frameon=False
-            )
-
-        else:
-            fig, ax = plt.subplots(figsize=(9, 5))
-
-            _draw_lines(ax, df, scopes, color_map, ci)
-            _style_ax(ax, threshold_labels)
-
-            handles = [
-                plt.Line2D(
-                    [0], [0], color=color_map[s], linewidth=2, marker="o", label=s
-                )
-                for s in scopes
-            ]
-            ax.legend(handles=handles, title="Population", frameon=False)
-
-        fig.suptitle(plot_title, fontsize=14, fontweight="bold", y=1.01)
-        fig.text(
-            0.5,
-            0.98,
-            "Rank Threshold vs. Enrichment Ratio",
-            ha="center",
-            fontsize=10,
-            color="grey",
-            transform=fig.transFigure,
-        )
-
-        fig.tight_layout()
-        return fig
-
-    def _draw_lines(ax, df, scopes, color_map, ci):
-        """Plot one line per scope onto *ax*."""
-        ax.set_yscale("log")
-        ax.axhline(y=1, linestyle="--", color="grey", linewidth=0.8, zorder=0)
-
-        for scope in scopes:
-            sub = df.filter(pl.col("scope") == scope).sort("x_pos")
-            if sub.is_empty():
-                continue
-            x = sub["x_pos"].to_list()
-            y = sub["ratio"].to_list()
-            color = color_map[scope]
-
-            ax.plot(
-                x, y, color=color, linewidth=1.5, marker="o", markersize=4, label=scope
-            )
-
-            if ci:
-                y_lo = sub["CI_low_ratio"].to_list()
-                y_hi = sub["CI_up_ratio"].to_list()
-                ax.fill_between(x, y_lo, y_hi, color=color, alpha=0.15, linewidth=0)
-
-    def _style_ax(ax, threshold_labels, subtitle=None):
-        """Apply common axis styling."""
-        ax.set_xticks(range(len(threshold_labels)))
-        ax.set_xticklabels(threshold_labels, rotation=45, ha="right", fontsize=8)
-        ax.set_xlabel("Rank Threshold")
-        ax.set_ylabel("Enrichment Ratio (Obs/Exp)")
-
-        ax.yaxis.set_major_locator(
-            ticker.LogLocator(base=10.0, subs=(1.0, 2.0, 3.0, 5.0), numticks=20)
-        )
-        # ScalarFormatter: shows "10" instead of "10^1"
-        ax.yaxis.set_major_formatter(ticker.ScalarFormatter())
-
-        # # Optional: Minor ticks for visual density without labels
-        ax.yaxis.set_minor_locator(
-            ticker.LogLocator(base=10.0, subs="auto", numticks=20)
-        )
-        ax.yaxis.set_minor_formatter(ticker.NullFormatter())
-        ax.grid(True, which="both", linestyle=":", linewidth=0.5, alpha=0.6)
-
-        ax.spines[["top", "right"]].set_visible(False)
-        if subtitle:
-            ax.set_title(subtitle, fontsize=10)
 
     df_case, df_control, df_curves, df_fdr = run_enrichment(
         sweep_files=sweep_files.split(","),
@@ -1386,7 +1353,6 @@ def enrichment(
         thresholds=[int(x) for x in thresholds.split(",")],
         pop_interest=pop_interest,
         cluster_distance=cluster_distance,
-        n_runs=n_runs,
         tolerance=tolerance,
         min_distance=min_distance,
         flip=flip,
@@ -1395,28 +1361,76 @@ def enrichment(
         n_shuffles=n_shuffles,
         shuffling_segs=shuffling_segs,
         distance_file=distance_file,
+        seed=seed,
+        reuse_bootstrap=reuse_bootstrap,
+        output_folder=output_folder,
+        count_sweeps=count_sweeps,
+        shuffle_blocks=shuffle_blocks,
     )
 
-    out_p = {}
-    for k, v in df_curves.group_by("dataset"):
-        out_p[k[0]] = enrichment_plot_python(
-            v,
+    plot_enrichment(
+        df_curves,
+        scopes=list(np.unique(groups.split(",")))
+        if plot_groups
+        else list(np.unique(populations.split(","))),
+        facet=facet,
+        output_folder=output_folder,
+        show=output_folder is None,
+    )
+
+
+@cli.command("enrichment-plot")
+@click.option(
+    "--curves",
+    type=str,
+    required=True,
+    help="enrichment_curves.txt written by 'flexsweep enrichment --output_folder'.",
+)
+@click.option(
+    "--scopes",
+    type=str,
+    default=None,
+    help="Comma-separated scopes to draw (populations, groups or All). Default: all.",
+)
+@click.option("--facet", is_flag=True, default=False, help="One panel per scope.")
+@click.option("--ci", is_flag=True, default=False, help="Shade bootstrap intervals.")
+@click.option("--title", type=str, default="", help="Figure title.")
+@click.option(
+    "--output_folder",
+    type=str,
+    default=None,
+    help="Folder for the SVGs. Default: the folder of --curves.",
+)
+def enrichment_plot(curves, scopes, facet, ci, title, output_folder):
+    """
+    Plot enrichment curves from a finished enrichment run, without rerunning it.
+
+    Writes one ``enrichment_curves_<sweep file name>.svg`` per sweep file in the table.
+
+    \b
+    Example usage:
+        flexsweep enrichment-plot \\
+            --curves enrichment_out/enrichment_curves.txt \\
+            --scopes afr,amr,eas,eur,sas \\
+            --facet
+    """
+    from flexsweep.enrichment import _curve_svg_path, plot_enrichment
+
+    if output_folder is None:
+        output_folder = os.path.dirname(os.path.abspath(curves))
+    try:
+        figs = plot_enrichment(
+            curves,
+            scopes=scopes.split(",") if scopes else None,
             facet=facet,
-            population=np.unique(groups.split(","))
-            if plot_groups
-            else np.unique(populations.split(",")),
+            ci=ci,
+            title=title,
+            output_folder=output_folder,
         )
-
-    if output_folder is not None:
-        df_case.write_csv(f"{output_folder}/case_set.txt")
-        df_control.write_csv(f"{output_folder}/control_set.txt")
-        df_curves.write_csv(f"{output_folder}/enrichment_curves.txt")
-        df_fdr.write_csv(f"{output_folder}/fdr.txt")
-
-        for k, v in out_p.items():
-            v.savefig(f"{output_folder}/enrichement_curves_{k}.svg")
-    else:
-        plt.show()
+    except ValueError as e:
+        raise click.BadParameter(str(e), param_hint="--scopes")
+    for dataset in figs:
+        click.echo(f"{dataset} -> {_curve_svg_path(output_folder, dataset)}")
 
 
 @cli.command()
@@ -1436,7 +1450,7 @@ def enrichment(
     "--outgroups",
     type=str,
     required=True,
-    help="Comma-separated list of outgroups, e.g: panTro4,ponAbe2,gorGor6",
+    help="Comma-separated list of outgroups as named in the MAF, e.g. panTro4,gorGor3,ponAbe2 (hg38 multiz20way).",
 )
 @click.option(
     "--method",
@@ -1460,12 +1474,12 @@ def polarize(maf, vcf, outgroups, method, nrandom):
     contig, sorted by position, and must name that contig identically. Prepare them first:
 
     \b
-        flexsweep split-maf --maf primates.maf.gz --contig CM000663.2
-        bcftools view -r CM000663.2 all.vcf.gz -Oz -o yri_CM000663.2.vcf.gz
+        flexsweep split-maf --maf 447.primates.maf.gz --contig chr22
+        bcftools view -r chr22 all.vcf.gz -Oz -o yri_chr22.vcf.gz
 
     \b
     Example usage:
-        flexsweep polarize --maf primates_CM000663.2.maf.gz --vcf yri_CM000663.2.vcf.gz --outgroups specie1,specie2,specie3 --method kimura
+        flexsweep polarize --maf 447.primates_chr22.maf.gz --vcf yri_chr22.vcf.gz --outgroups Pan_troglodytes,Gorilla_gorilla,Pongo_abelii --method kimura
 
     """
 
@@ -1492,7 +1506,7 @@ def polarize(maf, vcf, outgroups, method, nrandom):
     "--contig",
     type=str,
     required=True,
-    help="Reference contig to extract, e.g: CM000663.2. Must match the VCF's contig name.",
+    help="Reference contig to extract, e.g: chr22. Must match the VCF's contig name.",
 )
 @click.option(
     "--outdir",
@@ -1531,12 +1545,12 @@ def split_maf(maf, contig, outdir, sort, tmp_dir, chunk_bytes):
 
     \b
     The VCF side is a standard bcftools job, so flexsweep does not duplicate it:
-        bcftools view -r CM000663.2 all.vcf.gz -Oz -o yri_CM000663.2.vcf.gz
-        tabix -p vcf yri_CM000663.2.vcf.gz
+        bcftools view -r chr22 all.vcf.gz -Oz -o yri_chr22.vcf.gz
+        tabix -p vcf yri_chr22.vcf.gz
 
     \b
     Example usage:
-        flexsweep split-maf --maf primates.maf.gz --contig CM000663.2
+        flexsweep split-maf --maf 447.primates.maf.gz --contig chr22
     """
 
     import flexsweep as fs
@@ -1638,8 +1652,9 @@ def split_maf(maf, contig, outdir, sort, tmp_dir, chunk_bytes):
     "--recombination_map",
     type=str,
     default=None,
-    help="TSV recombination map (chr, start, end, cm_mb, cm). "
-    "Enables genetic-distance windows and joint DAF+recomb normalization.",
+    required=False,
+    callback=_resolve_map_option,
+    help=MAP_HELP,
 )
 @click.option(
     "--n_daf_bins",
@@ -1712,6 +1727,23 @@ def split_maf(maf, contig, outdir, sort, tmp_dir, chunk_bytes):
     help="Focal window size in bp for T3 per-SNP stats (dind, hapdaf_o, "
     "hapdaf_s, s_ratio, high_freq, low_freq).",
 )
+@click.option(
+    "--r_bins",
+    type=str,
+    default=None,
+    help=(
+        "Comma-separated recombination-rate bin edges (cM/Mb) for joint DAF x recombination "
+        "normalization of per-SNP stats; requires --recombination_map. Compute them with "
+        "'flexsweep recombination-bins'. Default: DAF-only normalization."
+    ),
+)
+@click.option(
+    "--min_rate",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Drop windows below this recombination rate (cM/Mb) when --r_bins is set.",
+)
 def scan(
     vcf_path,
     out_prefix,
@@ -1730,6 +1762,8 @@ def scan(
     w_size_bp,
     step_bp,
     window_size,
+    r_bins,
+    min_rate,
 ):
     """Standalone outlier scan from a directory of per-chromosome VCF files.
 
@@ -1751,12 +1785,15 @@ def scan(
 
     \b
     Examples:
-        flexsweep scan --vcf_path vcf_folder/ --out YRI --stats ihs,nsl
-        flexsweep scan --vcf_path vcf_folder/ --out YRI --stats ihs,nsl,h12,lassip --nthreads 8
-        flexsweep scan --vcf_path vcf_folder/ --out YRI \\
+        flexsweep scan --vcf_path vcf_folder/ --out_prefix YRI --stats ihs,nsl
+        flexsweep scan --vcf_path vcf_folder/ --out_prefix YRI --stats ihs,nsl,h12,lassip --nthreads 8
+        flexsweep scan --vcf_path vcf_folder/ --out_prefix YRI \\
             --stats dind,hapdaf_o,hapdaf_s --window_size 100000
     """
     from flexsweep.scan import scan as _scan
+
+    if r_bins is not None and recombination_map is None:
+        raise click.UsageError("--r_bins requires --recombination_map.")
 
     stat_list = [s.strip() for s in stats.split(",")]
     _scan(
@@ -1770,6 +1807,8 @@ def scan(
         min_maf=min_maf,
         recombination_map=recombination_map,
         n_daf_bins=n_daf_bins,
+        r_bins=parse_float_list(r_bins),
+        min_rate=min_rate,
         nthreads=nthreads,
         window_mode=window_mode,
         config={
@@ -1790,6 +1829,232 @@ def scan(
     )
 
 
+EXAMPLE_STEPS = ("data", "simulate", "fvs-sims", "fvs-vcf", "cnn", "scan")
+
+
+@cli.command("example")
+@click.option(
+    "--output_folder", type=str, required=True, help="Folder for every output of the example."
+)
+@click.option(
+    "--nthreads", type=int, required=True, help="Threads for every step (e.g. 24)."
+)
+@click.option(
+    "--full",
+    is_flag=True,
+    default=False,
+    help="Whole chr22 instead of chr22:20-25 Mb.",
+)
+@click.option(
+    "--num_simulations",
+    type=int,
+    default=1000,
+    show_default=True,
+    help="Neutral and sweep replicates (each) for the CNN training set.",
+)
+@click.option(
+    "--seed", type=int, default=1, show_default=True, help="Seed for the sample draw, simulations and CNN."
+)
+@click.option(
+    "--steps",
+    type=str,
+    default=",".join(EXAMPLE_STEPS),
+    show_default=True,
+    help="Comma-separated subset of steps to run, in this order.",
+)
+@click.option(
+    "--overwrite", is_flag=True, default=False, help="Rerun steps already finished."
+)
+@click.pass_context
+def example(ctx, output_folder, nthreads, full, num_simulations, seed, steps, overwrite):
+    """
+    Run the full example on 50 YRI: data, simulations, feature vectors, CNN and scan.
+
+    \b
+    Steps (all by default; on rerun, a step is skipped if it finished and its
+    outputs still exist; rerunning a step also reruns the steps that use it):
+      data      download the Zenodo record (YRI chr22 VCF, great-ape MAF, GIAB
+                difficult regions), draw 50 YRI, polarize and mask chr22:20-25 Mb
+                (--full: whole chr22)                            -> data/vcfs/
+      simulate  YRI neutral and sweep replicates with discoal    -> sims/
+      fvs-sims  feature vectors of the simulations               -> sims/fvs.parquet
+      fvs-vcf   feature vectors of the VCF (deCODE map)          -> data/vcfs/fvs_yri.parquet
+      cnn       train the CNN on the simulations, predict the VCF -> cnn/
+      scan      iHS, nSL, H12 and RAiSD outlier scan and plots   -> scan/
+    Wall-clock time per step is printed and appended to timings.tsv.
+
+    \b
+    Example usage:
+        flexsweep example --output_folder yri_example --nthreads 24
+        flexsweep example --output_folder yri_chr22 --nthreads 24 --full
+    """
+    import time
+
+    from flexsweep.example import EXAMPLE_N_SAMPLES, fetch_example
+    from flexsweep.simulate_discoal import resolve_demes, resolve_recombination_map
+
+    todo = [s.strip() for s in steps.split(",") if s.strip()]
+    unknown = sorted(set(todo) - set(EXAMPLE_STEPS))
+    if unknown:
+        raise click.BadParameter(
+            f"unknown step(s) {unknown}; choose from {','.join(EXAMPLE_STEPS)}",
+            param_hint="--steps",
+        )
+    todo = [s for s in EXAMPLE_STEPS if s in todo]
+
+    out = os.path.abspath(output_folder)
+    data_dir, vcf_dir = os.path.join(out, "data"), os.path.join(out, "data", "vcfs")
+    sims_dir, cnn_dir = os.path.join(out, "sims"), os.path.join(out, "cnn")
+    scan_prefix = os.path.join(out, "scan", "yri")
+    done_dir = os.path.join(out, ".done")
+    os.makedirs(done_dir, exist_ok=True)
+
+    # A folder holds one region: refuse to mix 5 Mb and whole-chr22 outputs
+    mode = "chr22" if full else "chr22_20_25Mb"
+    mode_file = os.path.join(out, "mode.txt")
+    if os.path.exists(mode_file):
+        with open(mode_file) as fh:
+            prev = fh.read().strip()
+        if prev != mode and not overwrite:
+            raise click.UsageError(
+                f"{out} holds the {prev} example; use another --output_folder or --overwrite."
+            )
+        if prev != mode:  # --overwrite to another region: earlier steps are stale
+            for f in os.listdir(done_dir):
+                os.remove(os.path.join(done_dir, f))
+    with open(mode_file, "w") as fh:
+        fh.write(mode + "\n")
+
+    def run_data():
+        fetch_example(data_dir, full=full, seed=seed, overwrite=overwrite)
+
+    def run_simulate():
+        ctx.invoke(
+            simulator,
+            sample_size=2 * EXAMPLE_N_SAMPLES,
+            demes=resolve_demes("yri"),
+            output_folder=sims_dir,
+            num_simulations=num_simulations,
+            nthreads=nthreads,
+            seed=seed,
+        )
+
+    def run_fvs_sims():
+        ctx.invoke(fvs_discoal, simulations_path=sims_dir, nthreads=nthreads)
+
+    def run_fvs_vcf():
+        ctx.invoke(
+            fvs_vcf,
+            vcf_path=vcf_dir,
+            recombination_map=resolve_recombination_map("decode"),
+            suffix="yri",
+            nthreads=nthreads,
+        )
+
+    def run_cnn():
+        ctx.invoke(
+            cnn,
+            train_data=os.path.join(sims_dir, "fvs.parquet"),
+            predict_data=os.path.join(vcf_dir, "fvs_yri.parquet"),
+            output_folder=cnn_dir,
+            seed=seed,
+        )
+
+    def run_scan():
+        stats = ("ihs", "nsl", "h12", "raisd")
+        os.makedirs(os.path.dirname(scan_prefix), exist_ok=True)
+        ctx.invoke(
+            scan,
+            vcf_path=vcf_dir,
+            out_prefix=scan_prefix,
+            stats=",".join(stats),
+            nthreads=nthreads,
+        )
+        # Outlier plots: values with the top 1% highlighted, and -log10 empirical p-values
+        # (SVG keeps text editable; PNG for viewers that draw no SVG text)
+        files = tuple(f"{scan_prefix}.{s}.txt" for s in stats)
+        for ext in ("svg", "png"):
+            ctx.invoke(
+                scan_plot, stat_files=files, multi=True, out_file=f"{scan_prefix}.scan.{ext}"
+            )
+            ctx.invoke(
+                scan_plot,
+                stat_files=files,
+                multi=True,
+                pvalue=True,
+                out_file=f"{scan_prefix}.scan_pvalue.{ext}",
+            )
+
+    runners = {
+        "data": run_data,
+        "simulate": run_simulate,
+        "fvs-sims": run_fvs_sims,
+        "fvs-vcf": run_fvs_vcf,
+        "cnn": run_cnn,
+        "scan": run_scan,
+    }
+    # A step is done when it finished (marker) and its outputs still exist
+    outputs = {
+        "data": [os.path.join(vcf_dir, "yri_chr22_example.vcf.gz.tbi")],
+        "simulate": [os.path.join(sims_dir, "params.txt.gz")],
+        "fvs-sims": [os.path.join(sims_dir, "fvs.parquet")],
+        "fvs-vcf": [os.path.join(vcf_dir, "fvs_yri.parquet")],
+        "cnn": [os.path.join(cnn_dir, "yri_predictions.txt")],
+        "scan": [f"{scan_prefix}.scan{k}.{e}" for k in ("", "_pvalue") for e in ("svg", "png")],
+    }
+    # Steps that read a step's outputs; rerunning a step makes them stale
+    users = {
+        "data": ["fvs-vcf", "scan"],
+        "simulate": ["fvs-sims"],
+        "fvs-sims": ["cnn"],
+        "fvs-vcf": ["cnn"],
+        "cnn": [],
+        "scan": [],
+    }
+
+    def is_done(step):
+        marker = os.path.join(done_dir, step)
+        return os.path.exists(marker) and all(os.path.exists(f) for f in outputs[step])
+
+    def invalidate(step):
+        for u in users[step]:
+            marker = os.path.join(done_dir, u)
+            if os.path.exists(marker):
+                os.remove(marker)
+            invalidate(u)
+
+    n = len(EXAMPLE_STEPS)
+    timings = []
+    for step in todo:
+        i = EXAMPLE_STEPS.index(step) + 1
+        if is_done(step) and not overwrite:
+            click.secho(f"[{i}/{n}] {step}: already done, skipping", fg="cyan")
+            continue
+        click.secho(f"[{i}/{n}] {step} ...", fg="cyan", bold=True)
+        invalidate(step)
+        t0 = time.perf_counter()
+        runners[step]()
+        dt = time.perf_counter() - t0
+        open(os.path.join(done_dir, step), "w").close()
+        timings.append((step, dt))
+        click.secho(f"[{i}/{n}] {step} done in {dt / 60:.1f} min", fg="green")
+
+    if timings:
+        tsv = os.path.join(out, "timings.tsv")
+        new = not os.path.exists(tsv)
+        with open(tsv, "a") as fh:
+            if new:
+                fh.write("step\tseconds\tregion\tnthreads\tnum_simulations\tseed\n")
+            for step, dt in timings:
+                fh.write(f"{step}\t{dt:.1f}\t{mode}\t{nthreads}\t{num_simulations}\t{seed}\n")
+        total = sum(dt for _, dt in timings)
+        click.secho(f"Finished {len(timings)} step(s) in {total / 60:.1f} min ({tsv})", bold=True)
+    click.echo(
+        f"Predictions: {cnn_dir}/  Scan: {os.path.dirname(scan_prefix)}/  "
+        f"VCF: {vcf_dir}/"
+    )
+
+
 @cli.command("scan-plot")
 @click.option(
     "--stat",
@@ -1797,60 +2062,98 @@ def scan(
     type=str,
     multiple=True,
     required=True,
-    help="Path(s) to scan output file(s). Repeat for multiple stats.",
+    help="Scan output file ({prefix}.{stat}.txt). Repeat for several stats.",
 )
 @click.option(
     "--col",
     "stat_cols",
     type=str,
     multiple=True,
-    required=True,
-    help="Column name(s) to plot, matching order of --stat.",
-)
-@click.option(
-    "--pvalue",
-    is_flag=True,
-    default=False,
-    help="Plot the {col}_rank column instead of raw values.",
-)
-@click.option(
-    "--top_pct",
-    type=float,
-    default=0.01,
-    show_default=True,
-    help="Fraction of top-ranked points to highlight (default 0.01 = 1%).",
+    help="Column to plot per --stat, in the same order. Default: the stat's rank "
+    "column, inferred from the file name (e.g. yri.raisd.txt -> mu_total).",
 )
 @click.option(
     "--multi",
     is_flag=True,
     default=False,
-    help="Stacked multi-stat plot with shared x-axis.",
+    help="Stack all stats in one figure. Default: one figure per stat.",
+)
+@click.option(
+    "--split_chr",
+    is_flag=True,
+    default=False,
+    help="One figure per chromosome. Default: all chromosomes in one figure, "
+    "separated by dashed lines.",
+)
+@click.option(
+    "--pvalue",
+    is_flag=True,
+    default=False,
+    help="Plot -log10 of the {col}_pvalue column instead of raw values.",
+)
+@click.option(
+    "--top_pct",
+    type=click.FloatRange(0, 0.5, min_open=True, max_open=True),
+    default=0.01,
+    show_default=True,
+    help="Fraction highlighted per tail; signed stats (iHS, nSL, ...) get both tails.",
 )
 @click.option(
     "--out",
     "out_file",
     type=str,
-    default=None,
-    help="Output image path (png/pdf/svg). If omitted, shows interactively.",
+    default="scan_plot.svg",
+    show_default=True,
+    help="Output path; SVG unless the extension says otherwise (.png, .pdf). "
+    "Without --multi, '.{col}' is added per stat; with --split_chr, '.chr{N}' "
+    "per chromosome.",
 )
-def scan_plot(stat_files, stat_cols, pvalue, top_pct, multi, out_file):
+def scan_plot(stat_files, stat_cols, multi, split_chr, pvalue, top_pct, out_file):
     """Visualize outlier scan results.
 
     \b
-    Single stat:
-        flexsweep scan-plot --stat YRI.chr22.lassip.txt --col Lambda
-    Multi-stat stacked tracks:
-        flexsweep scan-plot --stat YRI.chr22.ihs.txt --col ihs \\
-            --stat YRI.chr22.h12.txt --col h12
+    One figure per stat, all chromosomes (scan_plot.ihs.svg, scan_plot.nsl.svg):
+        flexsweep scan-plot --stat yri.ihs.txt --stat yri.nsl.txt
+    All stats stacked in one figure:
+        flexsweep scan-plot --stat yri.ihs.txt --stat yri.nsl.txt --multi
+    Add --split_chr to either for one figure per chromosome (.chr{N}).
     """
+    import os
+
+    from flexsweep.scan import STAT_REGISTRY
     from flexsweep.utils import plot_scan
 
     stat_files = list(stat_files)
-    stat_cols = list(stat_cols)
-    if len(stat_files) != len(stat_cols):
-        raise click.UsageError("Number of --stat and --col arguments must match.")
+    if stat_cols:
+        stat_cols = list(stat_cols)
+        if len(stat_files) != len(stat_cols):
+            raise click.UsageError(
+                "Give one --col per --stat, or omit --col to infer it."
+            )
     else:
-        plot_scan(stat_files, stat_cols, pvalue=pvalue, top_pct=top_pct, out=out_file)
+        stat_cols = []
+        for f in stat_files:
+            parts = os.path.basename(f).split(".")
+            key = parts[-2] if len(parts) >= 3 else None
+            if key not in STAT_REGISTRY:
+                raise click.UsageError(
+                    f"Cannot infer the column for '{f}' (expected "
+                    "{prefix}.{stat}.txt from flexsweep scan); pass --col."
+                )
+            stat_cols.append(STAT_REGISTRY[key].rank_col)
+
+    try:
+        plot_scan(
+            stat_files,
+            stat_cols,
+            pvalue=pvalue,
+            top_pct=top_pct,
+            out=out_file,
+            multi=multi,
+            split_chr=split_chr,
+        )
+    except ValueError as e:
+        raise click.UsageError(str(e))
 
 
 if __name__ == "__main__":
