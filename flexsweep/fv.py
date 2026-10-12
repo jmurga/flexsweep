@@ -1762,7 +1762,7 @@ def run_windows_stat(_tmp_hap, _positions, _ac, _f, window_size=None, iu=None, j
         # k_counts = np.unique(_tmp_hap, axis=1).shape[1]
     except Exception:
         h12_v, h2_h1, h1_v, k_counts = np.nan, np.nan, np.nan, np.nan
-    zns_v, omega_max = Ld(_tmp_hap)
+    zns_v, omega_max, sigd2, sigdz = Ld(_tmp_hap)
 
     (
         _tajima_d,
@@ -1795,7 +1795,7 @@ def run_windows_stat(_tmp_hap, _positions, _ac, _f, window_size=None, iu=None, j
     dist_var, dist_skew, dist_kurtosis = fast_skew_kurt(dists, bias=True)
 
     # Schema order: pi, tajima_d, theta_w, theta_h, k_counts, haf,
-    #               h1, h12, h2_h1, zns, omega_max,
+    #               h1, h12, h2_h1, zns, omega_max, dz
     #               max_fda, dist_var, dist_skew, dist_kurtosis
     return (
         _pi_pb,
@@ -1809,6 +1809,7 @@ def run_windows_stat(_tmp_hap, _positions, _ac, _f, window_size=None, iu=None, j
         h2_h1,
         zns_v,
         omega_max,
+        sigdz,
         max_fda,
         dist_var,
         dist_skew,
@@ -2102,6 +2103,7 @@ _WINDOW_STAT_COLS = [
     "h2_h1",
     "zns",
     "omega_max",
+    "dz",
     "max_fda",
     "dist_var",
     "dist_skew",
@@ -2122,6 +2124,7 @@ WINDOW_STAT_REGISTRY = {
     "h2_h1": ("garud", 1),
     "zns": ("ld", 0),
     "omega_max": ("ld", 1),
+    "dz": ("ld", 2),
     "haf": ("haf", 0),
     "max_fda": ("max_fda", 0),
     "dist_var": ("pairwise", 0),
@@ -3715,6 +3718,7 @@ def normalize_cut_raw(
         "h2_h1",
         "zns",
         "omega_max",
+        "dz",
         "max_fda",
         "dist_var",
         "dist_skew",
@@ -6048,10 +6052,17 @@ def r2(locus_A: np.ndarray, locus_B: np.ndarray) -> float:
     return r_squared
 
 
-def compute_r2_matrix_upper(hap, as_float32=False):
+def compute_r2_matrix_upper(hap, as_float32=False, signed=False):
     """
     r² via pre-scaled BLAS matmul. Avoids the outer-product subtraction step
     of the original compute_r2_matrix_upper, saving one O(S²) allocation.
+
+
+    :param bool signed:
+        If True, return the **full signed** correlation matrix r_ij *before* the
+        in-place square, instead of np.triu(r², k=1). The sign of r carries the
+        sign of D, which squaring destroys; two_locus_moments needs it. The caller
+        is then responsible for squaring (np.square(R, out=R)) if it wants r².
     """
     if not as_float32:
         if hap.dtype != np.float64:
@@ -6069,6 +6080,8 @@ def compute_r2_matrix_upper(hap, as_float32=False):
     std = np.sqrt(v)
     hap_scaled = (hap - p[:, None]) / std[:, None]
     r2 = (hap_scaled @ hap_scaled.T) / N
+    if signed:
+        return r2
     np.square(r2, out=r2)
     return np.triu(r2, k=1)
 
@@ -6173,6 +6186,105 @@ def omega_linear_correct(r2_matrix):
     return zns, omega_max
 
 
+@njit(parallel=False, cache=True)
+def two_locus_moments(r_signed, p, n):
+    """
+    Unbiased Hill-Robertson two-locus moment sums over every SNP pair i < j.
+
+    Computes sum(D), sum(D²), sum(Dz) and sum(pi2) with the finite-sample-unbiased
+    estimators of moments.LD, from the four haplotype counts
+    (c1, c2, c3, c4) = (n_AB, n_Ab, n_aB, n_ab).
+
+    Dz estimates E[D(1-2p)(1-2q)] -- the covariance between linkage disequilibrium
+    and joint allele-frequency skew. The naive plug-in D(1-2p_hat)(1-2q_hat) is NOT
+    usable: its O(1/n) bias is the same size as the neutral signal (Step 4).
+
+    Takes the SIGNED correlation matrix, not r²: D enters Dz to the first power, and
+    squaring destroys the sign that carries it (Step 6). The counts follow as
+
+        c1 = round( n * ( r_ij * sqrt(v_i v_j) + p_i p_j ) ),   v_i = p_i (1 - p_i)
+        c2 = nA - c1     c3 = nB - c1     c4 = n - nA - nB + c1
+
+    :param r_signed: (S, S) SIGNED correlation matrix from
+        compute_r2_matrix_upper(..., signed=True). Only i < j is read.
+    :param p: length-S float64 vector of derived allele frequencies.
+    :param n: number of haplotypes.
+
+    :returns: (sum_D, sum_D2, sum_Dz, sum_pi2, n_pairs, max_round_residual).
+        max_round_residual is the largest distance any recovered count fell from an
+        integer. It must stay well below 0.5 for the recovery to be exact, and is
+        returned so callers can assert on it rather than assume it (Step 11b).
+
+    :notes:
+        Monomorphic sites contribute exactly zero to all four sums (their pi2 is
+        zero), so they are harmless, but they still increment n_pairs.
+        Requires n >= 4; smaller samples return zeros.
+    """
+    S = r_signed.shape[0]
+    if S < 2 or n < 4.0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+    d2 = n * (n - 1.0)
+    d4 = d2 * (n - 2.0) * (n - 3.0)
+
+    # Hoist per-locus quantities out of the O(S²) inner loop.
+    sv = np.empty(S, np.float64)  # sqrt(p(1-p))
+    nc = np.empty(S, np.float64)  # derived allele COUNT, exact integer
+    for i in range(S):
+        p_i = p[i]
+        sv[i] = np.sqrt(p_i * (1.0 - p_i))
+        nc[i] = round(p_i * n)
+
+    sum_D = 0.0
+    sum_D2 = 0.0
+    sum_Dz = 0.0
+    sum_pi2 = 0.0
+    n_pairs = 0.0
+    max_resid = 0.0
+
+    for i in range(S):
+        p_i = p[i]
+        sv_i = sv[i]
+        nA = nc[i]
+        n_minus_nA = n - nA
+        for j in range(i + 1, S):
+            nB = nc[j]
+            raw = n * (r_signed[i, j] * sv_i * sv[j] + p_i * p[j])
+            c1 = round(raw)
+            resid = abs(raw - c1)
+            if resid > max_resid:
+                max_resid = resid
+
+            c2 = nA - c1
+            c3 = nB - c1
+            c4 = n_minus_nA - nB + c1
+            e = c1 * c4 - c2 * c3
+
+            sum_D += e / d2
+
+            sum_D2 += (
+                c1 * (c1 - 1.0) * c4 * (c4 - 1.0)
+                + c2 * (c2 - 1.0) * c3 * (c3 - 1.0)
+                - 2.0 * c1 * c2 * c3 * c4
+            ) / d4
+
+            sum_Dz += (
+                e * (c3 + c4 - c1 - c2) * (c2 + c4 - c1 - c3)
+                + e * (c2 + c3 - c1 - c4)
+                + 2.0 * (c2 * c3 + c1 * c4)
+            ) / d4
+
+            sum_pi2 += (
+                (c1 + c2) * (c3 + c4) * (c1 + c3) * (c2 + c4)
+                - c1 * c4 * (-1.0 + c1 + 3.0 * c2 + 3.0 * c3 + c4)
+                - c2 * c3 * (-1.0 + 3.0 * c1 + c2 + c3 + 3.0 * c4)
+            ) / d4
+
+            n_pairs += 1.0
+
+    return sum_D, sum_D2, sum_Dz, sum_pi2, n_pairs, max_resid
+
+
 def Ld(hap, as_float32=True) -> tuple:
     """
     Compute **Kelly's ZnS** (mean pairwise :math:`r^2`) and **omega\\_max** from an LD matrix.
@@ -6214,6 +6326,38 @@ def Ld(hap, as_float32=True) -> tuple:
 
     # return zns, 0
     return zns, omega_max
+
+
+def Ld(hap, as_float32=True, two_locus=True) -> tuple:
+    """
+    Kelly's ZnS, omega_max, and the normalised two-locus moments sigma_D2 and sigma_Dz.
+
+    :param bool two_locus:
+        Compute sigma_D2 / sigma_Dz. When False they are returned as 0.0, which keeps
+        the tuple positions (and therefore WINDOW_STAT_REGISTRY indices) stable while
+        skipping the extra O(S²) pass.
+
+    :returns: (zns, omega_max, sigd2, sigdz)
+    """
+    if not two_locus:
+        r_2 = compute_r2_matrix_upper(hap, as_float32=as_float32)
+        zns, omega_max = omega_linear_correct(r_2)
+        return zns, omega_max, 0.0, 0.0
+
+    # one matmul, read twice: signed first (for Dz), then squared (for ZnS / omega).
+    R = compute_r2_matrix_upper(hap, as_float32=as_float32, signed=True)
+    p = np.asarray(hap, dtype=np.float64).mean(axis=1)
+    n = float(hap.shape[1])
+
+    sD, sD2, sDz, spi2, npairs, resid = two_locus_moments(R, p, n)
+
+    # convert to r²
+    np.square(R, out=R)
+    zns, omega_max = omega_linear_correct(np.triu(R, k=1))
+
+    sigd2 = sD2 / spi2 if spi2 > 0.0 else 0.0
+    sigdz = sDz / spi2 if spi2 > 0.0 else 0.0
+    return zns, omega_max, sigd2, sigdz
 
 
 ################## Site Frequency Spectrum stats
@@ -8403,7 +8547,8 @@ def mu_stat(hap, snp_positions, window_size=50):
         :func:`get_pattern_ids`
     """
     # Physical span of the full region; used to normalise mu_var across regions
-    D_ln = (snp_positions[-1] + 1) - snp_positions[0]
+    # D_ln = (snp_positions[-1] + 1) - snp_positions[0]
+    D_ln = snp_positions[-1] + 1
     S, n = hap.shape
 
     # Watterson’s harmonic correction: sum(1/k, k=1..n-1); normalises mu_sfs for sample size
