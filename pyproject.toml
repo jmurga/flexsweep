@@ -84,6 +84,12 @@ docs = [
 [dependency-groups]
 dev = [
     "flexsweep[docs]",
+    "pytest>=8",
     "maturin>=1.13.1",
     "ziglang>=0.15.2",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: end-to-end CLI runs (minutes); deselect with -m 'not slow'",
 ]
