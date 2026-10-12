@@ -766,6 +766,11 @@ class CNN:
         one_dim=False,
         preprocess=False,
         show_plot=False,
+        learning_rate=1e-4,
+        batch_size=32,
+        patience=5,
+        min_delta=1e-4,
+        epochs=1000,
     ):
         """
         Train a CNN on flex-sweep tensors with early stopping and checkpoints.
@@ -775,7 +780,7 @@ class CNN:
         _iter : int, default=1
             Tag for output naming (kept for backwards compatibility).
         _stats : list[str] | None
-            Statistic base names. If None, defaults to the 11 flex-sweep stats.
+            Statistic base names. If None, defaults to the 24 flex-sweep stats.
         w : int | list[int] | None
             Window size(s) to select (see :meth:`load_training_data`).
         cnn : callable | None
@@ -785,6 +790,16 @@ class CNN:
         one_dim : bool, default=False
             If True, uses ``(W*C, S)`` inputs (positions x statistics); otherwise
             ``(S, W*C, 1)``.
+        learning_rate : float, default=1e-4
+            Initial learning rate of the cosine-decay-with-restarts schedule.
+        batch_size : int, default=32
+            Mini-batch size for training, validation and test evaluation.
+        patience : int, default=5
+            Epochs without improvement in validation accuracy before stopping.
+        min_delta : float, default=1e-4
+            Minimum increase in validation accuracy counted as an improvement.
+        epochs : int, default=1000
+            Maximum number of epochs (early stopping usually ends training first).
 
         Returns
         -------
@@ -794,10 +809,12 @@ class CNN:
 
         Notes
         -----
-        - Optimizer: Adam with cosine-restarts schedule.
-        - Loss: Binary cross-entropy with label smoothing (0.05).
-        - Early stopping monitors validation AUC (restore best weights).
+        - Optimizer: Adam (AMSGrad) with a cosine-decay-with-restarts schedule.
+        - Loss: binary cross-entropy.
+        - Early stopping monitors validation accuracy (restores best weights).
         - Saves ``model.keras`` to ``output_folder`` if provided.
+        - The hyperparameter arguments let external optimizers (Optuna, KerasTuner)
+          search over training settings; the defaults are the version 1.0 values.
         """
 
         if one_dim:
@@ -858,7 +875,6 @@ class CNN:
 
         # put model together
         input_to_model = tf.keras.Input(X_train.shape[1:])
-        batch_size = 32
 
         # norm = tf.keras.layers.Normalization(axis=(0, 1, 2))
         # augment = tf.keras.Sequential(
@@ -920,7 +936,7 @@ class CNN:
         ]
 
         lr_decayed_fn = tf.keras.optimizers.schedules.CosineDecayRestarts(
-            initial_learning_rate=1e-4, first_decay_steps=300
+            initial_learning_rate=learning_rate, first_decay_steps=300
         )
         opt_adam = tf.keras.optimizers.Adam(
             learning_rate=lr_decayed_fn, epsilon=0.0000001, amsgrad=True
@@ -936,8 +952,8 @@ class CNN:
         earlystop = tf.keras.callbacks.EarlyStopping(
             monitor="val_accuracy",
             # monitor="val_auc",
-            min_delta=0.0001,
-            patience=5,
+            min_delta=min_delta,
+            patience=patience,
             verbose=2,
             mode="max",
             restore_best_weights=True,
@@ -958,26 +974,24 @@ class CNN:
 
         history = model.fit(
             train_dataset,
-            epochs=1000,
+            epochs=epochs,
             validation_data=valid_dataset,
             callbacks=callbacks_list,
         )
 
+        # Datasets are already batched by batch_size; steps must use the same size
         val_score = model.evaluate(
             valid_dataset,
-            batch_size=32,
-            steps=len(Y_valid) // 32,
+            steps=max(1, len(Y_valid) // batch_size),
         )
         test_score = model.evaluate(
             test_dataset,
-            batch_size=32,
-            steps=len(Y_test) // 32,
+            steps=max(1, len(Y_test) // batch_size),
         )
 
         train_score = model.evaluate(
             train_dataset,
-            batch_size=32,
-            steps=len(Y_train) // 32,
+            steps=max(1, len(Y_train) // batch_size),
         )
         self.scores = [val_score, test_score, train_score]
 
@@ -2313,11 +2327,11 @@ class CNN:
                 "classifier_loss": hh["classifier_loss"],
                 "discriminator_loss": hh["discriminator_loss"],
                 "val_classifier_accuracy": hh["val_classifier_masked_binary_accuracy"],
-                "val_discriminator_accuracy": hh[
-                    "val_discriminator_masked_binary_accuracy"
-                ],
                 "val_classifier_loss": hh["val_classifier_loss"],
-                "val_discriminator_loss": hh["val_discriminator_loss"],
+                # No val_discriminator_*: the validation set is held-out SOURCE only and its
+                # discriminator labels are all -1, i.e. masked, so those two metrics reduce
+                # over an empty tensor and come out as nan and 0.0. They were being written
+                # to history_da.txt as if they were measurements.
             }
         )
 
@@ -2361,10 +2375,48 @@ class CNN:
         _stats=None,
         max_lambda=1,
         ramp_epochs=30,
-        tgt_ratio=1,
-        batch_size=128,
-        preprocess=True,
+        # these three used to disagree with the `dann` command (tgt_ratio 1, batch 128,
+        # preprocess True); the command's values are the ones used in the paper
+        tgt_ratio=2.0,
+        batch_size=64,
+        preprocess=False,
+        learning_rate=5e-5,
+        weight_decay=1e-4,
+        patience=20,
+        epochs=1000,
     ):
+        """
+        Train the domain-adaptive CNN (gradient reversal) on labelled source and unlabelled
+        target feature vectors.
+
+        Hyperparameters are arguments so that external optimizers (Optuna, KerasTuner) can
+        search over them; the defaults are the values used in the paper, chosen by manual
+        tuning and KerasTuner runs, and match the defaults of the ``dann`` command.
+
+        Validation, and therefore early stopping, uses a held-out part of the SOURCE data:
+        the target is unlabelled, so no target-domain criterion exists at training time.
+        The discriminator is masked on that validation set, so the history reports
+        validation metrics for the classifier only.
+
+        Parameters
+        ----------
+        max_lambda : float, default=1
+            Maximum gradient-reversal strength reached by the ramp.
+        ramp_epochs : int, default=30
+            Epochs over which the reversal strength ramps from 0 to ``max_lambda``.
+        tgt_ratio : float, default=2.0
+            Target-to-source examples per batch.
+        batch_size : int, default=64
+            Source mini-batch size.
+        learning_rate : float, default=5e-5
+            Initial learning rate of the AdamW cosine-decay-with-restarts schedule.
+        weight_decay : float, default=1e-4
+            AdamW weight decay.
+        patience : int, default=20
+            Early-stopping patience (epochs).
+        epochs : int, default=1000
+            Maximum number of epochs; at least ``ramp_epochs`` are always allowed.
+        """
         tf = self.check_tf()
         if _stats is None:
             _stats = [
@@ -2450,9 +2502,11 @@ class CNN:
         #     'loss_weight_discriminator': 0.5948347312577422}
 
         opt = tf.keras.optimizers.AdamW(
-            learning_rate=tf.keras.optimizers.schedules.CosineDecayRestarts(5e-5, 300),
+            learning_rate=tf.keras.optimizers.schedules.CosineDecayRestarts(
+                learning_rate, 300
+            ),
             # learning_rate=tf.keras.optimizers.schedules.CosineDecayRestarts(1e-3, 300),
-            weight_decay=1e-4,
+            weight_decay=weight_decay,
             # weight_decay=0.0003667748863292507,
             epsilon=1e-7,
             clipnorm=1.0,
@@ -2476,7 +2530,7 @@ class CNN:
             tf.keras.callbacks.EarlyStopping(
                 monitor="val_classifier_masked_binary_accuracy",
                 mode="max",
-                patience=20,
+                patience=patience,
                 min_delta=1e-4,
                 restore_best_weights=True,
             ),
@@ -2493,7 +2547,7 @@ class CNN:
             )
         hist = model.fit(
             data_gen,
-            epochs=max(1000, ramp_epochs),
+            epochs=max(epochs, ramp_epochs),
             # epochs=30,
             steps_per_epoch=len(data_gen),
             validation_data=(
@@ -2516,11 +2570,11 @@ class CNN:
                 "classifier_loss": hh["classifier_loss"],
                 "discriminator_loss": hh["discriminator_loss"],
                 "val_classifier_accuracy": hh["val_classifier_masked_binary_accuracy"],
-                "val_discriminator_accuracy": hh[
-                    "val_discriminator_masked_binary_accuracy"
-                ],
                 "val_classifier_loss": hh["val_classifier_loss"],
-                "val_discriminator_loss": hh["val_discriminator_loss"],
+                # No val_discriminator_*: the validation set is held-out SOURCE only and its
+                # discriminator labels are all -1, i.e. masked, so those two metrics reduce
+                # over an empty tensor and come out as nan and 0.0. They were being written
+                # to history_da.txt as if they were measurements.
             }
         )
 
@@ -2716,11 +2770,11 @@ class CNN:
                 "classifier_loss": hh["classifier_loss"],
                 "discriminator_loss": hh["discriminator_loss"],
                 "val_classifier_accuracy": hh["val_classifier_masked_binary_accuracy"],
-                "val_discriminator_accuracy": hh[
-                    "val_discriminator_masked_binary_accuracy"
-                ],
                 "val_classifier_loss": hh["val_classifier_loss"],
-                "val_discriminator_loss": hh["val_discriminator_loss"],
+                # No val_discriminator_*: the validation set is held-out SOURCE only and its
+                # discriminator labels are all -1, i.e. masked, so those two metrics reduce
+                # over an empty tensor and come out as nan and 0.0. They were being written
+                # to history_da.txt as if they were measurements.
             }
         )
 
@@ -2758,7 +2812,9 @@ class CNN:
         self.prediction = df_pred
         return self.history
 
-    def predict_da(self, _stats=None, preprocess=True, fname=None):
+    # preprocess defaults to False, as in train_da and the `dann` command: the feature
+    # vectors written by fvs-discoal and fvs-vcf are already standardized
+    def predict_da(self, _stats=None, preprocess=False, fname=None):
         """
         Predict sweep probabilities on empirical (target) data using a DA model.
 
