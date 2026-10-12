@@ -15,6 +15,11 @@ Simulation
     :undoc-members:
     :show-inheritance:
 
+.. autofunction:: flexsweep.simulate_discoal.resolve_demes
+.. autofunction:: flexsweep.simulate_discoal.resolve_recombination_map
+.. autodata:: flexsweep.simulate_discoal.POPULATIONS_1KG
+   :no-value:
+
 
 Data I/O
 --------
@@ -23,6 +28,10 @@ Data I/O
     :members:
     :undoc-members:
     :show-inheritance:
+
+.. autofunction:: flexsweep.data.get_contig_from_vcf_filename
+.. autofunction:: flexsweep.data.check_vcf_file
+.. autofunction:: flexsweep.example.fetch_example
 
 
 Feature vectors
@@ -48,6 +57,20 @@ Outlier scan
 .. autofunction:: flexsweep.scan.empirical_pvalues
 
 
+Haplotype matrices
+------------------
+
+.. autofunction:: flexsweep.hap_matrix.haplotype_images
+.. autofunction:: flexsweep.hap_matrix.sort_haplotypes
+.. autofunction:: flexsweep.hap_matrix.encode_alleles
+.. autofunction:: flexsweep.hap_matrix.daf_sorting
+.. autofunction:: flexsweep.hap_matrix.freq_sorting
+.. autofunction:: flexsweep.hap_matrix.corr_sorting
+.. autofunction:: flexsweep.hap_matrix.pcc_column_sort_numba
+.. autofunction:: flexsweep.hap_matrix.haplotype_freq_sorting
+.. autofunction:: flexsweep.hap_matrix.haplotype_freq_sorting_hamming
+
+
 CNN / DANN
 ----------
 
@@ -61,10 +84,10 @@ Enrichment
 ----------
 
 .. autofunction:: flexsweep.enrichment.run_enrichment
+.. autofunction:: flexsweep.enrichment.plot_enrichment
+.. autofunction:: flexsweep.enrichment.count_sweeps_fast
+.. autofunction:: flexsweep.enrichment.estimate_fdr_fast
 .. autofunction:: flexsweep.enrichment.run_bootstrap_nomatchomega
-.. autofunction:: flexsweep.enrichment.estimate_fdr
-.. autofunction:: flexsweep.enrichment.count_sweeps_singlepop
-.. autofunction:: flexsweep.enrichment.count_sweeps_multipop
 
 
 Ancestral polarization
@@ -109,6 +132,8 @@ Visualization
 .. autofunction:: flexsweep.utils.plot_fv_pca
 .. autofunction:: flexsweep.utils.plot_stat_distributions
 .. autofunction:: flexsweep.utils.rank_probabilities
+.. autofunction:: flexsweep.utils.rank_merge
+.. autofunction:: flexsweep.utils.find_prediction_files
 
 
 Population genetics statistics

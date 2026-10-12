@@ -6,9 +6,16 @@ Project (n = 108), which is one of the populations with higher sample size and
 nucleotide diversity. All timing estimates are based on a 24-core AMD Ryzen 9
 PRO 5945 workstation with 64 GB RAM and an NVIDIA RTX 3080.
 
-The full workflow — simulations, feature vector estimation for all 22 YRI
-autosomes, training, and genome-wide prediction — completes in a ~2 hours on
-this configuration.
+.. important::
+
+   This page analyses the ``yri_vcfs/`` folder built in :doc:`data_preparation`:
+   one phased, polarized and masked VCF per autosome for the 108 unrelated YRI
+   (1000GP, GRCh38). Build it first, or follow the same steps for your own data
+   (:ref:`vcf-requirements`).
+
+The full workflow (simulations, feature vector estimation for all 22 YRI autosomes,
+training and genome-wide prediction) completes in about 2 hours on this
+configuration. For a run that finishes in minutes, start with :doc:`quickstart`.
 
 Command line
 ------------
@@ -18,10 +25,11 @@ Command line
     # Simulate 22,000 neutral + 22,000 sweep replicates (~70 min)
     flexsweep simulator \
         --sample_size 216 \
-        --demes yri_spiedel_2019.yaml \
+        --demes yri \
         --output_folder yri_test \
         --nthreads 24 \
-        --num_simulations 220000
+        --num_simulations 22000 \
+        --seed 1
 
 .. code-block:: bash
 
@@ -35,7 +43,7 @@ Command line
     # Estimate feature vectors from VCF (~27 min, 22 autosomes)
     flexsweep fvs-vcf \
         --vcf_path yri_vcfs \
-        --recombination_map decode_sexavg_2019.txt \
+        --recombination_map decode \
         --nthreads 24 \
         --suffix yri
 
@@ -45,7 +53,8 @@ Command line
     flexsweep cnn \
         --train_data yri_test/fvs.parquet \
         --predict_data yri_vcfs/fvs_yri.parquet \
-        --output_folder yri_test
+        --output_folder yri_test \
+        --seed 1
 
 
 Python interface
@@ -56,11 +65,11 @@ Python interface
     import flexsweep as fs
 
     simulator = fs.Simulator(
-        216, fs.DEMES_EXAMPLES['yri'], 'yri_test',
-        num_simulations=int(2.5e5), nthreads=24
+        216, "yri", "yri_test",
+        num_simulations=22000, nthreads=24, seed=1
     )
 
-    # Prior parameters to simulate
+    # Draw per-replicate parameters (mu, r, s, t, start/end frequencies, discoal seeds)
     df_params = simulator.create_params()
 
     # Simulate
@@ -83,6 +92,7 @@ Python interface
         train_data="yri_test/fvs.parquet",
         predict_data="yri_vcfs/fvs_yri.parquet",
         output_folder="yri_vcfs",
+        seed=1,
     )
     fs_cnn.train()
     fs_cnn.predict()
@@ -90,9 +100,17 @@ Python interface
 The training incorporates early stopping to prevent overfitting and converges
 in about 40 epochs for YRI-sized datasets.
 
-The package includes built-in defaults for YRI, CEU, and CHB demographic
-models estimated from `Relate <https://www.nature.com/articles/s41588-019-0484-x>`_,
-as well as the `deCODE recombination map <https://doi.org/10.1126/science.aau1043>`_.
+The package ships the demographic models of all 26 1000 Genomes populations,
+single-population :math:`N_e(t)` trajectories estimated with
+`Relate <https://doi.org/10.1038/s41588-019-0484-x>`_ (``--demes yri``, ``ceu``,
+``chb``, ... or ``constant``; see :ref:`shipped-models`), and the
+sex-averaged `deCODE recombination map <https://doi.org/10.1126/science.aau1043>`_ on
+GRCh38 (``--recombination_map decode``).
+
+``--seed`` makes runs reproducible: the simulator stores per-replicate discoal seeds
+in ``params.txt.gz``, and seeded CPU training gives identical predictions. GPU
+training may still differ slightly between runs because some GPU kernels are
+non-deterministic.
 You can inspect them directly:
 
 .. code-block:: python

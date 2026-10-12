@@ -11,16 +11,32 @@ Second version of `Flex-sweep <https://doi.org/10.1093/molbev/msad139>`_, a vers
 
 .. toctree::
    :maxdepth: 2
-   :caption: Contents:
+   :caption: Getting started
 
    introduction
    installation
+   quickstart
+
+.. toctree::
+   :maxdepth: 2
+   :caption: User guide
+
+   data_preparation
    basic_usage
+   simulation
+   feature_vectors
+   cnn
+   dann
+   haplotype_matrix
    scan
    prediction
    enrichment
    polarize
-   advanced_usage
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Reference
+
    api
 
 
@@ -39,8 +55,3 @@ Support
  * Report issues on `GitHub <https://github.com/jmurga/flexsweep>`_
 
  * Contact: murgamoreno@arizona.edu, denard@arizona.edu
-
-..
-.. API
-
-

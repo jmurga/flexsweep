@@ -2,15 +2,17 @@
 Installation
 ============
 
-Flex-sweep is distributed as a Python package with a Command Line Interface,
-avoiding non-standard input files and the manual installation of external
-dependencies. The `discoal <https://github.com/kr-colab/discoal>`_ binary
-is bundled with the package, and the software compiles it from source on first
-use if no executable binary is found, so no external simulator installation is
-required.
+Flex-sweep is a Python package with a command line interface (CLI). It requires
+Python ``>=3.12,<3.13``; install it into a virtual environment so that the pinned
+dependencies (NumPy 1.26, TensorFlow 2.18) do not clash with other projects. See
+:ref:`requirements` for the hardware used in this documentation.
 
-Flex-sweep requires Python ``>=3.12,<3.13``. We recommend installing it into a
-virtual environment to improve reproducibility.
+No external simulator is needed. The wheel ships a precompiled
+`discoal <https://github.com/kr-colab/discoal>`_ binary for x86-64 Linux. On other
+platforms (macOS, ARM), or if that binary cannot run, Flex-sweep clones discoal and
+compiles it with ``make`` the first time you simulate; this needs ``git``, ``make``
+and a C compiler. See :doc:`simulation` for the lookup order and for using your own
+binary.
 
 pip
 ---
@@ -131,6 +133,7 @@ You can easily test flexsweep by running the CLI in your terminal
       cnn                 Run the Flex-sweep CNN for training or prediction.
       dann                Run the Flex-sweep DANN for training or prediction.
       enrichment          Gene-set sweep enrichment and FDR analysis.
+      example             Run the full example on 50 YRI: data, simulations,...
       fvs-discoal         Estimate summary statistics from discoal...
       fvs-vcf             Estimate summary statistics from VCF files and...
       polarize            Polarize VCF using rust est-sfs refactor.
@@ -147,7 +150,7 @@ You can also try to import the package into your python enviroment
 
     python -c "import flexsweep"
 
-Each command is documented in its own section: :doc:`basic_usage` for the
-simulation, feature-vector and training workflow, :doc:`scan` for the
-standalone outlier scan, :doc:`polarize` for ancestral-state polarization, and
-:doc:`enrichment` for the gene-set enrichment pipeline.
+Start with :doc:`quickstart` for a complete run on a small dataset, then
+:doc:`basic_usage` for the full workflow. Each command has its own page:
+:doc:`simulation`, :doc:`feature_vectors`, :doc:`cnn`, :doc:`dann`, :doc:`scan`,
+:doc:`prediction`, :doc:`enrichment` and :doc:`polarize`.

@@ -13,8 +13,38 @@ Where the outgroup consensus supports the alternate allele as ancestral, REF and
 ALT are swapped in the output VCF and all associated fields (AC, AF, GT) are
 updated accordingly.
 
-The polarization engine is implemented in Rust for performance and is invoked
-via a compiled binary (``flexsweep-polarize``).
+The polarization engine is a refactor of
+`est-sfs <https://doi.org/10.1534/genetics.118.301120>`_ written in Rust and compiled
+into the Python package (``flexsweep.polarize``).
+
+Command line and Python interface
+---------------------------------
+
+.. code-block:: bash
+
+    flexsweep polarize \
+        --maf 447.primates_chr22.maf.gz \
+        --vcf yri_chr22.vcf.gz \
+        --outgroups Pan_troglodytes,Gorilla_gorilla,Pongo_abelii \
+        --method kimura
+
+.. code-block:: python
+
+    import flexsweep as fs
+
+    fs.polarize.polarize(
+        "447.primates_chr22.maf.gz",
+        "yri_chr22.vcf.gz",
+        "Pan_troglodytes,Gorilla_gorilla,Pongo_abelii",
+        method="kimura",
+        nrandom=10,
+        output="yri_chr22.polarized.vcf.gz",
+    )
+
+The MAF is the human-anchored great-ape MAF of the Zoonomia 447-mammal alignment
+(:ref:`Zenodo <example-data-zenodo>`); any reference-anchored MAF works, e.g. a UCSC
+multiz20way file with ``--outgroups panTro4,gorGor3,ponAbe2``. The VCF needs ``AC``,
+``AN`` and ``AF`` for the analysed samples (:ref:`polarize-inputs`).
 
 
 How it works
@@ -24,23 +54,26 @@ The pipeline has two steps:
 
 **Step 1 — Sort the MAF** (if not already sorted by contig/position):
 
-The Rust binary streams the MAF and VCF together in a merge-join. Both files
+Polarization streams the MAF and VCF together in a merge-join. Both files
 must be sorted by the same reference contig order and position. If your MAF is
-unsorted, run ``sort-maf`` first.
+unsorted, run ``flexsweep split-maf --sort`` first.
 
 **Step 2 — Polarize the VCF**:
 
-For each biallelic SNP in the VCF, the binary looks up the aligned column in the
+For each biallelic SNP in the VCF, it looks up the aligned column in the
 MAF for each requested outgroup. The ancestral allele is inferred by one of four
 substitution models and compared to REF/ALT:
 
 - If the inferred ancestral allele matches **REF** → no change.
 - If the inferred ancestral allele matches **ALT** → REF and ALT are swapped;
   AC, AF, and all genotypes are flipped.
-- If the ancestral allele cannot be determined → the site is left unchanged.
+- If the site has no usable alignment → the variant is dropped from the output.
 
-The output is a bgzipped VCF with an ``AA`` INFO field recording the inferred
-ancestral allele.
+The output is a bgzipped VCF in which REF is the inferred ancestral allele, with its
+tabix index (``.tbi``) next to it, so it can be passed directly to ``fvs-vcf`` and
+``scan``. The log
+reports how many variants had a usable alignment, how many were swapped and how many
+were dropped.
 
 
 Polarization methods
@@ -69,29 +102,15 @@ Multiple random starts (``--nrandom``, default 10) are used for model fitting
 to avoid local optima.
 
 
-.. Requirements
-.. ------------
+Requirements
+------------
 
-.. The polarization binary is implemented in Rust. You need either:
+``flexsweep.polarize`` is a compiled Rust extension included in the published wheels,
+so nothing else needs to be installed. Building Flex-sweep from source compiles it and
+needs the Rust toolchain (see :doc:`installation`).
 
-.. - A **bioconda installation** — the binary is included automatically.
-.. - A **manual build** — requires the Rust toolchain (``rustc`` and ``cargo``).
-..   Run the following once before using the polarize commands:
 
-.. .. code-block:: python
-
-..     import flexsweep as fs
-..     fs.build_rust_polarization()
-
-.. The binary is searched in this order:
-
-.. 1. ``FLEXSWEEP_RUST_BIN`` environment variable (explicit path).
-.. 2. ``flexsweep/src/target/release/`` or ``debug/`` (local build).
-.. 3. ``flexsweep-polarize`` or ``polarize`` on the system ``PATH``.
-
-.. If none is found and ``cargo`` is available, the binary is compiled
-.. automatically on first use.
-
+.. _polarize-inputs:
 
 Input files
 -----------
@@ -100,17 +119,69 @@ Input files
 
 A whole-genome alignment anchored to the reference species (the same genome
 used for the VCF). Common sources: UCSC Genome Browser ``multiz`` alignments.
-The file can be plain text or gzipped (``.maf.gz``).
+The file can be plain text or gzipped (``.maf.gz``). For human GRCh38 data the
+per-chromosome files of the UCSC hg38 20-way primate alignment are a practical
+choice (e.g. ``chr22.maf.gz``, 147 MB), whereas the 100-way files are much larger:
+https://hgdownload.soe.ucsc.edu/goldenPath/hg38/multiz20way/maf/
+
+**MAF from a Cactus HAL alignment** (e.g. Zoonomia). For species without a UCSC
+multiz alignment, extract a reference-anchored MAF with ``cactus-hal2maf``,
+keeping only the focal genome and the outgroups you will pass to
+``--outgroups``. For the human analyses we extracted the three great apes from the
+Zoonomia 447-mammal alignment (``447-mammalian-2022v1.hal``), anchored on human
+(GRCh38). This primate MAF, genome-wide and for chr22, is on
+:ref:`Zenodo <example-data-zenodo>`.
+
+.. code-block:: bash
+
+    set -euo pipefail
+    # Genome names as stored in the HAL
+    halStats --genomes 447-mammalian-2022v1.hal
+
+    cactus-hal2maf ./js 447-mammalian-2022v1.hal 447.primates.maf.gz \
+        --refGenome Homo_sapiens \
+        --targetGenomes Pan_troglodytes,Gorilla_gorilla,Pongo_abelii \
+        --noAncestors --onlyOrthologs --filterGapCausingDupes \
+        --chunkSize 100000 \
+        --batchSystem singleMachine --batchCores 240 --maxLocalJobs 240 \
+        --logFile 447.primates.maf.gz.log
+
+    # One sorted MAF per chromosome (writes 447.primates_chr22.maf.gz)
+    flexsweep split-maf --maf 447.primates.maf.gz --contig chr22 --sort
+
+    flexsweep polarize \
+        --maf 447.primates_chr22.maf.gz \
+        --vcf yri_chr22.vcf.gz \
+        --outgroups Pan_troglodytes,Gorilla_gorilla,Pongo_abelii \
+        --method kimura
+
+``--noAncestors`` drops the reconstructed ancestral genomes, ``--onlyOrthologs``
+keeps only sequences orthologous to the reference, and ``--filterGapCausingDupes``
+removes duplicated rows that would open gaps in the reference. Scale
+``--batchCores`` and ``--maxLocalJobs`` to your machine. In this alignment the
+reference rows are named ``Homo_sapiens.chrN``, so ``split-maf --contig chrN``
+matches the VCF contigs directly. Other HAL files name the reference contigs
+differently, e.g. by GenBank accession (``CM000663.2`` is GRCh38 chr1). Check
+with ``zcat file.maf.gz | grep -m1 '^s'``, and if the names differ, rename the
+VCF contigs before polarizing (``bcftools annotate --rename-chrs``) and back
+afterwards.
 
 **VCF**:
 
-A bgzipped, sorted VCF (``*.vcf.gz``) of the focal population. Must be sorted
+A sorted VCF of the focal population, bgzipped (``*.vcf.gz``) or plain (``*.vcf``;
+plain gzip is not read). Must be sorted
 by the same contig order as the MAF reference.
+It must carry ``AC``, ``AN`` and ``AF`` INFO fields computed for the analysed
+samples (e.g. ``bcftools +fill-tags -- -t AC,AN,AF`` after subsetting): the
+ancestral-state model is fitted on these counts, and sites without them are
+treated as AC = AN = 0.
 
 **Outgroups**:
 
-One or more species names as they appear in the MAF ``s`` lines (e.g.
-``panTro4``, ``ponAbe2``, ``gorGor6`` for human data). Multiple outgroups
+One or more assembly names as they appear in the MAF ``s`` lines. In the hg38
+multiz20way alignment the great apes are ``panTro4`` (chimpanzee), ``gorGor3``
+(gorilla) and ``ponAbe2`` (orangutan); in the Zoonomia 447-mammal MAF above they
+are ``Pan_troglodytes``, ``Gorilla_gorilla`` and ``Pongo_abelii``. Multiple outgroups
 improve robustness — the model aggregates information across all specified
 outgroups.
 
@@ -132,41 +203,41 @@ CLI reference
    * - ``--maf PATH``
      - required
      - Input MAF file. Can be gzipped. Must be sorted by contig/position
-       (or pass ``--sort`` to sort it automatically).
+       (use ``flexsweep split-maf --sort`` to extract and sort one contig).
    * - ``--vcf PATH``
      - required
      - Input VCF file. Can be gzipped. Must be sorted by contig/position.
    * - ``--outgroups LIST``
      - required
      - Comma-separated outgroup species names, e.g.
-       ``panTro4,ponAbe2,gorGor6``.
+       ``panTro4,gorGor3,ponAbe2``.
    * - ``--method STR``
      - required
      - Substitution model: ``parsimony``, ``jc``, ``kimura``, or ``r6``.
    * - ``--nrandom INT``
      - 10
      - Number of random starts for model fitting (ignored by ``parsimony``).
-   * - ``--sort BOOL``
-     - False
-     - If True, sort the MAF by contig/position before polarizing.
 
 Examples:
 
 .. code-block:: bash
 
-    # Sort MAF first, then polarize with Kimura model
+    # Per-chromosome multiz20way MAF (already in hg38 position order)
+    wget https://hgdownload.soe.ucsc.edu/goldenPath/hg38/multiz20way/maf/chr22.maf.gz
     flexsweep polarize \
-        --maf hg38.multiz100way.maf.gz \
+        --maf chr22.maf.gz \
         --vcf YRI.chr22.vcf.gz \
-        --outgroups panTro4,ponAbe2,gorGor6 \
-        --method kimura \
-        --sort True
+        --outgroups panTro4,gorGor3,ponAbe2 \
+        --method kimura
+
+    # A whole-genome MAF must first be split by contig and sorted
+    flexsweep split-maf --maf genome.maf.gz --contig chr22 --sort
 
     # Use parsimony with a pre-sorted MAF
     flexsweep polarize \
-        --maf hg38.multiz100way.sorted.maf.gz \
+        --maf chr22.maf.gz \
         --vcf YRI.chr22.vcf.gz \
-        --outgroups panTro4,gorGor6 \
+        --outgroups panTro4,gorGor3 \
         --method parsimony
 
 
@@ -177,17 +248,14 @@ Python API
 
     import flexsweep as fs
 
-    # Build the Rust binary (only needed once)
-    fs.build_rust_polarization()
+    # Optional: sort a MAF by reference contig/position (skip for UCSC per-chromosome files)
+    fs.polarize.maf_sort("genome.maf.gz", "genome.sorted.maf.gz")
 
-    # Step 1: sort MAF (skip if already sorted)
-    sorted_maf = fs.run_sort_maf("hg38.multiz100way.maf.gz")
-
-    # Step 2: polarize
-    output_vcf = fs.run_polarize(
-        maf=sorted_maf,
-        vcf="YRI.chr22.vcf.gz",
-        outgroup=["panTro4", "ponAbe2", "gorGor6"],
+    # Polarize (the Rust extension is compiled when the package is built)
+    fs.polarize.polarize(
+        "chr22.maf.gz",
+        "YRI.chr22.vcf.gz",
+        "panTro4,gorGor3,ponAbe2",
         method="kimura",
         nrandom=10,
         output="YRI.chr22.polarized.vcf.gz",

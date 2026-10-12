@@ -38,10 +38,11 @@ napoleon_google_docstring = True
 napoleon_use_param = False
 napoleon_use_rtype = False
 
-# Only third-party heavy deps belong here. Mocking `flexsweep.cnn` itself would
-# turn every autodoc directive pointing into it (e.g. `flexsweep.cnn.CNN` in
-# api.rst) into an empty stub.
-autodoc_mock_imports = ["tensorflow"]
+# Only heavy or compiled deps that docs/requirements.txt does not install belong
+# here (Read the Docs builds without a Rust toolchain or GPU wheels). Mocking
+# `flexsweep.cnn` itself would turn every autodoc directive pointing into it
+# (e.g. `flexsweep.cnn.CNN` in api.rst) into an empty stub.
+autodoc_mock_imports = ["tensorflow", "flexsweep.polarize", "polars_bio", "ngboost", "tbb"]
 
 templates_path = ["_templates"]
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "cms.rst"]

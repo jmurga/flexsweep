@@ -44,6 +44,29 @@ locus is among the most extreme in the genome for that statistic.
    correspond to a controlled false-positive rate.
 
 
+Command line and Python interface
+---------------------------------
+
+.. code-block:: bash
+
+    flexsweep scan \
+        --vcf_path yri_vcfs \
+        --out_prefix results/yri \
+        --stats ihs,nsl,h12,raisd \
+        --nthreads 8
+
+.. code-block:: python
+
+    from flexsweep.scan import scan
+
+    results = scan("yri_vcfs", "results/yri", stats=["ihs", "nsl", "h12", "raisd"], nthreads=8)
+    results["ihs"]   # Polars DataFrame with an ihs_pvalue column
+
+``--vcf_path`` is a folder of per-chromosome VCFs (:ref:`vcf-requirements`). The scan
+writes one file per statistic, ``results/yri.<stat>.txt``, at the statistic's own
+resolution (:ref:`scan-output`). Options are listed in :ref:`scan-cli`; statistic
+parameters in :ref:`scan-window-mode` and the tables below.
+
 Available statistics
 --------------------
 
@@ -273,17 +296,84 @@ One score per physical window. All configurable via shared ``w_size_bp``
      - NCD1 for balancing selection (`Bitarello et al. 2018 <https://doi.org/10.1093/gbe/evy054>`_). Configurable:
        ``tf`` (0.5), ``w`` (3000), ``minIS`` (2).
 
+.. _scan-window-mode:
+
 Window mode
 ~~~~~~~~~~~
 
-SNP-count windows are required for H12, LASSI, and RAiSD — physical windows
-confound SNP density with haplotype diversity for those statistics. SFS-based statistics (Tajima's D, Fay-Wu H, etc.) use physical
-bp windows by default.
+Window statistics need a definition of "window". Flex-sweep supports two:
 
-With the default ``window_mode="auto"``, each statistic uses its built-in
-mode. Pass ``window_mode="snp"`` or ``window_mode="bp"`` to force a uniform
-mode across all window statistics.
+* **SNP windows** (``snp``): a fixed number of consecutive SNPs, sliding by a fixed
+  number of SNPs. Every window holds the same amount of data, whatever the local SNP
+  density.
+* **Physical windows** (``bp``): a fixed length in base pairs, sliding by a fixed
+  number of base pairs. Every window covers the same stretch of sequence, but the
+  number of SNPs in it varies with mutation rate, diversity and filtering.
 
+In both modes only full windows are scored: windows start at the first SNP and stop
+at the last full window, so no window runs past the last SNP of a chromosome. Each
+window is reported at its centre (``positions``): the middle SNP for SNP windows,
+``start + w_size_bp/2`` for bp windows; RAiSD uses the midpoint of the first and last
+SNP and LASSI/saltiLASSI the median SNP position. A chromosome whose SNPs span less
+than one window gives no rows for that statistic and a warning.
+
+Haplotype statistics (HAF, H12/Garud's H, LASSI, saltiLASSI, RAiSD) use SNP windows.
+Their value depends on how many SNPs define a haplotype: in a physical window, a region
+with few SNPs (low diversity, heavy masking) has fewer distinct haplotypes and higher
+haplotype homozygosity even without selection, so SNP density would be mistaken for a
+sweep signal. Fixing the number of SNPs removes that dependence. Site frequency spectrum
+statistics (Tajima's D, Fay and Wu's H, Zeng's E, Fu and Li's tests, :math:`\pi`,
+:math:`\theta_W`) and the LD statistics :math:`\omega` and :math:`Z_{nS}` use physical
+windows, because they are normalised per site or per window and are compared along a
+fixed physical scale.
+
+Defaults (``window_mode="auto"``):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 12 24 24
+
+   * - Statistics
+     - Mode
+     - Window
+     - Step
+   * - ``haf``, ``lassi``, ``lassip``
+     - snp
+     - 201 SNPs (``--w_size``)
+     - 10 SNPs (``--step``)
+   * - ``h12``, ``garud``
+     - snp
+     - 200 SNPs
+     - 10 SNPs
+   * - ``raisd``
+     - snp
+     - 50 SNPs (``--raisd_window``)
+     - 1 SNP
+   * - ``tajima_d``, ``pi``, ``theta_w``, ``fay_wu_h``, ``zeng_e``, ``achaz_y``,
+       ``fuli_f``, ``fuli_f_star``, ``fuli_d``, ``fuli_d_star``, ``neutrality``
+     - bp
+     - 1 Mb (``--w_size_bp``)
+     - 10 kb (``--step_bp``)
+   * - ``omega``, ``zns``
+     - bp
+     - 100 kb
+     - 10 kb
+   * - ``beta``
+     - bp
+     - 50 kb
+     - 5 kb
+
+``--window_mode snp`` or ``--window_mode bp`` (``window_mode=`` in Python) forces one
+mode on all window statistics, with the window and step taken from ``--w_size`` and
+``--step`` or ``--w_size_bp`` and ``--step_bp``. Per-SNP statistics (iHS, nSL, iSAFE,
+DIND, hapDAF, Sratio, high/low frequency, H-scan) have no window mode; DIND, hapDAF,
+Sratio and the high/low frequency statistics summarise a focal region of
+``--window_size`` bp (50 kb by default) around each SNP.
+
+``stat_params("<key>")`` prints the parameters a statistic accepts.
+
+
+.. _scan-normalization:
 
 Normalization
 -------------
@@ -302,13 +392,38 @@ that would otherwise cause high-frequency SNPs to dominate outlier lists.
    SNPs are left as NaN.
 
 **Joint DAF × recombination rate normalization** (when ``recombination_map``
-and ``n_r_bins`` are both set):
+and ``r_bins`` are both set):
 
 The genome is additionally stratified by recombination rate. Each SNP is
 assigned to a (DAF bin, recomb rate bin) cell and z-scored within that cell.
-This further reduces false positives in low-recombination regions (Johnson et
-al. approach). To enable it, pass both ``recombination_map`` and
-``n_r_bins`` (typically ``n_r_bins=10``):
+Haplotype statistics such as iHS and nSL correlate with the local recombination rate,
+so low-recombination regions would otherwise dominate the outlier tail. Normalising
+within joint allele-frequency and recombination-rate strata follows
+`Johnson and Voight 2018 <https://doi.org/10.1038/s41559-018-0478-6>`_, who normalised
+iHS within 50 derived allele frequency bins x 10 local recombination-rate bins.
+
+To enable it, pass both ``recombination_map`` and ``r_bins``, the recombination-rate
+bin edges in cM/Mb. First compute equal-frequency edges (deciles by default) from your
+own VCFs and map with ``flexsweep recombination-bins``:
+
+.. code-block:: bash
+
+    flexsweep recombination-bins --vcf_path data/vcf/ --recombination_map decode --bins 10
+    # Recombination bins: 0.37,0.55,0.71,0.87,1.05,1.26,1.53,1.88,2.46,6.1
+
+and pass the printed edges to the scan. The edges in these examples are the deCODE
+genome-wide deciles used for the 1000 Genomes analyses; compute your own for other
+data:
+
+.. code-block:: bash
+
+    flexsweep scan \
+        --vcf_path data/vcf/ \
+        --out_prefix results/YRI \
+        --stats ihs,nsl \
+        --recombination_map decode \
+        --r_bins 0.37,0.55,0.71,0.87,1.05,1.26,1.53,1.88,2.46,6.10 \
+        --nthreads 4
 
 .. code-block:: python
 
@@ -316,16 +431,16 @@ al. approach). To enable it, pass both ``recombination_map`` and
         "data/vcf/",
         "results/YRI",
         stats=["ihs", "nsl"],
-        recombination_map="data/decode_sexavg_2019.txt.gz",
+        recombination_map="decode",
         n_daf_bins=50,
-        n_r_bins=10,
+        r_bins=[0.37, 0.55, 0.71, 0.87, 1.05, 1.26, 1.53, 1.88, 2.46, 6.10],
     )
 
 .. note::
 
-   Passing only ``recombination_map`` without ``n_r_bins`` uses DAF-only
+   Passing only ``recombination_map`` without ``r_bins`` uses DAF-only
    normalization with genetic-distance windows for T3 stats (dind, hapdaf,
-   s_ratio). Set ``n_r_bins`` explicitly to enable joint normalization.
+   s_ratio). Set ``r_bins`` explicitly to enable joint normalization.
 
 
 Multi-contig usage
@@ -347,9 +462,11 @@ ensuring p-values reflect the true genome-wide distribution.
         --vcf_path data/vcf/ \
         --out_prefix results/YRI \
         --stats ihs,nsl,h12 \
-        --recombination_map data/decode_sexavg_2019.txt.gz \
+        --recombination_map decode \
         --nthreads 4
 
+
+.. _scan-cli:
 
 CLI reference
 -------------
@@ -404,11 +521,15 @@ CLI reference
    * - ``--n_daf_bins INT``
      - 50
      - Number of equal-frequency DAF bins for normalization.
-   * - ``--n_r_bins INT``
+   * - ``--r_bins LIST``
      - None
-     - Number of recombination rate bins for joint DAF × recomb
-       normalization. Set to 10 to match Johnson et al. Requires
-       ``--recombination_map``.
+     - Comma-separated recombination-rate bin edges (cM/Mb) for joint
+       DAF x recombination-rate normalization (Johnson and Voight 2018 used 10
+       recombination-rate bins). Compute them with ``flexsweep recombination-bins``.
+       Requires ``--recombination_map``.
+   * - ``--min_rate FLOAT``
+     - 0.0
+     - With ``--r_bins``, drop windows below this recombination rate (cM/Mb).
    * - ``--K_truncation INT``
      - 10
      - K truncation for LASSI (number of HFS classes).
@@ -428,13 +549,13 @@ Examples:
 
     # iHS + nSL on a single chromosome
     flexsweep scan \
-        --vcf_path YRI.chr22.vcf.gz \
+        --vcf_path data/vcf/ \
         --out_prefix results/YRI.chr22 \
         --stats ihs,nsl
 
     # H12 + RAiSD with custom SNP window
     flexsweep scan \
-        --vcf_path YRI.chr22.vcf.gz \
+        --vcf_path data/vcf/ \
         --out_prefix results/YRI.chr22 \
         --stats h12,raisd \
         --w_size 400 \
@@ -442,25 +563,26 @@ Examples:
 
     # SFS statistics using physical bp windows
     flexsweep scan \
-        --vcf_path YRI.chr22.vcf.gz \
+        --vcf_path data/vcf/ \
         --out_prefix results/YRI.chr22 \
         --stats tajima_d,fay_wu_h,zeng_e,omega
 
     # DIND + HapDAF with a larger focal window
     flexsweep scan \
-        --vcf_path YRI.chr22.vcf.gz \
+        --vcf_path data/vcf/ \
         --out_prefix results/YRI.chr22 \
         --stats dind,hapdaf_o,hapdaf_s \
         --window_size 100000 \
-        --recombination_map data/decode_sexavg_2019.txt.gz
+        --recombination_map decode
 
-    # Genome-wide scan — joint DAF × recomb normalization
+    # Genome-wide scan with joint DAF x recombination-rate normalization;
+    # r_bins from: flexsweep recombination-bins --vcf_path data/vcf/ --recombination_map decode
     flexsweep scan \
         --vcf_path data/vcf/ \
         --out_prefix results/YRI \
-        --stats ihs,nsl,h12 \
-        --recombination_map data/decode_sexavg_2019.txt.gz \
-        --n_r_bins 10 \
+        --stats ihs,nsl,h12,raisd \
+        --recombination_map decode \
+        --r_bins 0.37,0.55,0.71,0.87,1.05,1.26,1.53,1.88,2.46,6.10 \
         --nthreads 4
 
 
@@ -479,11 +601,9 @@ Python API
 
     # Inspect a single stat — shows rank_col, resolution, window_mode,
     # default_window, default_step, shared_params, and stat_params
-    stat_params("raisd")
-    # {'raisd': {'rank_col': 'mu_total', 'resolution': 'window',
-    #            'window_mode': 'snp', 'default_window': '50 SNPs',
-    #            'default_step': '10 SNPs',
-    #            'stat_params': {'window_size': 50}, ...}}
+    stat_params("h12")
+    # {'h12': {'rank_col': 'h12', 'resolution': 'window', 'window_mode': 'snp',
+    #          'default_window': '200 SNPs', 'default_step': '10 SNPs', ...}}
 
     stat_params("hscan")
     # {'hscan': {'rank_col': 'hscan', 'resolution': 'snp',
@@ -495,22 +615,23 @@ Python API
     results = scan(
         "data/vcf/",
         "results/YRI",
-        stats=["ihs", "nsl", "h12"],
+        stats=["ihs", "nsl", "h12", "raisd"],
         min_maf=0.05,
-        recombination_map="data/decode_sexavg_2019.txt.gz",
+        recombination_map="decode",
         nthreads=4,
     )
     # results["ihs"]   → Polars DataFrame, SNP resolution, ihs_pvalue column
     # results["raisd"] → Polars DataFrame, window resolution, mu_total_pvalue column
 
-    # Joint DAF × recomb normalization
+    # Joint DAF x recombination-rate normalization; r_bins computed beforehand
+    # with `flexsweep recombination-bins` on the same VCFs and map
     results = scan(
         "data/vcf/",
         "results/YRI",
         stats=["ihs", "nsl"],
-        recombination_map="data/decode_sexavg_2019.txt.gz",
+        recombination_map="decode",
         n_daf_bins=50,
-        n_r_bins=10,
+        r_bins=[0.37, 0.55, 0.71, 0.87, 1.05, 1.26, 1.53, 1.88, 2.46, 6.10],
         nthreads=4,
     )
 
@@ -527,6 +648,8 @@ Python API
     )
 
 
+.. _scan-output:
+
 Output format
 -------------
 
@@ -538,9 +661,9 @@ Each statistic writes one tab-separated file ``{out_prefix}.{stat}.txt``:
 
    * - Column
      - Description
-   * - ``chrom``
-     - Chromosome/contig name from VCF.
-   * - ``pos``
+   * - ``chr``
+     - Chromosome, written as ``chr<N>`` for every statistic.
+   * - ``positions``
      - Genomic position (bp). SNP stats: SNP position. Window stats: centre
        of window.
    * - ``daf``
@@ -562,8 +685,55 @@ lassi, ``mu_var``, ``mu_sfs``, ``mu_ld`` for raisd).
 Scan results visualization
 ---------------------------
 
-Use ``plot_scan`` from ``flexsweep.utils`` to generate Manhattan-style or
-regional zoom plots directly from ``scan()`` output or saved TSV files.
+From the command line, ``flexsweep scan-plot`` plots scan output files. Two
+independent flags choose the figures; with ``--out x.svg``:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 40 30
+
+   * - Flags
+     - Figures
+     - Files
+   * - (none)
+     - one per statistic, all chromosomes
+     - ``x.<col>.svg``
+   * - ``--split_chr``
+     - one per statistic and chromosome
+     - ``x.<col>.chr<N>.svg``
+   * - ``--multi``
+     - all statistics stacked, all chromosomes
+     - ``x.svg``
+   * - ``--multi --split_chr``
+     - all statistics stacked, one per chromosome
+     - ``x.chr<N>.svg``
+
+The ``<col>`` and ``chr<N>`` parts are added only when there is more than one
+statistic or chromosome. Chromosomes sharing a figure are separated by dashed
+lines; the x-axis shows position in Mb within each chromosome.
+
+.. code-block:: bash
+
+    # iHS and nSL stacked, one figure per chromosome
+    flexsweep scan-plot --stat results/YRI.ihs.txt --stat results/YRI.nsl.txt \
+        --multi --split_chr --out results/YRI.svg
+
+``--col`` defaults to the statistic's rank column, inferred from the
+``{prefix}.{stat}.txt`` file name. ``--out`` defaults to ``scan_plot.svg``; a
+``.png`` or ``.pdf`` extension selects that format. SVG output keeps text as
+editable text and draws points as vectors; a panel with more than 200,000 points
+(e.g. genome-wide iHS) embeds its background points as a 300 dpi image to keep the
+file small, while outliers, lines and labels stay vector.
+
+All panels and all figures of one call share the same x scale: per-SNP statistics
+and window statistics (plotted at window centres, see `Window mode`_) are placed on
+one bp axis, so ``yri.ihs.svg`` and ``yri.raisd.svg`` line up. ``--pvalue`` plots
+:math:`-\log_{10}(p_{\mathrm{emp}})` and fails if the file has no
+``{col}_pvalue`` column.
+
+In Python, ``plot_scan`` from ``flexsweep.utils`` takes the same choices
+(``multi``, ``split_chr``) and also draws regional zoom plots, directly from
+``scan()`` output or saved TSV files.
 
 **Genome-wide plot:**
 
@@ -576,29 +746,35 @@ regional zoom plots directly from ``scan()`` output or saved TSV files.
     # No need to specify stat_cols.
 
     # Single statistic — raw values, top 1% highlighted
-    plot_scan({"ihs": results["ihs"]}, out="results/YRI.ihs.png")
+    plot_scan({"ihs": results["ihs"]}, out="results/YRI.ihs.svg")
 
     # Single statistic — empirical p-values (-log10 scale)
-    plot_scan({"ihs": results["ihs"]}, pvalue=True, out="results/YRI.ihs.png")
+    plot_scan({"ihs": results["ihs"]}, pvalue=True, out="results/YRI.ihs.svg")
 
     # Stacked multi-statistic panels — rank columns resolved automatically
     plot_scan(
         {k: results[k] for k in ["ihs", "h12", "raisd"]},
         pvalue=True,
-        out="results/YRI.multi.png",
+        multi=True,
+        out="results/YRI.multi.svg",
     )
     # Plots: ihs, h12, mu_total (raisd)
 
-**Regional zoom plot** (raw + p-value side by side):
+    # Several chromosomes: one figure (dashed separators, default) or one per chromosome
+    plot_scan({"ihs": results["ihs"]}, split_chr=True, out="results/YRI.ihs.svg")
+    # -> results/YRI.ihs.chr1.svg, results/YRI.ihs.chr2.svg, ...
+
+**Regional zoom plot:**
 
 .. code-block:: python
 
     plot_scan(
         {k: results[k] for k in ["ihs", "raisd"]},
+        multi=True,
         chrom="22",
         center=17_000_000,
         window_bp=500_000,
-        out="results/YRI.zoom.png",
+        out="results/YRI.zoom.svg",
     )
 
 **From saved TSV files** (stat_cols must be provided explicitly):
@@ -609,7 +785,8 @@ regional zoom plots directly from ``scan()`` output or saved TSV files.
         ["results/YRI.ihs.txt", "results/YRI.raisd.txt"],
         stat_cols=["ihs", "mu_total"],   # must match column name in file
         pvalue=True,
-        out="results/YRI.multi.png",
+        multi=True,
+        out="results/YRI.multi.svg",
     )
 
 ``plot_scan`` parameters:
@@ -635,7 +812,10 @@ regional zoom plots directly from ``scan()`` output or saved TSV files.
        outliers highlighted.
    * - ``top_pct``
      - 0.01
-     - Fraction of loci highlighted as outliers in raw mode.
+     - Fraction of loci highlighted per tail in raw mode. Statistics with any
+       negative value (e.g. iHS, nSL, Tajima's D, Fay-Wu H) get the upper and
+       the lower tail; non-negative statistics only the upper one. Tails are
+       computed genome-wide, also in zoom and ``split_chr`` plots.
    * - ``chrom``
      - None
      - Chromosome for zoom mode. Provide together with ``center``.
@@ -645,9 +825,19 @@ regional zoom plots directly from ``scan()`` output or saved TSV files.
    * - ``window_bp``
      - 500000
      - Half-window in bp for zoom mode (±500 kb around ``center``).
+   * - ``multi``
+     - False
+     - Stack all statistics in one figure. False gives one figure per
+       statistic, saved as ``{stem}.<col>{ext}``.
+   * - ``split_chr``
+     - False
+     - One figure per chromosome, saved as ``{stem}.chr<N>{ext}``. By default all
+       chromosomes share one figure, separated by dashed vertical lines, with
+       Mb ticks within each chromosome.
    * - ``out``
      - None
-     - Save path. If None, shows interactively.
+     - Save path. SVG by default (a path without extension gets ``.svg``);
+       ``.png``/``.pdf`` select that format. If None, shows interactively.
    * - ``figsize``
      - None
      - Figure size tuple. Defaults to (14, 4) genome-wide, (10, 2.5×n) zoom.

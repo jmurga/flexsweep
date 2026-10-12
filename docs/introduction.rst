@@ -11,8 +11,8 @@ particularly useful for non-model species.
 
 Flex-sweep 2.0 is a more general-purpose update that streamlines the workflow,
 vastly speeds up summary-statistic computation, relaxes CNN constraints by
-supporting custom architectures, and enables ancestral-state polarization, while
-being highly customizable and robust to model mis-specification. Flex-sweep now
+supporting custom architectures, enables ancestral-state polarization, and adds
+domain-adaptive training to reduce the effect of simulation mismatch. Flex-sweep now
 scales to thousands of simulated training scenarios and enables genome-wide
 inference on a standard workstation rather than an HPC.
 
@@ -28,12 +28,13 @@ Pipeline overview
 Simulations
 ~~~~~~~~~~~
 
-The simulations module takes advantage of `demes <https://doi.org/10.1093/genetics/iyac131>`_
-to simulate custom demography histories. The software includes a pre-compiled
-`discoal <https://github.com/kr-colab/discoal>`_ binary to avoid external
-dependencies (a custom binary path can be provided if needed). Prior parameters
-are flexible across different distribution configurations and can be set via
-the Python API or CLI without manually editing custom input files.
+The simulations module reads demographic histories in
+`demes <https://doi.org/10.1093/genetics/iyac131>`_ format and ships the
+:math:`N_e(t)` trajectories of the 26 1000 Genomes populations. It includes a
+precompiled `discoal <https://github.com/kr-colab/discoal>`_ binary, so no external
+simulator is needed (a custom binary path can be given). Every replicate draws its
+mutation rate, recombination rate, selection coefficient, sweep age and start and end
+allele frequencies from ranges set on the command line or in Python. See :doc:`simulation`.
 
 Feature vector estimation
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -53,7 +54,7 @@ are interpolated automatically.
 The refactored version includes optimised implementations of iSAFE, DIND,
 hapDAF-o/s, Sratio, highfreq, lowfreq, as well as the custom HAF and H12
 statistics from the original Flex-sweep paper. Additional statistics have been
-added (see :doc:`advanced_usage` for the full list).
+added (see :doc:`feature_vectors` for the full list).
 
 Users can select any custom combination of the available statistics via the
 ``stats=`` argument, choosing only those most informative for the organism and
@@ -66,13 +67,53 @@ vector without writing custom code.
 Normalization
 ~~~~~~~~~~~~~
 
+Before training or prediction, Flex-sweep converts every
+statistic to a z-score, so that each value measures how unusual it is
+relative to a reference distribution:
+
+.. math::
+
+   z_i = \frac{x_i - \mu}{\sigma}
+
+where :math:`x_i` is the value of a statistic, and :math:`\mu` and
+:math:`\sigma` are the mean and standard deviation of the reference set it is
+compared with. The reference depends on the input:
+
+* **Simulations**: :math:`\mu` and :math:`\sigma` are estimated from the
+  **neutral** replicates only and applied to neutral and sweep replicates
+  alike, so a sweep appears as a departure from neutral expectations.
+* **VCFs**: :math:`\mu` and :math:`\sigma` are estimated from the empirical
+  regions themselves. Each dataset is therefore centred on its own
+  distribution, which removes part of the difference between simulated and
+  real data.
+
+**Per-SNP statistics** (iHS, nSL, DIND, hapDAF, Sratio, ...) are standardized
+within bins of derived allele frequency (DAF), following
+`Voight et al. 2006 <https://doi.org/10.1371/journal.pbio.0040072>`_. A SNP is
+compared only with SNPs of similar frequency, which removes the dependence of
+these statistics on allele frequency:
+
+.. math::
+   z_i^{(f)} = \frac{x_i^{(f)} - \mu^{(f)}}{\sigma^{(f)}}
+
+where :math:`f` is the DAF bin of SNP :math:`i`. The standardized SNP values
+are then summarized in each window of the feature vector.
+
+**Window statistics** (:math:`\pi`, Tajima's D, H12, HAF, ...) are
+standardized within each combination of window size :math:`w` and center
+:math:`c`, so that a value is compared only with values computed over the same
+genomic geometry:
+
+.. math::
+
+   z_i^{(w,c)} = \frac{x_i^{(w,c)} - \mu^{(w,c)}}{\sigma^{(w,c)}}
+
 When a high-quality recombination map is available,
 Flex-sweep normalises both SNP-based and windowed statistic within bins defined by 
 the empirical recombination distribution. For windowed statistic each input is standardized 
 within bins defined by the joint combination of window position, window center,
 and local recombination rate, extending the normalization scheme to explicitly
 account for recombination rate heterogeneity across the genome:
-
 
 .. math::
    Z\text{-score} = \frac{\pi_i^{(w,c,r)} - \mu^{(w,c,r)}}{\sigma^{(w,c,r)}}
@@ -102,63 +143,26 @@ we normalized using the same approach described above.
 Training and prediction
 ~~~~~~~~~~~~~~~~~~~~~~~
 
-Because feature vectors are flexible to any combination of statistics, genomic
-center, and window size, the new API provides an automatic interface for custom
-CNN architectures — supporting both 1D and 2D CNNs. State-of-the-art haplotype
-rearrangement strategies are also available for working with raw haplotype
-matrices (see :doc:`advanced_usage`).
+The CNN input is an image of summary statistics: one row per statistic and one
+column per (window size, center) position. Flex-sweep reads the statistics, windows and
+centers from the column names of the feature-vector file, so a feature vector with any
+combination of them trains without extra settings, and any Keras architecture, 2D or 1D,
+can replace the default network (see :doc:`cnn`). Separately, Flex-sweep can build
+sorted haplotype-matrix images from the same simulations and VCFs, for CNNs that take
+haplotypes rather than summary statistics as input (see :doc:`haplotype_matrix`); these
+images are not part of the Flex-sweep feature vector so it will require advance usage of the API.
 
-Domain-Adaptive Neural Network (DANN)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Domain-adaptive neural network (DANN)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Flex-sweep is now more versatile for analysing non-model organisms where the
-quality or availability of simulated parameters — such as mutation rate,
-recombination rate, and demography — is limited. It extends the method to work
-with the Domain-Adaptive model proposed by
-`Mo, Z. and Siepel, A. 2023 <https://doi.org/10.1371/journal.pgen.1011032>`_.
-The Domain-Adaptive Neural Network trains not only on labelled simulated data
-but also incorporates unlabelled empirical data during training, learning a
-shared representation that is highly predictive for the classification task but
-uninformative about the domain (simulated vs. real). In the case of CNN
-approaches, models trained under unrealistic demography, recombination, or
-mutation landscapes can easily confound sweep prediction due to overfitting of
-artifacts; the DANN is explicitly designed to account for and mitigate this
-mismatch.
-
-.. note::
-
-   When working with extremely out-of-range demographics (e.g. training over
-   constant population sizes) or simulated parameters, domain-adaptive
-   training may still perform worse than the plain CNN.
-
-.. To improve robustness under domain shift, Flex-sweep further stabilizes
-.. adversarial domain adaptation through controlled gradient scheduling and
-.. constrained adversarial strength. Rather than applying a fixed gradient
-.. reversal factor throughout training, the model introduces a time-epoch–dependent
-.. schedule in which the adversarial signal is gradually increased from zero to a
-.. predefined maximum. This allows the model to first learn task-discriminative
-.. features from labelled simulated data before progressively enforcing domain
-.. invariance using unlabelled empirical data. In addition, constraining the
-.. maximum adversarial strength prevents the domain objective from dominating the
-.. optimisation process, preserving features that remain informative for
-.. classification despite being partially domain-specific. Together, this strategy
-.. improves optimisation stability, reduces negative transfer, and promotes
-.. representations that generalise more effectively across mismatched empirical
-.. and simulated genomic distributions.
-
-
-.. figure:: images/sia_da.png
-   :align: center
-   :width: 80%
-   :figclass: extra-space cap-justify
-   :alt: Summary of neural networks, domain adaptation architecture, input data and benchmarking in population genetic inference.
-
-   Figure extracted from `Mo, Z. and Siepel, A. 2023 <https://doi.org/10.1371/journal.pgen.1011032>`_.
-
-   Summary of neural networks, domain adaptation architecture, input data and
-   benchmarking in the context of population genetic inference. Flex-sweep takes
-   the same approach but *Source* and *Target* outputs are feature-vector images
-   instead of genealogies.
+Simulations never match real data exactly: demography, mutation and recombination
+landscapes, and background selection all shift the summary statistics. To reduce the
+effect of this mismatch, Flex-sweep implements the domain-adversarial network of
+`Mo and Siepel 2023 <https://doi.org/10.1371/journal.pgen.1011032>`_. It trains on
+labelled simulations and on unlabelled empirical feature vectors together, and learns
+features that predict sweeps but do not separate simulated from real windows during training. Please not that when the
+training simulations is far from the truth, it can still perform worse than the plain
+CNN (see :doc:`dann`).
 
 Polarization
 ~~~~~~~~~~~~
@@ -175,10 +179,10 @@ pipeline:
 
 These posteriors are used to probabilistically assign ancestral and derived
 states, enabling downstream selection scans that are robust to ancestral
-mis-specification. 
-.. This design is intended to take advantage of large
-.. comparative genomic resources such as the
-.. `Zoonomia Project <https://doi.org/10.1038/s41586-020-2876-6>`_.
+mis-specification. Any reference-anchored MAF works, including alignments
+extracted from large comparative genomic resources such as the
+`Zoonomia Project <https://doi.org/10.1038/s41586-020-2876-6>`_: the example data
+are polarized with the great apes of the Zoonomia 447-mammal Cactus alignment.
 
 Genome-wide outlier scan
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -201,27 +205,31 @@ available. See :doc:`scan` for full documentation.
 Rank and enrichment
 ~~~~~~~~~~~~~~~~~~~
 
-A rank algorithm post-processes sweep probabilities and associates them with
-any genomic element in a BED file, using
-`polars-bio <https://github.com/biodatageeks/polars-bio>`_ to estimate genomic
-distances efficiently. See :doc:`prediction` for usage.
+``flexsweep rank`` assigns sweep probabilities to genomic features. It takes any set
+of genomic elements of interest in a BED file (e.g. genes, enhancers, transcription factors, etc.), computes the
+distance from each element to the predicted windows with
+`polars-bio <https://github.com/biodatageeks/polars-bio>`_, and gives each element the
+highest sweep probability among its *k* nearest windows, so elements can be ranked by
+their sweep signal. See :doc:`prediction` for usage.
 
 To assess whether top-ranked genes or elements are sweep enriched, Flex-sweep implements
 the enrichment pipeline described in `Enard et al. 2020 <https://doi.org/10.1098/rstb.2019.0575>`_ 
 (see :doc:`enrichment` for details).
 
 
+.. _requirements:
+
 Recommended requirements
 ------------------------
 
-Flex-sweep runs now on a standard workstation. The minimum requirements depend
-mainly on the species genome size and sample size. The examples in this
-documentation use the YRI population (n = 108) from the 1000 Genomes Project
-and were run on the following configuration:
+Flex-sweep runs on a standard workstation. Memory and run time depend mainly on the
+number of simulations, the sample size and the genome size. The examples and results
+in this documentation were produced on:
 
-* Pop!_OS 22.04
-* AMD Ryzen 9 PRO 5945 workstation (24 cores)
-* 1 TB M.2 NVMe SSD
-* 64 GB RAM
-* NVIDIA GeForce RTX 3080
+* **Workstation**: AMD Ryzen 9 PRO 5945 (24 threads), 64 GB RAM, NVIDIA GeForce
+  RTX 3080, Pop!_OS 22.04. All models were trained on RTX 3080 GPU.
+* **Local server**: used only to speed up large simulation and feature-vector runs:
+  2 x AMD EPYC 7713 (128 cores, 255 threads), 4 TB RAM.
 
+A GPU is optional: training runs on the CPU, more slowly. A run of the
+:doc:`quickstart` needs neither the server nor a GPU.
