@@ -459,6 +459,7 @@ dependencies = [
  "argmin-math",
  "clap",
  "flate2",
+ "noodles-tabix",
  "noodles-vcf",
  "pyo3",
  "rand",

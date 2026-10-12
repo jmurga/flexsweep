@@ -9,6 +9,7 @@ use clap::Parser;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use maf::{AlignmentBlock, MafError, MafReader};
+use noodles_tabix as tabix;
 use noodles_vcf as vcf;
 use noodles_vcf::variant::io::Write as VcfWrite;
 use noodles_vcf::variant::record::AlternateBases;
@@ -993,6 +994,9 @@ fn run_parsimony(
     let query_time = total_time.elapsed();
     info!("Time to polarize variants: {:?}", query_time);
     report_polarization(flipped_count, written_count, total_variants);
+    writer.get_mut().flush()?;
+    drop(writer);
+    index_polarized(vcf_out);
     Ok(())
 }
 
@@ -1390,8 +1394,70 @@ fn run_model_based(
     let query_time = total_pol_time.elapsed();
     info!("Time to polarize variants: {:?}", query_time);
     report_polarization(flipped_count, written_count, total_variants);
+    writer.get_mut().flush()?;
+    drop(writer);
+    index_polarized(vcf_out);
 
     Ok(())
+}
+
+/// True if `path` ends with `.gz` or `.bgz` (noodles writes BGZF for these).
+fn is_bgzf_path(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("gz" | "bgz")
+    )
+}
+
+/// Path of the tabix index of `vcf_gz`: `<vcf_gz>.tbi`.
+fn tbi_path(vcf_gz: &Path) -> PathBuf {
+    let mut s = vcf_gz.as_os_str().to_owned();
+    s.push(".tbi");
+    PathBuf::from(s)
+}
+
+/// Write `<vcf_gz>.tbi` for a bgzip-compressed, coordinate-sorted VCF.
+fn index_vcf(vcf_gz: &Path) -> io::Result<PathBuf> {
+    let index = vcf::fs::index(vcf_gz)?;
+    let tbi = tbi_path(vcf_gz);
+    tabix::fs::write(&tbi, &index)?;
+    Ok(tbi)
+}
+
+/// Index the polarized output when it is bgzip-compressed. Indexing needs coordinate-sorted
+/// records; polarize keeps the input order, so an unsorted input only yields a warning.
+fn index_polarized(vcf_out: &Path) {
+    if !is_bgzf_path(vcf_out) {
+        return;
+    }
+    match index_vcf(vcf_out) {
+        Ok(tbi) => info!("Indexed {}", tbi.display()),
+        Err(e) => warn!(
+            "Could not index {} ({}). Sort and index it with: \
+             bcftools sort {} -Oz -o sorted.vcf.gz && tabix -p vcf sorted.vcf.gz",
+            vcf_out.display(),
+            e,
+            vcf_out.display()
+        ),
+    }
+}
+
+/// Copy a plain or bgzip-compressed VCF to a bgzip-compressed `output` and write
+/// `<output>.tbi`. Records must be sorted by contig and position.
+fn run_bgzip_index(input: &Path, output: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if !is_bgzf_path(output) {
+        return Err(format!("{}: output must end with .gz or .bgz", output.display()).into());
+    }
+    let mut reader = vcf::io::reader::Builder::default().build_from_path(input)?;
+    let header = reader.read_header()?;
+    let mut writer = vcf::io::writer::Builder::default().build_from_path(output)?;
+    writer.write_header(&header)?;
+    for row in reader.records() {
+        writer.write_record(&header, &row?)?;
+    }
+    writer.get_mut().flush()?;
+    drop(writer);
+    Ok(index_vcf(output)?)
 }
 
 struct BlockRecord {
@@ -2113,6 +2179,20 @@ pub fn maf_split_py(
     run_split_maf(args).map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
+/// Bgzip-compress a VCF and write its tabix index.
+///
+/// :param str input: Input VCF, plain or bgzip-compressed, sorted by contig/pos.
+/// :param str output: Output path ending with .gz; the index is written to output + ".tbi".
+/// :return: Path of the index.
+#[pyfunction]
+#[pyo3(name = "bgzip_index")]
+#[pyo3(signature = (input, output))]
+pub fn bgzip_index_py(input: String, output: String) -> PyResult<String> {
+    run_bgzip_index(Path::new(&input), Path::new(&output))
+        .map(|p| p.to_string_lossy().into_owned())
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+}
+
 #[pyfunction]
 pub fn init_logging() {
     // This initializes the tracing ecosystem
@@ -2143,6 +2223,7 @@ fn polarize(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(maf_split_py, m)?)?;
     m.add_function(wrap_pyfunction!(maf_sort_py, m)?)?;
     m.add_function(wrap_pyfunction!(run_polarize_py, m)?)?;
+    m.add_function(wrap_pyfunction!(bgzip_index_py, m)?)?;
     Ok(())
 
 }
