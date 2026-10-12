@@ -53,12 +53,15 @@ Notes
 
 import glob
 import os
+import re
 import warnings
 from collections import namedtuple
 from math import ceil
 from allel import nsl, windowed_statistic
 
 from . import Parallel, delayed, np, pl
+from .data import Data, check_genome_build
+from .simulate_discoal import resolve_recombination_map
 from .fv import (
     Lambda_statistic_fast,
     LASSI_spectrum_and_Kspectrum,
@@ -76,6 +79,7 @@ from .fv import (
     fuli_f_star,
     garud_h,
     genome_reader,
+    get_cm,
     haf_top,
     hapdaf_from_pairs,
     hscan,
@@ -470,18 +474,21 @@ def _sliding_windows(positions, w_size: int, step: int):
 
 
 def _bp_windows(positions, w_size_bp: int, step_bp: int):
-    """Yield (start_idx, end_idx, center_pos) for physical bp sliding windows."""
+    """Yield (start_idx, end_idx, center_pos) for physical bp sliding windows.
+
+    Only full windows ``[start, start + w_size_bp]`` inside the SNP span are
+    emitted, as for SNP-count windows: a window running past the last SNP would
+    be scored on a truncated set of SNPs and centred outside the data.
+    """
     max_pos = int(positions[-1])
     win_start = int(positions[0])
-    while win_start <= max_pos:
+    while win_start + w_size_bp <= max_pos:
         win_end = win_start + w_size_bp
         i = int(np.searchsorted(positions, win_start))
         j = int(np.searchsorted(positions, win_end, side="right"))
         if j - i >= 2:
             yield i, j, win_start + w_size_bp // 2
         win_start += step_bp
-        if win_start >= max_pos:
-            break
 
 
 def _get_windows(positions, params):
@@ -830,7 +837,7 @@ def _run_ihs(hap, positions, ac, rec_map, genetic_pos, **params):
     )
     if df is None or len(df) == 0:
         return None
-    return df.select(["positions", "daf", "ihs"]).rename({"positions": "pos"})
+    return df.select(["positions", "daf", "ihs"])
 
 
 def _run_nsl(hap, positions, ac, rec_map, genetic_pos, **params):
@@ -842,7 +849,7 @@ def _run_nsl(hap, positions, ac, rec_map, genetic_pos, **params):
     nsl_vals = nsl(hap[mask], use_threads=False)
     return pl.DataFrame(
         {
-            "pos": positions[mask].tolist(),
+            "positions": positions[mask].tolist(),
             "daf": freqs[mask].tolist(),
             "nsl": nsl_vals.tolist(),
         }
@@ -873,9 +880,7 @@ def _run_isafe(hap, positions, ac, rec_map, genetic_pos, **params):
             )
             if df_r is not None and len(df_r) > 0:
                 results.append(
-                    df_r.select(["positions", "daf", "isafe"]).rename(
-                        {"positions": "pos"}
-                    )
+                    df_r.select(["positions", "daf", "isafe"])
                 )
         region_start = region_end
     return pl.concat(results) if results else None
@@ -899,9 +904,7 @@ def _run_dind(hap, positions, ac, rec_map, genetic_pos, **params):
     df, _, _, _ = fs_stats_dataframe(info, r_dind, r_high, r_low, [], [], [])
     if df is None or len(df) == 0:
         return None
-    return df.select(["positions", "daf", "dind", "high_freq", "low_freq"]).rename(
-        {"positions": "pos"}
-    )
+    return df.select(["positions", "daf", "dind", "high_freq", "low_freq"])
 
 
 def _run_high_freq(hap, positions, ac, rec_map, genetic_pos, **params):
@@ -922,7 +925,7 @@ def _run_high_freq(hap, positions, ac, rec_map, genetic_pos, **params):
     df, _, _, _ = fs_stats_dataframe(info, r_dind, r_high, r_low, [], [], [])
     if df is None or len(df) == 0:
         return None
-    return df.select(["positions", "daf", "high_freq"]).rename({"positions": "pos"})
+    return df.select(["positions", "daf", "high_freq"])
 
 
 def _run_low_freq(hap, positions, ac, rec_map, genetic_pos, **params):
@@ -943,7 +946,7 @@ def _run_low_freq(hap, positions, ac, rec_map, genetic_pos, **params):
     df, _, _, _ = fs_stats_dataframe(info, r_dind, r_high, r_low, [], [], [])
     if df is None or len(df) == 0:
         return None
-    return df.select(["positions", "daf", "low_freq"]).rename({"positions": "pos"})
+    return df.select(["positions", "daf", "low_freq"])
 
 
 def _run_s_ratio(hap, positions, ac, rec_map, genetic_pos, **params):
@@ -964,7 +967,7 @@ def _run_s_ratio(hap, positions, ac, rec_map, genetic_pos, **params):
     _, df, _, _ = fs_stats_dataframe(info, [], [], [], r_s, [], [])
     if df is None or len(df) == 0:
         return None
-    return df.select(["positions", "daf", "s_ratio"]).rename({"positions": "pos"})
+    return df.select(["positions", "daf", "s_ratio"])
 
 
 def _run_hapdaf_o(hap, positions, ac, rec_map, genetic_pos, **params):
@@ -987,7 +990,7 @@ def _run_hapdaf_o(hap, positions, ac, rec_map, genetic_pos, **params):
     _, _, df_o, _ = fs_stats_dataframe(info, [], [], [], [], r_hdo, [])
     if df_o is None or len(df_o) == 0:
         return None
-    return df_o.select(["positions", "daf", "hapdaf_o"]).rename({"positions": "pos"})
+    return df_o.select(["positions", "daf", "hapdaf_o"])
 
 
 def _run_hapdaf_s(hap, positions, ac, rec_map, genetic_pos, **params):
@@ -1010,18 +1013,18 @@ def _run_hapdaf_s(hap, positions, ac, rec_map, genetic_pos, **params):
     _, _, _, df_s = fs_stats_dataframe(info, [], [], [], [], [], r_hds)
     if df_s is None or len(df_s) == 0:
         return None
-    return df_s.select(["positions", "daf", "hapdaf_s"]).rename({"positions": "pos"})
+    return df_s.select(["positions", "daf", "hapdaf_s"])
 
 
 def _run_haf(hap, positions, ac, rec_map, genetic_pos, _single_window=None, **params):
     if _single_window is not None:
-        i, j, center = _single_window
-        val = haf_top(hap[i:j], positions[i:j])
-        return pl.DataFrame({"pos": [center], "haf": [float(val)]})
+        # arrays are already sliced to the window; _single_window is its center
+        val = haf_top(hap, positions)
+        return pl.DataFrame({"positions": [_single_window], "haf": [float(val)]})
     rows = []
     for i, j, center in _get_windows(positions, params):
         val = haf_top(hap[i:j], positions[i:j])
-        rows.append({"pos": center, "haf": float(val)})
+        rows.append({"positions": center, "haf": float(val)})
     if not rows:
         return None
     return pl.DataFrame(rows)
@@ -1036,7 +1039,9 @@ def _run_hscan(hap, positions, ac, rec_map, genetic_pos, **params):
     )
     if len(pos_out) == 0:
         return None
-    return pl.DataFrame({"pos": pos_out.astype(int).tolist(), "hscan": h_out.tolist()})
+    return pl.DataFrame(
+        {"positions": pos_out.astype(int).tolist(), "hscan": h_out.tolist()}
+    )
 
 
 # Sliding-window stat runners
@@ -1048,7 +1053,7 @@ def _run_h12(hap, positions, ac, rec_map, genetic_pos, _single_window=None, **pa
         return pl.DataFrame(
             [
                 {
-                    "pos": _single_window,
+                    "positions": _single_window,
                     "n_snps": len(positions),
                     "h12": float(h12_val),
                     "h2_h1": float(h2_h1),
@@ -1060,7 +1065,7 @@ def _run_h12(hap, positions, ac, rec_map, genetic_pos, _single_window=None, **pa
         h12_val, h2_h1, h1, h123, _n = garud_h(hap[i:j])
         rows.append(
             {
-                "pos": center,
+                "positions": center,
                 "n_snps": j - i,
                 "h12": float(h12_val),
                 "h2_h1": float(h2_h1),
@@ -1075,7 +1080,7 @@ def _run_garud(hap, positions, ac, rec_map, genetic_pos, _single_window=None, **
         return pl.DataFrame(
             [
                 {
-                    "pos": _single_window,
+                    "positions": _single_window,
                     "n_snps": len(positions),
                     "h1": float(h1),
                     "h12": float(h12_val),
@@ -1088,7 +1093,7 @@ def _run_garud(hap, positions, ac, rec_map, genetic_pos, _single_window=None, **
         h12_val, h2_h1, h1, h123, _n = garud_h(hap[i:j])
         rows.append(
             {
-                "pos": center,
+                "positions": center,
                 "n_snps": j - i,
                 "h1": float(h1),
                 "h12": float(h12_val),
@@ -1106,7 +1111,7 @@ def _run_neutrality(
         return pl.DataFrame(
             [
                 {
-                    "pos": _single_window,
+                    "positions": _single_window,
                     "n_snps": len(positions),
                     "tajima_d": float(res[0]),
                     "fay_wu_h_norm": float(res[3]),
@@ -1120,7 +1125,7 @@ def _run_neutrality(
         res = neutrality_stats(ac[i:j].astype(np.int32), positions[i:j])
         rows.append(
             {
-                "pos": center,
+                "positions": center,
                 "n_snps": j - i,
                 "tajima_d": float(res[0]),
                 "fay_wu_h_norm": float(res[3]),
@@ -1135,11 +1140,11 @@ def _run_omega(hap, positions, ac, rec_map, genetic_pos, _single_window=None, **
     if _single_window is not None:
         hap_f = np.ascontiguousarray(hap.astype(np.float64))
         r2 = compute_r2_matrix_upper(hap_f)
-        omega = omega_linear_correct(r2)
+        _, omega = omega_linear_correct(r2)
         return pl.DataFrame(
             [
                 {
-                    "pos": _single_window,
+                    "positions": _single_window,
                     "n_snps": len(positions),
                     "omega_max": float(omega),
                 }
@@ -1149,23 +1154,29 @@ def _run_omega(hap, positions, ac, rec_map, genetic_pos, _single_window=None, **
     for i, j, center in _get_windows(positions, params):
         hap_f = np.ascontiguousarray(hap[i:j].astype(np.float64))
         r2 = compute_r2_matrix_upper(hap_f)
-        omega = omega_linear_correct(r2)
-        rows.append({"pos": center, "n_snps": j - i, "omega_max": float(omega)})
+        _, omega = omega_linear_correct(r2)
+        rows.append({"positions": center, "n_snps": j - i, "omega_max": float(omega)})
     return pl.DataFrame(rows) if rows else None
 
 
 def _run_zns(hap, positions, ac, rec_map, genetic_pos, _single_window=None, **params):
     if _single_window is not None:
         hap_f = np.ascontiguousarray(hap.astype(np.float64))
-        zns_val, _ = Ld(hap_f)
+        zns_val = Ld(hap_f)[0]
         return pl.DataFrame(
-            [{"pos": _single_window, "n_snps": len(positions), "zns": float(zns_val)}]
+            [
+                {
+                    "positions": _single_window,
+                    "n_snps": len(positions),
+                    "zns": float(zns_val),
+                }
+            ]
         )
     rows = []
     for i, j, center in _get_windows(positions, params):
         hap_f = np.ascontiguousarray(hap[i:j].astype(np.float64))
-        zns_val, _ = Ld(hap_f)
-        rows.append({"pos": center, "n_snps": j - i, "zns": float(zns_val)})
+        zns_val = Ld(hap_f)[0]
+        rows.append({"positions": center, "n_snps": j - i, "zns": float(zns_val)})
     return pl.DataFrame(rows) if rows else None
 
 
@@ -1185,7 +1196,7 @@ def _run_lassi_scan(hap, positions, ac, rec_map, genetic_pos, **params):
     )
     return t_m.select(
         [
-            pl.col("window_lassi").cast(pl.Int64).alias("pos"),
+            pl.col("window_lassi").cast(pl.Int64).alias("positions"),
             pl.col("T").alias("T_m"),
             pl.col("m"),
             pl.col("frequency").alias("epsilon"),
@@ -1215,28 +1226,26 @@ def _run_lassip_scan(hap, positions, ac, rec_map, genetic_pos, nthreads=1, **par
             nthreads=nthreads,
             max_extend=max_extend,
         )
-        .rename({"window_lassip": "pos"})
+        .rename({"window_lassip": "positions"})
         .select(pl.exclude("iter"))
     )
 
 
 def _run_raisd(hap, positions, ac, rec_map, genetic_pos, **params):
     window_size = params.get("window_size", 50)
-    return mu_stat(hap, positions, window_size).rename({"positions": "pos"})
+    return mu_stat(hap, positions, window_size)
 
 
 def _run_beta(hap, positions, ac, rec_map, genetic_pos, **params):
     m = params.get("m", 0.1)
     # use run_beta_window which takes ac and positions directly
     out = run_beta_window(ac, positions, m=m)
-    if out is None or out.shape[0] == 0:
+    if out is None or out.height == 0:
         return None
-    return pl.DataFrame(
-        {
-            "pos": out[:, 0].astype(int).tolist(),
-            "beta1": out[:, 1].tolist(),
-            "beta2": out[:, 2].tolist(),
-        }
+    return out.select(
+        pl.col("positions"),
+        pl.col("beta").alias("beta1"),
+        pl.col("t").alias("beta2"),
     )
 
 
@@ -1267,7 +1276,7 @@ def _run_ncd(hap, positions, ac, rec_map, genetic_pos, **params):
         return None
     n_valid = min(len(valid_centers), len(ncd_vals))
     return pl.DataFrame(
-        {"pos": valid_centers[:n_valid], "ncd1": ncd_vals[:n_valid].tolist()}
+        {"positions": valid_centers[:n_valid], "ncd1": ncd_vals[:n_valid].tolist()}
     )
 
 
@@ -1283,7 +1292,7 @@ def _run_single_neutrality_array(
         return pl.DataFrame(
             [
                 {
-                    "pos": _single_window,
+                    "positions": _single_window,
                     "n_snps": len(positions),
                     col_name: float(res[arr_idx]),
                 }
@@ -1292,7 +1301,9 @@ def _run_single_neutrality_array(
     rows = []
     for i, j, center in _get_windows(positions, params):
         res = neutrality_stats(ac[i:j].astype(np.int32), positions[i:j])
-        rows.append({"pos": center, "n_snps": j - i, col_name: float(res[arr_idx])})
+        rows.append(
+            {"positions": center, "n_snps": j - i, col_name: float(res[arr_idx])}
+        )
     return pl.DataFrame(rows) if rows else None
 
 
@@ -1305,17 +1316,22 @@ def _run_single_neutrality_fn(
     _fn_nparams = len(inspect.signature(fn).parameters)
 
     def _call(ac_win, pos_win):
-        return float(fn(ac_win, pos_win) if _fn_nparams >= 2 else fn(ac_win))
+        res = fn(ac_win, pos_win) if _fn_nparams >= 2 else fn(ac_win)
+        # some estimators return a tuple whose last element is the statistic
+        # (fay_wu_h_norm -> (theta_h, H, normalized H))
+        if isinstance(res, tuple):
+            res = res[-1]
+        return float(res)
 
     if _single_window is not None:
         val = _call(ac, positions)
         return pl.DataFrame(
-            [{"pos": _single_window, "n_snps": len(positions), col_name: val}]
+            [{"positions": _single_window, "n_snps": len(positions), col_name: val}]
         )
     rows = []
     for i, j, center in _get_windows(positions, params):
         val = _call(ac[i:j], positions[i:j])
-        rows.append({"pos": center, "n_snps": j - i, col_name: val})
+        rows.append({"positions": center, "n_snps": j - i, col_name: val})
     return pl.DataFrame(rows) if rows else None
 
 
@@ -1537,7 +1553,7 @@ def _run_isafe_region(hap_slice, pos_slice, ac_slice, params):
     )
     if df_r is None or len(df_r) == 0:
         return None
-    return df_r.select(["positions", "daf", "isafe"]).rename({"positions": "pos"})
+    return df_r.select(["positions", "daf", "isafe"])
 
 
 def _run_window_batch(
@@ -1551,6 +1567,7 @@ def _run_window_batch(
     """
     runner = _RUNNERS[stat_key]
     parts = []
+    first_error = None
     for i, j, center_pos in window_batch:
         try:
             df = runner(
@@ -1562,10 +1579,18 @@ def _run_window_batch(
                 _single_window=center_pos,
                 **params,
             )
-        except Exception:
+        except Exception as e:
+            # isolated windows may legitimately fail (too few SNPs); a stat failing
+            # on every window is a bug and must not silently produce no output
+            if first_error is None:
+                first_error = e
             continue
         if df is not None and len(df) > 0:
             parts.append(df)
+    if not parts and first_error is not None:
+        raise RuntimeError(
+            f"scan stat '{stat_key}' failed on all {len(window_batch)} windows"
+        ) from first_error
     return pl.concat(parts) if parts else None
 
 
@@ -1577,7 +1602,7 @@ def scan(
     config=None,
     w_size=201,
     step=10,
-    w_size_bp=1_200_000,
+    w_size_bp=1_000_000,
     step_bp=10_000,
     min_maf=0.05,
     recombination_map=None,
@@ -1601,7 +1626,8 @@ def scan(
         Directory containing ``*.vcf.gz`` (or ``*.bcf.gz``) files, one per
         chromosome/contig. Must be a directory; single-file input is not supported.
     out_prefix:
-        Output file prefix. Writes ``{out_prefix}.{stat}.txt`` for each stat.
+        Output file prefix, relative to the working directory. Writes
+        ``{out_prefix}.{stat}.txt`` for each stat; parent folders are created.
     stats:
         List of stat keys to compute. See ``available_stats()`` for options.
         Per-SNP: ihs, nsl, isafe, dind, high_freq, low_freq, s_ratio,
@@ -1624,17 +1650,20 @@ def scan(
     min_maf:
         Minimum minor allele frequency for iHS and nSL (default 0.05).
     recombination_map:
-        Path to recombination map TSV (chr, start, end, cm_mb, cm).
+        Path to recombination map TSV (chr, start, end, cm_mb, cm), or ``"decode"``
+        for the bundled deCODE 2019 map (GRCh38; VCF coordinates must match).
         If provided: genetic distances used for T3 stat windows, and
         frequency-sensitive stats (iHS, nSL, dind, …) are normalized
         by joint (DAF × recomb_rate) bins (Johnson et al. approach).
     n_daf_bins:
         Number of equal-frequency DAF bins for normalization (default 50).
-    n_r_bins:
-        Number of equal-frequency recombination rate bins for joint
-        (DAF × r_bins) normalization. ``None`` (default) → DAF-only normalization.
-        Set to 10 (Johnson et al.) to enable joint normalization when
-        ``recombination_map`` is provided.
+    r_bins:
+        Recombination-rate bin edges (cM/Mb) for joint (DAF x recombination)
+        normalization of per-SNP stats; requires ``recombination_map``.
+        ``None`` (default) -> DAF-only normalization. Compute edges with
+        ``flexsweep recombination-bins``.
+    min_rate:
+        With ``r_bins``, windows below this recombination rate (cM/Mb) are dropped.
     nthreads:
         Total worker threads for the global task pool (default 1).
         Window-batchable stats split each chromosome into ``nthreads`` window
@@ -1658,6 +1687,13 @@ def scan(
     unknown = [s for s in stats if s not in STAT_REGISTRY]
     if unknown:
         raise ValueError(f"Unknown stats: {unknown}. Available: {available_stats()}")
+    if "n_r_bins" in kwargs:
+        raise TypeError(
+            "n_r_bins was replaced by r_bins: pass the recombination-rate bin edges "
+            "(cM/Mb), e.g. from 'flexsweep recombination-bins'."
+        )
+    if os.path.dirname(out_prefix):
+        os.makedirs(os.path.dirname(out_prefix), exist_ok=True)
 
     config = config or {}
 
@@ -1673,6 +1709,9 @@ def scan(
     )
     if not vcf_files:
         raise FileNotFoundError(f"No *.vcf.gz or *.bcf.gz files found in {vcf_path}")
+
+    recombination_map = resolve_recombination_map(recombination_map)
+    check_genome_build(vcf_files, recombination_map)
 
     def _make_params(stat_key):
         """Merge params: registry defaults < shared < per-stat config."""
@@ -1878,6 +1917,11 @@ def scan(
                     )
                 all_windows = list(_get_windows(position_masked, params))
                 if not all_windows:
+                    span = int(position_masked[-1] - position_masked[0])
+                    warnings.warn(
+                        f"{stat_key}: chromosome {chrom} has no full window "
+                        f"(SNP span {span} bp, params {params}); skipped."
+                    )
                     continue
                 chunk_size = max(1, ceil(len(all_windows) / nthreads))
                 for batch_idx, start in enumerate(
@@ -1938,31 +1982,31 @@ def scan(
 
         if kind == "snp":
             stat_key = label[2]
-            df = result.with_columns(pl.lit(chrom).alias("chrom")).select(
-                ["chrom", "pos"]
-                + [c for c in result.columns if c not in ("chrom", "pos")]
+            df = result.with_columns(pl.lit(chrom).alias("chr")).select(
+                ["chr", "positions"]
+                + [c for c in result.columns if c not in ("chr", "positions")]
             )
             pos_masked = chrom_data[chrom][3]
             # recomb_vals = chrom_data[chrom][5]
             raw_per_stat[stat_key].append((df, pos_masked))
 
         elif kind == "isafe":
-            df = result.with_columns(pl.lit(chrom).alias("chrom"))
+            df = result.with_columns(pl.lit(chrom).alias("chr"))
             isafe_parts.setdefault(chrom, []).append(df)
 
         elif kind == "win_batch":
             stat_key = label[2]
-            df = result.with_columns(pl.lit(chrom).alias("chrom")).select(
-                ["chrom", "pos"]
-                + [c for c in result.columns if c not in ("chrom", "pos")]
+            df = result.with_columns(pl.lit(chrom).alias("chr")).select(
+                ["chr", "positions"]
+                + [c for c in result.columns if c not in ("chr", "positions")]
             )
             win_batch_parts.setdefault((chrom, stat_key), []).append(df)
 
         elif kind == "win_whole":
             stat_key = label[2]
-            df = result.with_columns(pl.lit(chrom).alias("chrom")).select(
-                ["chrom", "pos"]
-                + [c for c in result.columns if c not in ("chrom", "pos")]
+            df = result.with_columns(pl.lit(chrom).alias("chr")).select(
+                ["chr", "positions"]
+                + [c for c in result.columns if c not in ("chr", "positions")]
             )
             pos_masked = chrom_data[chrom][3]
             # recomb_vals = chrom_data[chrom][5]
@@ -1972,8 +2016,8 @@ def scan(
     if "isafe" in stats:
         for chrom, parts in isafe_parts.items():
             df_iso = pl.concat(parts).select(
-                ["chrom", "pos"]
-                + [c for c in parts[0].columns if c not in ("chrom", "pos")]
+                ["chr", "positions"]
+                + [c for c in parts[0].columns if c not in ("chr", "positions")]
             )
             pos_masked = chrom_data[chrom][3]
             # recomb_vals = chrom_data[chrom][5]
@@ -2000,34 +2044,34 @@ def scan(
 
         df_all = (
             pl.concat([t[0] for t in raw_per_stat[stat_key]])
-            .with_columns(pl.col("chrom").cast(int))
-            .sort("chrom", "pos")
+            .with_columns(pl.col("chr").cast(int))
+            .sort("chr", "positions")
         )
 
-        # Genome-wide DAF-bin normalization for frequency-sensitive per-SNP stats
+        # Genome-wide DAF-bin normalization for frequency-sensitive per-SNP stats.
+        # Every other stat (window stats, hscan, isafe) is ranked on its raw value.
         if stat_key in _NORMALIZE_BY_DAF and "daf" in df_all.columns:
-            daf = df_all["daf"].to_numpy()
-            if rank_col in df_all.columns:
-                # vals = df_all[rank_col].to_numpy().astype(np.float64)
-                # normalized = _normalize_daf_bins(
-                #     vals, daf, recomb_for_norm, 1 / n_daf_bins, r_bins
-                # )
-                normalized_df = normalize_stat_scan(
-                    df_all.rename({"chrom": "chr", "pos": "positions"}), df_r
+            normalized_df = normalize_stat_scan(df_all, df_r)
+        else:
+            normalized_df = df_all
+
+        for col in (rank_col, f"{rank_col}_std"):
+            if col in normalized_df.columns:
+                normalized_df = empirical_pvalues(
+                    normalized_df, col, abs_rank=(stat_key in _ABS_RANK)
                 )
 
-        if rank_col in normalized_df.columns:
-            normalized_df = empirical_pvalues(
-                normalized_df, f"{rank_col}", abs_rank=(stat_key in _ABS_RANK)
+        # normalize_stat_scan prefixes "chr" (needed for the r_bins join); give
+        # every stat the same "chr<N>" labels, sorted numerically.
+        normalized_df = (
+            normalized_df.with_columns(
+                pl.col("chr").cast(pl.Utf8).str.replace("^chr", "").cast(int)
             )
-            normalized_df = empirical_pvalues(
-                normalized_df, f"{rank_col}_std", abs_rank=(stat_key in _ABS_RANK)
-            )
-
-        normalized_df.write_csv(
-            f"{vcf_path}/{out_prefix}.{stat_key}.txt", separator="\t"
+            .sort("chr", "positions")
+            .with_columns(pl.format("chr{}", pl.col("chr")).alias("chr"))
         )
-        results[stat_key] = normalized_df.sort("chr", "positions")
+        normalized_df.write_csv(f"{out_prefix}.{stat_key}.txt", separator="\t")
+        results[stat_key] = normalized_df
 
     return results
 
