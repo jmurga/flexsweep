@@ -1,6 +1,7 @@
 import glob
 import gzip
 import math
+import os
 import re
 from collections import defaultdict
 
@@ -479,8 +480,17 @@ def _mh_draw_marginal(
 
 
 def _mh_facets(
-    df, *, log_transform, eps, ncols, neutral_threshold, threshold_lines, figsize,
-    title, out, dpi
+    df,
+    *,
+    log_transform,
+    eps,
+    ncols,
+    neutral_threshold,
+    threshold_lines,
+    figsize,
+    title,
+    out,
+    dpi,
 ):
     """Per-chromosome faceted mini-Manhattans (reuses the already-loaded df)."""
     chroms = sorted(df["CHR_INT"].unique().to_list())
@@ -1318,10 +1328,38 @@ def plot_stat_distributions(
 
 
 def _load_scan(stat_file: str, stat_col: str) -> pl.DataFrame:
-    df = pl.read_csv(stat_file, separator="\t")
+    with open(stat_file) as fh:
+        header = fh.readline().rstrip("\n").split("\t")
+    # Chromosome labels may be numeric ("22") or prefixed ("chr22"); read as text.
+    df = pl.read_csv(
+        stat_file,
+        separator="\t",
+        schema_overrides={c: pl.Utf8 for c in ("chr", "chrom") if c in header},
+    )
     if stat_col not in df.columns:
         raise ValueError(
             f"Column '{stat_col}' not found in {stat_file}. Available: {df.columns}"
+        )
+    return _scan_coords(df)
+
+
+def _scan_coords(df: pl.DataFrame) -> pl.DataFrame:
+    """Return ``df`` with ``chr``/``positions`` coordinate columns.
+
+    ``scan()`` writes ``chr``/``positions``; outputs from older versions used
+    ``chrom``/``pos`` and are renamed.
+    """
+    renames = {
+        old: new
+        for old, new in (("chrom", "chr"), ("pos", "positions"))
+        if old in df.columns and new not in df.columns
+    }
+    df = df.rename(renames)
+    missing = [c for c in ("chr", "positions") if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Scan table lacks coordinate column(s) {missing}; "
+            f"expected chr/positions. Available: {df.columns}"
         )
     return df
 
@@ -1330,21 +1368,23 @@ def _resolve_scan_inputs(stats, stat_cols):
     """Normalise flexible scan inputs to (list[pl.DataFrame], list[str]).
 
     Accepts:
-    - ``dict`` from ``scan()`` — keys are stat names, values are DataFrames.
-    - ``str`` — path to a single TSV file; ``stat_cols`` must be provided.
-    - ``list[str]`` — paths to multiple TSV files; ``stat_cols`` must match length.
+    - ``dict`` from ``scan()`` -- keys are stat names, values are DataFrames.
+    - ``str`` -- path to a single TSV file; ``stat_cols`` must be provided.
+    - ``list[str]`` -- paths to multiple TSV files; ``stat_cols`` must match length.
     """
     if isinstance(stats, dict):
-        if stat_cols is None:
+        # scan() also returns its window table under "params"; it is not a stat.
+        stats = {k: v for k, v in stats.items() if k != "params"}
+        if isinstance(stat_cols, str):
+            stat_cols = [stat_cols]
+        elif stat_cols is None:
             from .scan import STAT_REGISTRY
 
             stat_cols = [
                 STAT_REGISTRY[s].rank_col if s in STAT_REGISTRY else s
                 for s in stats.keys()
             ]
-        elif isinstance(stat_cols, str):
-            stat_cols = [stat_cols]
-        dfs = [stats[s] for s in stats.keys()]
+        dfs = [_scan_coords(stats[s]) for s in stats.keys()]
     elif isinstance(stats, str):
         if stat_cols is None:
             raise ValueError("stat_cols required when stats is a file path")
@@ -1369,6 +1409,165 @@ def _chr_to_float(col_expr):
     return col_expr.cast(pl.Utf8).str.replace("^chr", "").cast(pl.Float64)
 
 
+# Axis labels for scan columns whose names do not read well (RAiSD mu_total -> mu)
+_STAT_LABELS = {"mu_total": "mu"}
+
+
+def _scan_track(
+    df: pl.DataFrame, stat_col: str, pvalue: bool, top_pct: float
+) -> tuple[pl.DataFrame, str, bool]:
+    """Plot-ready track: ``chr_n``, ``positions``, ``_y`` and outlier class ``_cls``.
+
+    ``_cls`` is +1 / -1 for the upper / lower ``top_pct`` tail and 0 otherwise.
+    Stats with any negative value (iHS, nSL, Tajima's D, Fay-Wu H) get both
+    tails; non-negative stats only the upper one. Tails are computed on the full
+    input, so per-chromosome figures share genome-wide thresholds.
+    """
+    pval_col = f"{stat_col}_pvalue"
+    if pvalue and pval_col not in df.columns:
+        raise ValueError(
+            f"pvalue=True needs column '{pval_col}', which this table lacks. "
+            f"Available: {df.columns}"
+        )
+    use_p = pvalue
+    df = df.select(
+        _chr_to_float(pl.col("chr")).cast(pl.Int64).alias("chr_n"),
+        pl.col("positions").cast(pl.Int64),
+        pl.col(pval_col if use_p else stat_col).cast(pl.Float64).alias("_y"),
+    ).filter(pl.col("_y").is_not_null() & pl.col("_y").is_not_nan())
+    y = df["_y"].to_numpy()
+    if use_p:
+        y = -np.log10(np.clip(y, 1e-10, None))
+        cls = np.zeros(y.size, dtype=np.int8)
+        signed = False
+        name = _STAT_LABELS.get(stat_col, stat_col)
+        label = rf"$\mathrm{{{name}}}:\ -\log_{{10}}(p_{{\mathrm{{emp}}}})$"
+    else:
+        # Any negative value -> both tails (Fay-Wu H can be negative everywhere)
+        signed = y.size > 0 and y.min() < 0
+        cls = np.zeros(y.size, dtype=np.int8)
+        if y.size:
+            cls[y >= np.quantile(y, 1 - top_pct)] = 1
+            if signed:
+                cls[y <= np.quantile(y, top_pct)] = -1
+        label = _STAT_LABELS.get(stat_col, stat_col)
+    df = df.with_columns(pl.Series("_y", y), pl.Series("_cls", cls)).sort(
+        "chr_n", "positions"
+    )
+    return df, label, signed
+
+
+def _chr_layout(tracks: list[pl.DataFrame], gap_frac: float = 0.03) -> pl.DataFrame:
+    """Concatenated x layout: one block per chromosome spanning its data range.
+
+    Returns ``chr_n``, ``lo``, ``hi`` (bp) and ``offset`` such that
+    ``x = positions - lo + offset``; blocks are separated by ``gap_frac`` of the
+    total span.
+    """
+    lay = (
+        pl.concat([t.select("chr_n", "positions") for t in tracks])
+        .group_by("chr_n")
+        .agg(pl.min("positions").alias("lo"), pl.max("positions").alias("hi"))
+        .sort("chr_n")
+    )
+    span = (lay["hi"] - lay["lo"]).to_numpy().astype(np.float64)
+    gap = gap_frac * span.sum() if len(span) > 1 else 0.0
+    offset = np.concatenate([[0.0], np.cumsum(span + gap)[:-1]])
+    return lay.with_columns(pl.Series("offset", offset))
+
+
+# Points per panel above which the background scatter is rasterized.
+_SCAN_RASTER_MIN = 200_000
+
+
+def _draw_scan_track(
+    ax,
+    x: np.ndarray,
+    y: np.ndarray,
+    cls: np.ndarray,
+    block: np.ndarray,
+    pvalue: bool,
+    signed: bool,
+    top_pct: float,
+    threshold_lines: list | None,
+) -> None:
+    """Scatter one stat track; background alternates colour by chromosome block.
+
+    Points are vector paths unless the track exceeds ``_SCAN_RASTER_MIN`` points;
+    then the background (not outliers, lines or text) is embedded as an image so
+    genome-wide SVGs stay small.
+    """
+    alt_colors = ["#333333", "#999999"]
+    raster = x.size > _SCAN_RASTER_MIN
+    bg = cls == 0
+    for b in np.unique(block):
+        m = bg & (block == b)
+        ax.scatter(
+            x[m],
+            y[m],
+            s=4 if pvalue else 3,
+            color=alt_colors[int(b) % 2],
+            alpha=0.7 if pvalue else 0.5,
+            linewidths=0,
+            rasterized=raster,
+        )
+    pct = f"Top {top_pct * 100:g}%"
+    for c, color, lab in (
+        (1, "#d62728", f"{pct} (+)" if signed else pct),
+        (-1, "#1f77b4", f"{pct} (-)"),
+    ):
+        m = cls == c
+        if m.any():
+            ax.scatter(x[m], y[m], s=8, color=color, alpha=0.9, linewidths=0, label=lab)
+
+    lines = threshold_lines
+    if pvalue and lines is None:
+        lines = [(2, "--", "p = 0.01"), (3, "-", "p = 0.001")]
+    for y_val, ls, lab in lines or []:
+        ax.axhline(y_val, color="black", linestyle=ls, linewidth=1.0, label=lab)
+    if pvalue:
+        ax.set_ylim(0, 10)
+        ax.set_yticks([2, 4, 6, 8, 10])
+
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(
+            fontsize=8,
+            frameon=False,
+            markerscale=2,
+            loc="upper left",
+            bbox_to_anchor=(1.0, 1.0),
+        )
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(axis="y", color="lightgray", linewidth=0.5)
+    ax.grid(axis="x", visible=False)
+
+
+def _save_scan_fig(fig: plt.Figure, out: str | None) -> None:
+    """Save ``fig`` as SVG (or the format ``out``'s extension names) or show it.
+
+    The format is passed explicitly rather than left to the extension, and SVG
+    text stays text (``svg.fonttype="none"``) so labels remain editable.
+    """
+    if out:
+        ext = os.path.splitext(out)[1].lstrip(".").lower()
+        if not ext:
+            out, ext = f"{out}.svg", "svg"
+        with plt.rc_context({"svg.fonttype": "none"}):
+            fig.savefig(out, format=ext, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+    else:
+        plt.show()
+
+
+def _out_tag(out: str | None, *tags: str) -> str | None:
+    """``out`` with ``.tag`` parts inserted before the extension (SVG if none)."""
+    if not out:
+        return None
+    stem, ext = os.path.splitext(out)
+    return ".".join([stem, *tags]) + (ext or ".svg")
+
+
 def plot_scan(
     stats,
     stat_cols=None,
@@ -1382,340 +1581,315 @@ def plot_scan(
     chrom: str | None = None,
     center: int | None = None,
     window_bp: int = 500_000,
-) -> plt.Figure:
-    """Genome-wide or regional scan plot — single stat or stacked multi-stat.
+    multi: bool = False,
+    split_chr: bool = False,
+) -> plt.Figure | list[plt.Figure]:
+    """Genome-wide or regional scan plot.
 
-    Accepts output from ``scan()`` (dict) or paths to ``{prefix}.{stat}.txt`` files.
+    Accepts output from ``scan()`` (dict) or paths to ``{prefix}.{stat}.txt`` files
+    (columns ``chr``, ``positions``, ``{stat_col}``, ``{stat_col}_pvalue``).
 
-    **Genome-wide mode** (default, ``chrom=None``):
-    Single stat → 1-panel Manhattan. Multiple stats → stacked panels, shared x-axis.
-    ``pvalue=False`` plots raw values with bipolar colouring for signed stats.
-    ``pvalue=True`` plots ``-log10(p_emp)`` with threshold lines at p = 0.01 / 0.001.
+    Two independent switches choose the figures:
 
-    **Zoom mode** (``chrom`` + ``center`` provided):
-    n rows × 2 columns: raw stat (left) | ``-log10(p_emp)`` (right).
-    Filtered to ``[center ± window_bp]``. Orange dashed line marks the centre.
+    - ``multi=True,  split_chr=False``: all stats stacked, all chromosomes
+      -> ``x.svg``
+    - ``multi=True,  split_chr=True``: all stats stacked, one figure per
+      chromosome -> ``x.chr<N>.svg``
+    - ``multi=False, split_chr=False``: one figure per stat, all chromosomes
+      -> ``x.<stat>.svg``
+    - ``multi=False, split_chr=True``: one figure per stat and chromosome
+      -> ``x.<stat>.chr<N>.svg``
+
+    The ``<stat>`` / ``chr<N>`` parts are only added when there is more than one
+    stat / chromosome. The x-axis shows position in Mb within each chromosome;
+    chromosomes sharing a figure are separated by dashed vertical lines.
+    ``pvalue=False`` plots raw values; the top ``top_pct`` of each tail is
+    highlighted (both tails for signed stats such as iHS/nSL), with tails computed
+    over all chromosomes. ``pvalue=True`` plots ``-log10(p_emp)`` with threshold
+    lines at p = 0.01 / 0.001.
+
+    **Zoom mode** (``chrom`` + ``center`` provided): panels filtered to
+    ``[center +/- window_bp]`` on one chromosome; a dashed line marks the centre.
+    ``split_chr`` does not apply.
 
     Parameters
     ----------
     stats : dict | str | list[str]
-        - ``dict`` from ``scan()`` — keys are stat names, values are DataFrames.
-        - ``str`` — path to a single ``{stat}.txt`` scan output file.
-        - ``list[str]`` — paths to multiple scan output files.
+        - ``dict`` from ``scan()`` -- keys are stat names, values are DataFrames.
+        - ``str`` -- path to a single ``{stat}.txt`` scan output file.
+        - ``list[str]`` -- paths to multiple scan output files.
     stat_cols : str | list[str], optional
         Stat column name(s). Required when ``stats`` is a file path / list of paths.
-        When ``stats`` is a dict, defaults to all keys.
+        When ``stats`` is a dict, defaults to each stat's rank column.
     pvalue : bool
-        Genome-wide mode only. If True, plot ``-log10(p_emp)`` with y=[0,10] and
-        threshold lines. If False, plot raw stat values with bipolar colouring.
+        If True, plot ``-log10(p_emp)`` from ``{stat_col}_pvalue`` (error if the
+        column is missing). If False, plot raw values with outlier tails highlighted.
     top_pct : float
-        Fraction highlighted as outliers in genome-wide raw mode.
+        Fraction highlighted per tail in raw mode, in (0, 0.5).
     threshold_lines : list of (y_value, linestyle, label), optional
         Horizontal lines. ``pvalue=True`` default: y=2 dashed (p=0.01), y=3 solid.
         Pass ``[]`` to suppress.
     out : str, optional
-        Save path. If None, shows interactively.
+        Save path (see table). SVG by default: a path without extension gets
+        ``.svg``; ``.png``/``.pdf`` select that format. If None, shows interactively.
     figsize : tuple, optional
-        Genome-wide default: (14, 4) / (14, 3×n). Zoom default: (10, 2.5×n).
+        Genome-wide default: (14, 4) / (14, 3*n). Zoom default: (10, 4) / (10, 3*n).
     title : str, optional
-        Title for single-stat genome-wide plots.
+        Figure title.
     sharey : bool
-        Share y-axis across panels in genome-wide mode (default False).
+        Share y-axis across stacked panels (default False).
     chrom : str, optional
         Chromosome for zoom mode (e.g. ``"22"`` or ``"chr22"``).
     center : int, optional
         Centre position (bp) for zoom mode.
     window_bp : int
-        Half-window size in bp for zoom mode (default 500 000 = ±500 kb).
+        Half-window size in bp for zoom mode (default 500 000 = +/-500 kb).
+    multi : bool
+        Stack all stats in one figure. Default False: one figure per stat.
+    split_chr : bool
+        One figure per chromosome (default False: all chromosomes in one figure).
+
+    Returns
+    -------
+    A Figure when exactly one is produced, else a list of Figures.
     """
+    if not 0 < top_pct < 0.5:
+        raise ValueError(f"top_pct must be in (0, 0.5), got {top_pct}")
     dfs, stat_cols = _resolve_scan_inputs(stats, stat_cols)
-    n = len(dfs)
+    built = [_scan_track(df, c, pvalue, top_pct) for df, c in zip(dfs, stat_cols)]
+    n = len(built)
 
-    # ── Zoom mode ────────────────────────────────────────────────────────────
-    if chrom is not None and center is not None:
-        lo, hi = center - window_bp, center + window_bp
-        chrom_str = str(chrom).lstrip("chr")
-        if figsize is None:
-            figsize = (10, 4) if n == 1 else (10, 3.0 * n)
-        fig, axes = plt.subplots(n, 1, figsize=figsize, sharex=True, sharey=sharey)
-        axes = [axes] if n == 1 else list(axes)
-        for ax, df, stat_col in zip(axes, dfs, stat_cols):
-            pval_col = f"{stat_col}_pvalue"
-            df = df.filter(
-                pl.col("chrom").cast(pl.Utf8).str.replace("^chr", "") == chrom_str
-            ).filter((pl.col("pos") >= lo) & (pl.col("pos") <= hi))
-            pos = df["pos"].to_numpy()
+    # File tag per stat; disambiguate repeated column names (e.g. two populations).
+    tags = list(stat_cols)
+    for i, c in enumerate(stat_cols):
+        if stat_cols.count(c) > 1:
+            tags[i] = f"{c}{stat_cols[:i + 1].count(c)}"
+    groups = [list(range(n))] if multi or n == 1 else [[i] for i in range(n)]
+    # One x layout over every stat, so a bp maps to the same x in every panel and
+    # every figure (window stats start/end at window centres, SNP stats do not).
+    layout = _chr_layout([b[0] for b in built])
 
-            if pvalue and pval_col in df.columns:
-                p_raw = df[pval_col].to_numpy(allow_copy=True).astype(np.float64)
-                y = -np.log10(np.clip(p_raw, 1e-10, None))
-                y_label = (
-                    rf"$\mathrm{{{stat_col}}}:\ -\log_{{10}}(p_{{\mathrm{{emp}}}})$"
+    figs = []
+    for g in groups:
+        sub = [built[i] for i in g]
+        g_out = out if len(groups) == 1 else _out_tag(out, tags[g[0]])
+        if chrom is not None and center is not None:
+            figs.append(
+                _plot_scan_region(
+                    sub,
+                    chrom,
+                    center,
+                    window_bp,
+                    pvalue,
+                    top_pct,
+                    threshold_lines,
+                    g_out,
+                    figsize,
+                    title,
+                    sharey,
                 )
-                ax.scatter(
-                    pos,
-                    y,
-                    s=4,
-                    color="#333333",
-                    alpha=0.7,
-                    linewidths=0,
-                    rasterized=True,
+            )
+            continue
+        tracks = [b[0] for b in sub]
+        chroms = layout["chr_n"].to_list()
+        if split_chr and len(chroms) > 1:
+            parts = [
+                (
+                    [t.filter(pl.col("chr_n") == c) for t in tracks],
+                    _chr_layout_subset(layout, c),
+                    _out_tag(g_out, f"chr{c}"),
                 )
-                lines = (
-                    threshold_lines
-                    if threshold_lines is not None
-                    else [
-                        (2, "--", "p = 0.01"),
-                        (3, "-", "p = 0.001"),
-                    ]
-                )
-                for y_val, ls, label in lines:
-                    ax.axhline(
-                        y_val, color="black", linestyle=ls, linewidth=1.0, label=label
-                    )
-                ax.set_ylim(0, 10)
-                ax.set_yticks([2, 4, 6, 8, 10])
-            else:
-                y = df[stat_col].to_numpy(allow_copy=True).astype(np.float64)
-                y_label = stat_col
-                has_neg = np.nanmin(y) < 0
-                if has_neg:
-                    abs_thresh = np.nanpercentile(np.abs(y), (1 - top_pct) * 100)
-                    pos_out = y >= abs_thresh
-                    neg_out = y <= -abs_thresh
-                    background = ~pos_out & ~neg_out
-                else:
-                    thresh = np.nanpercentile(y, (1 - top_pct) * 100)
-                    pos_out = y >= thresh
-                    neg_out = np.zeros(len(y), dtype=bool)
-                    background = ~pos_out
-                ax.scatter(
-                    pos[background],
-                    y[background],
-                    s=3,
-                    color="#333333",
-                    alpha=0.4,
-                    linewidths=0,
-                    rasterized=True,
-                )
-                if pos_out.any():
-                    ax.scatter(
-                        pos[pos_out],
-                        y[pos_out],
-                        s=8,
-                        color="#d62728",
-                        alpha=0.8,
-                        linewidths=0,
-                        rasterized=True,
-                        label=f"Top {top_pct * 100:g}%{' (+)' if has_neg else ''}",
-                    )
-                if has_neg and neg_out.any():
-                    ax.scatter(
-                        pos[neg_out],
-                        y[neg_out],
-                        s=8,
-                        color="#1f77b4",
-                        alpha=0.8,
-                        linewidths=0,
-                        rasterized=True,
-                        label=f"Top {top_pct * 100:g}% (−)",
-                    )
-                if threshold_lines:
-                    for y_val, ls, label in threshold_lines:
-                        ax.axhline(
-                            y_val,
-                            color="black",
-                            linestyle=ls,
-                            linewidth=1.0,
-                            label=label,
-                        )
-
-            ax.axvline(center, color="black", lw=1, ls="--", alpha=1)
-            ax.set_ylabel(y_label, fontsize=8)
-            ax.legend(fontsize=8, frameon=False, markerscale=3)
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
-            ax.grid(axis="y", color="lightgray", linewidth=0.5)
-            ax.grid(axis="x", visible=False)
-
-        if n == 1 and title:
-            axes[0].set_title(title)
-        axes[-1].set_xlabel("Position")
-        axes[-1].xaxis.set_major_formatter(
-            mticker.FuncFormatter(lambda x, _: f"{x / 1e6:.2f} Mb")
-        )
-        fig.tight_layout()
-        if out:
-            fig.savefig(out, dpi=150)
-            plt.close(fig)
+                for c in chroms
+            ]
         else:
-            plt.show()
-        return fig
+            parts = [(tracks, layout, g_out)]
+        for part_tracks, part_layout, part_out in parts:
+            figs.append(
+                _plot_scan_genome(
+                    part_tracks,
+                    part_layout,
+                    [b[1] for b in sub],
+                    [b[2] for b in sub],
+                    pvalue,
+                    top_pct,
+                    threshold_lines,
+                    part_out,
+                    figsize,
+                    title,
+                    sharey,
+                )
+            )
+    return figs[0] if len(figs) == 1 else figs
 
-    # ── Genome-wide mode ─────────────────────────────────────────────────────
-    if figsize is None:
-        figsize = (14, 4) if n == 1 else (14, 3.0 * n)
 
-    fig, axes = plt.subplots(n, 1, figsize=figsize, sharex=True, sharey=sharey)
+def _plot_scan_region(
+    built: list[tuple[pl.DataFrame, str, bool]],
+    chrom: str | int,
+    center: int,
+    window_bp: int,
+    pvalue: bool,
+    top_pct: float,
+    threshold_lines: list | None,
+    out: str | None,
+    figsize: tuple | None,
+    title: str | None,
+    sharey: bool,
+) -> plt.Figure:
+    """Stacked panels over ``[center +/- window_bp]`` on one chromosome."""
+    n = len(built)
+    chr_n = int(float(str(chrom).removeprefix("chr")))
+    lo, hi = center - window_bp, center + window_bp
+    fig, axes = plt.subplots(
+        n,
+        1,
+        figsize=figsize or ((10, 4) if n == 1 else (10, 3.0 * n)),
+        sharex=True,
+        sharey=sharey,
+    )
+    axes = [axes] if n == 1 else list(axes)
+    for ax, (t, label, signed) in zip(axes, built):
+        t = t.filter(
+            (pl.col("chr_n") == chr_n) & pl.col("positions").is_between(lo, hi)
+        )
+        x = t["positions"].to_numpy()
+        _draw_scan_track(
+            ax,
+            x,
+            t["_y"].to_numpy(),
+            t["_cls"].to_numpy(),
+            np.zeros(x.size, dtype=np.int64),
+            pvalue,
+            signed,
+            top_pct,
+            threshold_lines,
+        )
+        ax.axvline(center, color="black", lw=1, ls="--")
+        ax.set_ylabel(label, fontsize=8)
+    ax = axes[-1]
+    ax.set_xlim(lo, hi)
+    ax.xaxis.set_major_locator(
+        mticker.MaxNLocator(nbins=20, steps=[1, 2, 2.5, 5, 10])
+    )
+    ax.xaxis.set_minor_locator(mticker.AutoMinorLocator())
+    ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v / 1e6:g}"))
+    ax.tick_params(axis="x", labelsize=7)
+    ax.set_xlabel(f"chr{chr_n} position (Mb)")
+    if title:
+        axes[0].set_title(title)
+    fig.tight_layout()
+    _save_scan_fig(fig, out)
+    return fig
+
+
+def _chr_layout_subset(layout: pl.DataFrame, chr_n: int) -> pl.DataFrame:
+    """Single-chromosome layout: same ``lo``/``hi``, offset reset to 0."""
+    return layout.filter(pl.col("chr_n") == chr_n).with_columns(
+        pl.lit(0.0).alias("offset")
+    )
+
+
+def _plot_scan_genome(
+    tracks: list[pl.DataFrame],
+    layout: pl.DataFrame,
+    labels: list[str],
+    signed: list[bool],
+    pvalue: bool,
+    top_pct: float,
+    threshold_lines: list | None,
+    out: str | None,
+    figsize: tuple | None,
+    title: str | None,
+    sharey: bool,
+) -> plt.Figure:
+    """Stacked genome-wide panels; ``layout`` (from ``_chr_layout``) fixes the x map."""
+    n = len(tracks)
+    fig, axes = plt.subplots(
+        n,
+        1,
+        figsize=figsize or ((14, 4) if n == 1 else (14, 3.0 * n)),
+        sharex=True,
+        sharey=sharey,
+    )
     axes = [axes] if n == 1 else list(axes)
 
-    # Chr offsets: computed once from the first DataFrame
-    df0 = dfs[0].with_columns(
-        [
-            _chr_to_float(pl.col("chrom")).alias("CHR"),
-            pl.col("pos").cast(pl.Float64).alias("BP"),
-        ]
-    )
-    chr_lens = (
-        df0.group_by("CHR")
-        .agg(pl.col("BP").max().alias("chr_len"))
-        .sort("CHR")
-        .with_columns((pl.col("chr_len").cum_sum() - pl.col("chr_len")).alias("tot"))
-        .select(["CHR", "tot"])
-    )
-    axisdf = None
-    alt_colors = ["#333333", "#aaaaaa"]
-
-    for ax, df, stat_col in zip(axes, dfs, stat_cols):
-        pval_col = f"{stat_col}_pvalue"
-
-        df_plot = (
-            df.with_columns(
-                [
-                    _chr_to_float(pl.col("chrom")).alias("CHR"),
-                    pl.col("pos").cast(pl.Float64).alias("BP"),
-                ]
-            )
-            .join(chr_lens, on="CHR", how="left")
-            .sort(["CHR", "BP"])
-            .with_columns((pl.col("BP") + pl.col("tot")).alias("BPcum"))
+    n_chr = layout.height
+    for ax, t, label, sgn in zip(axes, tracks, labels, signed):
+        t = t.join(layout, on="chr_n", how="inner").with_columns(
+            (pl.col("positions") - pl.col("lo") + pl.col("offset")).alias("_x")
         )
-        if axisdf is None:
-            axisdf = (
-                df_plot.group_by("CHR")
-                .agg(
-                    ((pl.col("BPcum").max() + pl.col("BPcum").min()) / 2).alias(
-                        "center"
-                    )
-                )
-                .sort("CHR")
+        _draw_scan_track(
+            ax,
+            t["_x"].to_numpy(),
+            t["_y"].to_numpy(),
+            t["_cls"].to_numpy(),
+            t["chr_n"].to_numpy(),
+            pvalue,
+            sgn,
+            top_pct,
+            threshold_lines,
+        )
+        ax.set_ylabel(label, fontsize=8)
+
+    # Dashed separators in the gap between consecutive chromosome blocks.
+    lo = layout["lo"].to_numpy().astype(np.float64)
+    hi = layout["hi"].to_numpy().astype(np.float64)
+    offset = layout["offset"].to_numpy()
+    ends = offset + (hi - lo)
+    for i in range(n_chr - 1):
+        for ax in axes:
+            ax.axvline(
+                (ends[i] + offset[i + 1]) / 2,
+                color="gray",
+                linestyle="--",
+                linewidth=0.8,
             )
 
-        bpcum = df_plot["BPcum"].to_numpy()
-        chr_vals = df_plot["CHR"].to_numpy()
-
-        if pvalue and pval_col in df_plot.columns:
-            p_raw = df_plot[pval_col].to_numpy(allow_copy=True).astype(np.float64)
-            y = -np.log10(np.clip(p_raw, 1e-10, None))
-            y_label = rf"$\mathrm{{{stat_col}}}:\ -\log_{{10}}(p_{{\mathrm{{emp}}}})$"
-
-            chromosomes = sorted(df_plot["CHR"].unique().to_list())
-            for i, chrom in enumerate(chromosomes):
-                mask = chr_vals == chrom
-                ax.scatter(
-                    bpcum[mask],
-                    y[mask],
-                    s=4,
-                    color=alt_colors[i % 2],
-                    alpha=0.7,
-                    linewidths=0,
-                    rasterized=True,
-                )
-
-            lines = (
-                threshold_lines
-                if threshold_lines is not None
-                else [
-                    (2, "--", "p = 0.01"),
-                    (3, "-", "p = 0.001"),
-                ]
-            )
-            for y_val, ls, label in lines:
-                ax.axhline(
-                    y_val, color="black", linestyle=ls, linewidth=1.0, label=label
-                )
-
-            ax.set_ylim(0, 10)
-            ax.set_yticks([2, 4, 6, 8, 10])
-
-        else:
-            y = df_plot[stat_col].to_numpy(allow_copy=True).astype(np.float64)
-            y_label = stat_col
-            has_neg = np.nanmin(y) < 0
-
-            if has_neg:
-                abs_thresh = np.nanpercentile(np.abs(y), (1 - top_pct) * 100)
-                pos_out = y >= abs_thresh
-                neg_out = y <= -abs_thresh
-                background = ~pos_out & ~neg_out
-            else:
-                thresh = np.nanpercentile(y, (1 - top_pct) * 100)
-                pos_out = y >= thresh
-                neg_out = np.zeros(len(y), dtype=bool)
-                background = ~pos_out
-
-            chromosomes = sorted(df_plot["CHR"].unique().to_list())
-            for i, chrom in enumerate(chromosomes):
-                mask = (chr_vals == chrom) & background
-                ax.scatter(
-                    bpcum[mask],
-                    y[mask],
-                    s=2,
-                    color=alt_colors[i % 2],
-                    alpha=0.4,
-                    linewidths=0,
-                    rasterized=True,
-                )
-
-            if pos_out.any():
-                ax.scatter(
-                    bpcum[pos_out],
-                    y[pos_out],
-                    s=6,
-                    color="#d62728",
-                    alpha=0.8,
-                    linewidths=0,
-                    rasterized=True,
-                    label=f"Top {top_pct * 100:g}%{' (+)' if has_neg else ''}",
-                )
-            if has_neg and neg_out.any():
-                ax.scatter(
-                    bpcum[neg_out],
-                    y[neg_out],
-                    s=6,
-                    color="#1f77b4",
-                    alpha=0.8,
-                    linewidths=0,
-                    rasterized=True,
-                    label=f"Top {top_pct * 100:g}% (−)",
-                )
-
-            if threshold_lines:
-                for y_val, ls, label in threshold_lines:
-                    ax.axhline(
-                        y_val, color="black", linestyle=ls, linewidth=1.0, label=label
-                    )
-
-        ax.set_ylabel(y_label, fontsize=8)
-        ax.legend(fontsize=8, frameon=False, markerscale=3)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.grid(axis="y", color="lightgray", linewidth=0.5)
-        ax.grid(axis="x", visible=False)
-
-    if n == 1 and title:
-        axes[0].set_title(title)
-
-    axes[-1].set_xticks(axisdf["center"].to_list())
-    axes[-1].set_xticklabels([str(int(c)) for c in axisdf["CHR"].to_list()], fontsize=7)
-    axes[-1].set_xlabel("Chromosome")
-
-    fig.tight_layout()
-    if out:
-        fig.savefig(out, dpi=150)
-        plt.close(fig)
+    # Mb ticks within each chromosome; chromosome name under its block.
+    total = float(ends[-1]) if n_chr else 1.0
+    # ~20 labelled ticks across the figure, shared by chromosome width, plus
+    # unlabelled minor ticks at 1/5 of the major step.
+    ticks, tick_labels, minor = [], [], []
+    for i in range(n_chr):
+        nbins = max(3, int(round(20 * (hi[i] - lo[i]) / max(total, 1.0))))
+        locs = mticker.MaxNLocator(nbins=nbins, steps=[1, 2, 2.5, 5, 10]).tick_values(
+            lo[i] / 1e6, hi[i] / 1e6
+        )
+        step = locs[1] - locs[0] if len(locs) > 1 else 0.0
+        for mb in locs:
+            if lo[i] <= mb * 1e6 <= hi[i]:
+                ticks.append(mb * 1e6 - lo[i] + offset[i])
+                tick_labels.append(f"{mb:g}")
+        if step:
+            sub = np.arange(locs[0], locs[-1] + step / 10, step / 5) * 1e6
+            sub = sub[(sub >= lo[i]) & (sub <= hi[i])]
+            minor.extend(sub - lo[i] + offset[i])
+    ax = axes[-1]
+    ax.set_xticks(ticks)
+    ax.set_xticklabels(tick_labels, fontsize=7)
+    ax.set_xticks(minor, minor=True)
+    pad = 0.01 * total
+    ax.set_xlim(-pad, total + pad)
+    chr_names = [f"chr{c}" for c in layout["chr_n"].to_list()]
+    if n_chr == 1:
+        ax.set_xlabel(f"{chr_names[0]} position (Mb)")
     else:
-        plt.show()
+        for i, name in enumerate(chr_names):
+            ax.annotate(
+                name,
+                xy=((offset[i] + ends[i]) / 2, 0),
+                xycoords=("data", "axes fraction"),
+                xytext=(0, -18),
+                textcoords="offset points",
+                ha="center",
+                va="top",
+                fontsize=8,
+            )
+        ax.set_xlabel("Position (Mb)", labelpad=16)
+
+    if title:
+        axes[0].set_title(title)
+    fig.tight_layout()
+    _save_scan_fig(fig, out)
     return fig
 
 
@@ -1723,6 +1897,7 @@ def plot_scan_zoom(
     stats, stat_cols, chrom, center, window_bp=500_000, **kwargs
 ) -> plt.Figure:
     """Deprecated alias — use ``plot_scan(..., chrom=chrom, center=center)``."""
+    kwargs.setdefault("multi", True)  # this alias always stacked the stats
     return plot_scan(
         stats,
         stat_cols=stat_cols,
@@ -1731,415 +1906,6 @@ def plot_scan_zoom(
         window_bp=window_bp,
         **kwargs,
     )
-
-
-def plot_enrichment(
-    df: pl.DataFrame,
-    title: str,
-    ci: bool = False,
-    population: list = None,
-    facet: bool = False,
-    log_scale: bool = False,
-    reverse_x: bool = True,
-):
-    """
-    Enrichment plot.
-
-    Parameters
-    ----------
-    log_scale : log10 y-axis (default, good for the exploratory view since the
-        fold-enrichment CI explodes at stringent thresholds). Set False for the
-        linear 0–N publication view (e.g. virus-enrichment PDFs).
-    reverse_x : plot thresholds large→small left-to-right (stringent on the
-        right), matching the published virus-enrichment figures.
-    """
-
-    # Filter Populations
-    target_groups = ["AFR", "AMR", "EAS", "EUR", "SAS", "All"]
-    plot_df = df.filter(
-        pl.col("scope").is_in(population if population else target_groups)
-    )
-
-    # Setup Figure
-    # Standard NPG-style colors (Nature Publishing Group)
-    colors = ["#E64B35", "#4DBBD5", "#00A087", "#3C5488", "#F39B7F", "#8491B3"]
-    unique_pops = plot_df["scope"].unique().to_list()
-    color_map = {pop: colors[i % len(colors)] for i, pop in enumerate(unique_pops)}
-
-    if facet:
-        fig, axes = plt.subplots(
-            len(unique_pops), 1, figsize=(8, 4 * len(unique_pops)), sharex=True
-        )
-        if len(unique_pops) == 1:
-            axes = [axes]
-    else:
-        fig, ax = plt.subplots(figsize=(10, 6))
-        axes = [ax] * len(unique_pops)
-
-    # Plotting Logic
-    for i, pop in enumerate(unique_pops):
-        current_ax = axes[i]
-        data = plot_df.filter(pl.col("scope") == pop).sort("threshold")
-
-        x = data["threshold"].to_numpy()
-        y = data["ratio"].to_numpy()
-
-        # Line and Points
-        (line,) = current_ax.plot(
-            x, y, marker="o", label=pop, color=color_map[pop], linewidth=2
-        )
-
-        # Confidence Interval Ribbon
-        if ci:
-            # Fold-enrichment CI: hold the observed VIP count fixed and divide by
-            # the control-count percentiles. NOTE the swap — dividing by the HIGH
-            # control percentile (ctrl_ci_hi) yields the LOWER enrichment bound,
-            # and by the LOW percentile (ctrl_ci_lo) the UPPER bound. The +0.1
-            # smoothing matches the `ratio` definition (vip+0.1)/(ctrl_mean+0.1),
-            # so the ribbon brackets the plotted line.
-            obs = data["vip_count"].to_numpy()
-            ctrl_lo = data["ctrl_ci_lo"].to_numpy()
-            ctrl_hi = data["ctrl_ci_hi"].to_numpy()
-            fold_lo = (obs + 0.1) / (ctrl_hi + 0.1)
-            fold_hi = (obs + 0.1) / (ctrl_lo + 0.1)
-            current_ax.fill_between(
-                x, fold_lo, fold_hi, color=line.get_color(), alpha=0.15
-            )
-
-        if facet or i == 0:
-            current_ax.axhline(1, color="black", linestyle="--", linewidth=1, alpha=0.7)
-            if log_scale:
-                current_ax.set_yscale("log")
-
-    # Styling (Theme Minimal equivalent)
-    for ax in axes if facet else [ax]:
-        ax.grid(True, which="both", ls="-", alpha=0.2)
-        ax.spines[["top", "right"]].set_visible(False)
-        if reverse_x:
-            ax.invert_xaxis()
-        if facet:
-            ax.set_title(f"Population: {unique_pops[axes.index(ax)]}")
-
-    if not facet:
-        plt.legend(title="Population", frameon=False)
-        plt.title(
-            f"{title}\nRank Threshold vs. Enrichment Ratio", loc="left", fontsize=14
-        )
-        plt.xlabel("Rank Threshold")
-        plt.ylabel("Enrichment Ratio (Obs/Exp)")
-
-    plt.tight_layout()
-    return fig
-
-
-################## Sorting methods
-
-
-@njit(parallel=False)
-def corr_sorting(matrix):
-    samples, sites = matrix.shape
-
-    # Step 1: Compute PCC matrix between rows
-    PCC = np.zeros((samples, samples), dtype=np.float64)
-    sum_pcc = np.zeros(samples, dtype=np.float64)
-    P_A = np.zeros(samples, dtype=np.int32)
-
-    for i in range(samples):
-        for k in range(sites):
-            P_A[i] += matrix[i, k]
-
-    for i in range(samples):
-        for k in range(samples):
-            if i == k:
-                PCC[i, k] = 1.000001
-            else:
-                P_AB = 0
-                for m in range(sites):
-                    if matrix[i, m] == 1 and matrix[k, m] == 1:
-                        P_AB += 1
-                num = (P_AB / sites - (P_A[i] / sites) * (P_A[k] / sites)) ** 2
-                den = (
-                    (P_A[i] / sites)
-                    * (1 - P_A[i] / sites)
-                    * (P_A[k] / sites)
-                    * (1 - P_A[k] / sites)
-                )
-                PCC[i, k] = num / den if den != 0 else 0.0
-    for i in range(samples):
-        for k in range(samples):
-            sum_pcc[i] += PCC[i, k]
-
-    # Step 2: Find max PCC sum index
-    max_idx = 0
-    for i in range(1, samples):
-        if sum_pcc[i] > sum_pcc[max_idx]:
-            max_idx = i
-
-    # Step 3: Sort rows based on PCC[max_idx] in descending order
-    indices = np.arange(samples)
-    for m in range(samples):
-        for n in range(m + 1, samples):
-            if PCC[max_idx, indices[m]] < PCC[max_idx, indices[n]]:
-                indices[m], indices[n] = indices[n], indices[m]
-
-    # Step 4: Reorder matrix
-    sorted_matrix = np.empty_like(matrix)
-    for i in range(samples):
-        for j in range(sites):
-            sorted_matrix[i, j] = matrix[indices[i], j]
-
-    return sorted_matrix
-
-
-@njit
-def daf_sorting(matrix):
-    samples, sites = matrix.shape
-    count = np.zeros(sites, dtype=int64)
-
-    # Count number of 1s per column (DAF)
-    for m in range(sites):
-        for n in range(samples):
-            if matrix[n, m] == 1:
-                count[m] += 1
-
-    # Bubble sort columns by descending count
-    for m in range(sites):
-        for n in range(m + 1, sites):
-            if count[m] < count[n]:
-                # Swap columns m and n
-                for k in range(samples):
-                    tmp = matrix[k, m]
-                    matrix[k, m] = matrix[k, n]
-                    matrix[k, n] = tmp
-                tmpc = count[m]
-                count[m] = count[n]
-                count[n] = tmpc
-
-    return matrix
-
-
-@njit
-def freq_sorting(matrix):
-    samples, sites = matrix.shape
-    weights = np.zeros(samples, dtype=np.int32)
-
-    # Step 1: Count the number of 1s (Hamming weight) per row
-    for i in range(samples):
-        for j in range(sites):
-            if matrix[i, j] == 1:
-                weights[i] += 1
-
-    # Step 2: Bubble sort rows by descending Hamming weight
-    for i in range(samples - 1):
-        for j in range(i + 1, samples):
-            if weights[i] < weights[j]:
-                # Swap weights
-                tmp_w = weights[i]
-                weights[i] = weights[j]
-                weights[j] = tmp_w
-
-                # Swap rows in matrix
-                for k in range(sites):
-                    tmp = matrix[i, k]
-                    matrix[i, k] = matrix[j, k]
-                    matrix[j, k] = tmp
-
-    return matrix
-
-
-@njit
-def pcc_column_sort_numba(matrix):
-    n, m = matrix.shape
-    PCC_matrix = np.zeros((m, m), dtype=np.float64)
-    scores = np.zeros(m, dtype=np.float64)
-
-    # Step 1: Compute PCC_matrix between columns
-    for i in range(m):
-        for j in range(m):
-            if i == j:
-                PCC_matrix[i, j] = 1.000001
-            else:
-                PA_i = 0
-                PA_j = 0
-                PAB = 0
-                for k in range(n):
-                    PA_i += matrix[k, i]
-                    PA_j += matrix[k, j]
-                    PAB += matrix[k, i] * matrix[k, j]
-
-                num = (PAB / n - (PA_i * PA_j) / (n * n)) ** 2
-                den = (PA_i / n) * (1 - PA_i / n) * (PA_j / n) * (1 - PA_j / n)
-                PCC_matrix[i, j] = num / den if den != 0 else 0.0
-    # Step 2: Compute total PCC for each SNP (column)
-    for i in range(m):
-        for j in range(m):
-            scores[i] += PCC_matrix[i, j]
-
-    # Step 3: Bubble sort columns by score (descending)
-    for i in range(m - 1):
-        for j in range(i + 1, m):
-            if scores[i] < scores[j]:
-                # Swap scores
-                tmp_score = scores[i]
-                scores[i] = scores[j]
-                scores[j] = tmp_score
-                # Swap columns i and j in matrix
-                for k in range(n):
-                    tmp = matrix[k, i]
-                    matrix[k, i] = matrix[k, j]
-                    matrix[k, j] = tmp
-
-    return matrix
-
-
-def haplotype_freq_sorting_hamming(matrix):
-    # Based on scikit haplotype counts
-
-    # setup collection
-    d = defaultdict(list)
-
-    S, n = matrix.shape
-    # iterate over haplotypes
-    for i in range(n):
-        # hash the haplotype
-        k = hash(matrix[:, i].tobytes())
-
-        # collect
-        d[k].append(i)
-
-    # extract sets, sorted by most common
-    counts = sorted(d.values(), key=len, reverse=True)
-    f = np.array([len(g) / n for g in counts], dtype=float)
-
-    # Representative column index for each group (you said groups are equal, so first is fine)
-    reps = np.array([g[0] for g in counts], dtype=int)
-
-    # Choose reference haplotype
-    ref = matrix[:, reps[np.argmax(f)]]
-
-    # Compute Hamming distance of each group's representative to ref
-    # Vectorized across all representatives
-    reps_mat = matrix[:, reps]  # shape (S, k)
-    distances = (reps_mat != ref[:, None]).sum(0)  # shape (k,)
-
-    # Sort groups by (-frequency, distance, representative index as a stable tie-breaker)
-    # np.lexsort uses last key as primary, so order keys accordingly
-    # primary: -f, then distance, then reps
-    group_order = np.lexsort((reps, distances, -f))
-
-    # final column order by concatenating columns from each group in the sorted group order
-    col_order = np.concatenate([np.asarray(counts[g], dtype=int) for g in group_order])
-    matrix_reordered = matrix[:, col_order]
-
-    return matrix_reordered, f
-
-
-def haplotype_freq_sorting(matrix):
-    """
-    Reorder matrix columns by haplotype frequency (descending), grouping columns
-    exactly as in the hashing/defaultdict approach.
-
-    Returns
-    -------
-    matrix_reordered : (S, n) ndarray
-    col_order : (n,) ndarray of int
-    groups_sorted : list[list[int]]
-    f : (k,) ndarray of float
-    """
-    matrix = np.asarray(matrix)
-    S, n = matrix.shape
-
-    # same grouping logic as in haplotype_freq_sorting_hamming
-    d = defaultdict(list)
-    for i in range(n):
-        k = hash(matrix[:, i].tobytes())
-        d[k].append(i)
-
-    # groups sorted by most common (stable for ties)
-    groups_sorted = sorted(d.values(), key=len, reverse=True)
-
-    # frequencies identical to the first function
-    f = np.array([len(g) / n for g in groups_sorted], dtype=float)
-
-    # column permutation and reordered matrix
-    if groups_sorted:
-        col_order = np.concatenate([np.asarray(g, dtype=int) for g in groups_sorted])
-    else:
-        col_order = np.array([], dtype=int)
-
-    matrix_reordered = matrix[:, col_order] if n > 0 else matrix
-
-    return matrix_reordered, col_order, groups_sorted, f
-
-
-def disrupt_genomic_positions(matrix):
-    """
-    Randomly permute (shuffle) the columns of `matrix`.
-
-    Parameters
-    ----------
-    matrix : array-like
-        2D data whose columns will be permuted.
-
-    Returns
-    -------
-    permuted : np.ndarray
-        Matrix with columns permuted.
-    """
-    arr = np.array(matrix, copy=True)
-
-    if arr.ndim != 2:
-        raise ValueError("`matrix` must be 2D.")
-
-    rng = np.random.default_rng()
-
-    n_cols = arr.shape[1]
-    perm = rng.permutation(n_cols)
-    permuted = arr[:, perm]
-
-    return permuted
-
-
-def disrupt_ld(matrix):
-    arr = matrix.T
-    np.random.shuffle(arr)
-    for j in range(arr.shape[0]):
-        # shuffle within each rows, which are snp columns
-        np.random.shuffle(arr[j])
-    return arr
-
-
-def disrupt_af(matrix):
-    rows, cols = matrix.shape
-    arr = matrix.copy().reshape(rows * cols)
-    np.random.shuffle(arr)
-    # reshape back to 2D
-    arr = arr.reshape(rows, cols)
-    # plot
-    return arr
-
-
-def mediant_af(matrix):
-    rows, cols = matrix.shape
-    num_ones = np.count_nonzero(matrix.T)
-    # make new 1D arr with the counts of two entry groups: zeros and ones
-    # zeros = # total entries - ones
-    arr = np.concatenate([np.zeros(rows * cols - num_ones), np.ones(num_ones)])
-    arr = arr.reshape((cols, rows)).T
-
-    return arr
-
-
-def mediant_af_left(matrix):
-    rows, cols = matrix.T.shape
-
-    num_ones = np.count_nonzero(matrix.T)
-    arr = np.concatenate([np.zeros(rows * cols - num_ones), np.ones(num_ones)])
-    arr = arr.reshape((cols, rows)).T
-    return arr
-
-
-################## Ranking
 
 
 def merge_regions(prediction, p):
@@ -2231,6 +1997,140 @@ def merge_regions(prediction, p):
     return df_merged, summary_stats
 
 
+def _drop_polars_bio_tables() -> None:
+    """Drop the session tables polars-bio range operations leave registered."""
+    from polars_bio.context import ctx
+
+    for table in ("s1", "s2"):
+        try:
+            ctx.deregister_table(table)
+        except Exception:
+            pass
+
+
+def _read_feature_bed(feature_coordinates: str) -> pl.DataFrame:
+    """Read a 5-column feature BED (autosomes only) in the layout rank_probabilities uses."""
+    return (
+        pl.read_csv(
+            feature_coordinates,
+            has_header=False,
+            separator="\t",
+            schema={
+                "chr": pl.Utf8,
+                "start": pl.Int64,
+                "end": pl.Int64,
+                "gene_id": pl.Utf8,
+                "strand": pl.Utf8,
+            },
+        )
+        .select("chr", "start", "end", "strand", "gene_id")
+        .filter(pl.col("chr").is_in([str(i) for i in range(1, 23)]))
+        .with_columns((pl.lit("chr") + pl.col("chr")).alias("chr"))
+        .sort(["chr", "start"])
+        # explicit deterministic order to break full ties exactly like bedtools A-stream
+        .with_row_index("gene_order", offset=0)
+    )
+
+
+def find_prediction_files(
+    prediction_dir: str,
+    populations: list[str],
+    pattern: str = "{pop}_*predictions.txt",
+) -> list[str]:
+    """
+    Resolve one prediction file per population, in ``populations`` order.
+
+    :param prediction_dir: Folder holding one prediction file per population.
+    :param populations: Population codes; each must match exactly one file.
+    :param pattern: Glob pattern relative to ``prediction_dir``; ``{pop}`` is replaced
+        by each population code. The default ends in ``predictions.txt`` so ranked
+        outputs (``*_rank_<k>.txt``) in the same folder are ignored.
+    :returns: List of file paths, same order as ``populations``.
+    :raises ValueError: If a population matches zero or several files.
+    """
+    files = []
+    for pop in populations:
+        hits = sorted(glob.glob(os.path.join(prediction_dir, pattern.format(pop=pop))))
+        if len(hits) != 1:
+            raise ValueError(
+                f"population '{pop}': expected 1 file matching "
+                f"'{pattern.format(pop=pop)}' in {prediction_dir}, found {len(hits)}"
+                + (f": {[os.path.basename(h) for h in hits]}" if hits else "")
+            )
+        files.append(hits[0])
+    return files
+
+
+def rank_merge(
+    prediction_files: list[str],
+    populations: list[str],
+    feature_coordinates: str,
+    output: str | None = None,
+    k: int = 111,
+) -> tuple[pl.DataFrame, dict]:
+    """
+    Rank genomic features in several populations and merge the ranks into one table.
+
+    Each prediction file is ranked with :func:`rank_probabilities`. The ranks are joined
+    on ``gene_id``, one column per population in ``populations`` order, and sorted by
+    ``gene_id``. This is the ``sweep_files`` input of
+    :func:`flexsweep.enrichment.run_enrichment`, which reads rank columns by position.
+
+    :param prediction_files: One prediction file per population (same order as
+        ``populations``), e.g. from :func:`find_prediction_files`.
+    :param populations: Population codes, used as column names.
+    :param feature_coordinates: BED file (``chr start end gene_id strand``, 0-based,
+        no header).
+    :param output: If given, write the table space-separated without header
+        (gzipped if the name ends in ``.gz``).
+    :param k: Nearest prediction windows per feature, passed to ``rank_probabilities``.
+    :returns: ``(df, ties)``: the merged table (``gene_id`` + one Int64 rank column per
+        population) and ``{population: number of features tied at the top probability}``.
+    :raises ValueError: If lengths differ, or populations rank different feature sets.
+    """
+    if len(prediction_files) != len(populations):
+        raise ValueError(
+            f"{len(prediction_files)} prediction files for {len(populations)} populations"
+        )
+    df_genes = _read_feature_bed(feature_coordinates)
+
+    merged = None
+    ref_ids = None
+    ties = {}
+    for pop, f in zip(populations, prediction_files):
+        ranked, n_tied = rank_probabilities(f, df_genes, k=k)
+        ties[pop] = n_tied
+        df_pop = ranked.select(
+            pl.col("gene_id"), pl.col("rank").cast(pl.Int64).alias(pop)
+        )
+        ids = set(df_pop["gene_id"].to_list())
+        if len(ids) != df_pop.height:
+            raise ValueError(f"population '{pop}' ({f}): duplicated gene_id in ranking")
+        if ref_ids is None:
+            ref_ids, ref_pop = ids, pop
+            merged = df_pop
+        else:
+            if ids != ref_ids:
+                extra = sorted(ids - ref_ids)[:5]
+                missing = sorted(ref_ids - ids)[:5]
+                raise ValueError(
+                    f"population '{pop}' ({f}) ranks a different gene set than "
+                    f"'{ref_pop}': extra {extra}, missing {missing}"
+                )
+            merged = merged.join(df_pop, on="gene_id", how="inner")
+
+    merged = merged.sort("gene_id")
+
+    if output is not None:
+        if output.endswith(".gz"):
+            with gzip.open(output, "wb") as fh:
+                merged.write_csv(fh, separator=" ", include_header=False)
+        else:
+            merged.write_csv(output, separator=" ", include_header=False)
+
+    return merged, ties
+
+
 def rank_probabilities(prediction, feature_coordinates, rank_distance=False, k=111):
     """
     Goal: match the original pybedtools/bedtools output *exactly*, including tie order.
@@ -2259,26 +2159,7 @@ def rank_probabilities(prediction, feature_coordinates, rank_distance=False, k=1
         )
 
     if isinstance(feature_coordinates, str):
-        df_genes = (
-            pl.read_csv(
-                feature_coordinates,
-                has_header=False,
-                separator="\t",
-                schema={
-                    "chr": pl.Utf8,
-                    "start": pl.Int64,
-                    "end": pl.Int64,
-                    "gene_id": pl.Utf8,
-                    "strand": pl.Utf8,
-                },
-            )
-            .select("chr", "start", "end", "strand", "gene_id")
-            .filter(pl.col("chr").is_in([str(i) for i in range(1, 23)]))
-            .with_columns((pl.lit("chr") + pl.col("chr")).alias("chr"))
-            .sort(["chr", "start"])
-            # explicit deterministic order to break full ties exactly like bedtools A-stream
-            .with_row_index("gene_order", offset=0)
-        )
+        df_genes = _read_feature_bed(feature_coordinates)
     elif isinstance(feature_coordinates, pl.DataFrame):
         df_genes = feature_coordinates.clone()
         if "gene_id" not in df_genes.columns and "feature_id" in df_genes.columns:
@@ -2319,12 +2200,14 @@ def rank_probabilities(prediction, feature_coordinates, rank_distance=False, k=1
     genes = _to_point_1based_closed(df_genes.rename({"chr": "chr"}), chr_col="chr")
     preds = _to_point_1based_closed(df_pred.rename({"chr": "chr"}), chr_col="chr")
 
-    genes_lf = genes.lazy()
-    preds_lf = preds.lazy()
-
+    # polars-bio (0.31) registers each range operation's inputs as session tables
+    # "s1"/"s2" and never drops them: a second operation (overlap below, or the next
+    # call) fails with "The table s1 already exists". Materialize each operation and
+    # drop the tables before the next one.
+    _drop_polars_bio_tables()
     nearest_raw = nearest(
-        genes_lf,
-        preds_lf,
+        genes,
+        preds,
         suffixes=("_gene", "_pred"),
         cols1=["chrom", "start", "end"],
         cols2=["chrom", "start", "end"],
@@ -2373,14 +2256,19 @@ def rank_probabilities(prediction, feature_coordinates, rank_distance=False, k=1
         )
     )
 
+    gene_windows = gene_windows.collect()
+    _drop_polars_bio_tables()
     hits_raw = overlap(
         gene_windows,
-        preds_lf,
+        preds,
         suffixes=("_win", "_pred"),
         cols1=["chrom", "start", "end"],
         cols2=["chrom", "start", "end"],
         output_type="polars.LazyFrame",
     )
+    # hits feeds two aggregations below; collect once so overlap runs once.
+    hits_raw = hits_raw.collect().lazy()
+    _drop_polars_bio_tables()
 
     hits = hits_raw.rename(
         {
