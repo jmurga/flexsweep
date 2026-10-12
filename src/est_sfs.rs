@@ -594,7 +594,8 @@ pub fn fit_substitution_model(
         k_min: 1e-4,
         k_max: 10.0,
         kappa_min: 1e-3,
-        kappa_max: 10.0,
+        // est-sfs bounds kappa only below (kappa > 0); 10 is only its starting range
+        kappa_max: 100.0,
     };
 
     let dim = op.dim();
@@ -627,34 +628,52 @@ pub fn fit_substitution_model(
         }
 
         if method == PolarizationMethod::R6 {
-            // pick small values so sum < 1 safely
-            // e.g. 5 * 0.05 = 0.25, so r6[5] = 0.75
-            let base = 0.05;
+            // C (set_up_random_starting_values): six uniform rates normalised to sum 1;
+            // the first five are free parameters, r6[5] = 1 - sum
+            let mut r = [0.0f64; 6];
+            for ri in r.iter_mut() {
+                *ri = rng.random::<f64>().max(1e-6);
+            }
+            let sum: f64 = r.iter().sum();
             for i in 0..5 {
-                z0[n_branches + i] = logit(base);
+                z0[n_branches + i] = logit(r[i] / sum);
             }
         }
 
-        let simplex = initial_simplex(&z0, 0.5);
-        let solver = NelderMead::new(simplex);
+        // C (est-sfs main loop): rerun the simplex from the current solution until the
+        // log-likelihood improves by < 0.01 (at most 100 runs), each run up to 1000
+        // iterations. A single fixed-length run often stalls in 6-10 dimensions (K2, R6)
+        // and ends below est-sfs's optimum.
+        let mut z_cur = z0;
+        let mut nll_cur = f64::INFINITY;
+        for run in 0..100 {
+            let simplex = initial_simplex(&z_cur, 0.5);
+            let solver = NelderMead::new(simplex)
+                .with_sd_tolerance(1e-10)
+                .map_err(|e| format!("argmin setup failed: {e}"))?;
+            let res = Executor::new(op.clone(), solver)
+                .configure(|state| state.max_iters(1000))
+                .run()
+                .map_err(|e| format!("argmin run failed: {e}"))?;
+            let nll = res.state().best_cost;
+            let improvement = nll_cur - nll;
+            if nll < nll_cur {
+                nll_cur = nll;
+                z_cur = res
+                    .state()
+                    .best_param
+                    .as_ref()
+                    .ok_or_else(|| "No best_param returned by argmin".to_string())?
+                    .clone();
+            }
+            if run > 0 && improvement < 0.01 {
+                break;
+            }
+        }
 
-        let res = Executor::new(op.clone(), solver)
-            .configure(|state| state.max_iters(600))
-            .run()
-            .map_err(|e| format!("argmin run failed: {e}"))?;
-
-        let z_hat = res
-            .state()
-            .best_param
-            .as_ref()
-            .ok_or_else(|| "No best_param returned by argmin".to_string())?
-            .clone();
-
-        let nll = res.state().best_cost;
-
-        if nll < best_nll {
-            best_nll = nll;
-            best_z = z_hat;
+        if nll_cur < best_nll {
+            best_nll = nll_cur;
+            best_z = z_cur;
         }
     }
 
@@ -1459,8 +1478,13 @@ pub fn posterior_ancestral_per_site(
     let mut pt = ptree(n_outgroups, major_state as i8, &outgroup_counts, &cache);
     normalize(&mut pt);
 
-    // Major is ancestral, no swap needed
-    let modified_record = if p_major_anc >= 0.5 {
+    // p_major_anc = P(major allele is ancestral); the major allele is REF or ALT
+    // depending on the counts. Swap REF/ALT only when the inferred ancestral allele is
+    // ALT (previously REF was assumed to be the major allele, which inverted the call
+    // at every site where ALT is the more frequent allele).
+    let major_is_ref = n_ref >= n_alt;
+    let ancestral_is_ref = (p_major_anc >= 0.5) == major_is_ref;
+    let modified_record = if ancestral_is_ref {
         None
     } else {
         // Need to swap
