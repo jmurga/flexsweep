@@ -929,30 +929,59 @@ def pivot_feature_vectors(df_fv, vcf=False):
     return df_fv_w
 
 
-def get_closest_snps(position_array, center, N):
-    """
-    Given a list of SNP positions and a center position, return the indices of the N closest SNPs.
+def get_closest_snps(position_array, center, N, symmetric=False):
+    """Given a 1D array of SNP positions and a center coordinate, return the indices
+
+    of the N closest SNPs.
 
     Args:
-        position_array (np.ndarray): 1D array of SNP positions (bp).
+        position_array (np.ndarray | list): 1D array of SNP positions (bp or
+          normalized [0, 1]).
         center (int | float): Central genomic coordinate.
-        N (int): Number of SNPs to select. Must be <= len(position_array).
+        N (int): Number of SNPs to select. Must be 1 <= N <=
+          len(position_array).
+        symmetric (bool): If True, returns a contiguous window of N SNPs
+          centered on the SNP closest to `center`. Supports both odd and even N
+          (e.g., odd N yields equal left/right SNP counts around the central
+          SNP).
 
     Returns:
-        np.ndarray: Indices of the N closest SNPs (sorted by increasing distance, then by position).
+        np.ndarray: 1D array of N selected SNP indices (sorted by genomic
+        position).
 
     Raises:
-        AssertionError: If `position_array` is not 1D or if `N` exceeds array length.
-
-    Notes:
-        - Ties are resolved by `np.argsort` stability on the distance array; if exact distances tie,relative order follows input order.
+        AssertionError: If `position_array` is not 1D or `N` is out of valid
+          range.
+        ValueError: If `symmetric=True` and there are insufficient SNPs on
+          either side of the central SNP to extract a window of size N.
     """
     position_array = np.asarray(position_array)
     assert position_array.ndim == 1, "position_array must be a 1D array"
-    assert N <= len(position_array), "N exceeds the number of SNPs in the array"
+    assert (
+        0 < N <= len(position_array)
+    ), f"N must be between 1 and {len(position_array)}, got {N}"
 
+    if symmetric:
+        # 1. Find the index of the SNP closest to the central coordinate
+        center_idx = int(np.argmin(np.abs(position_array - center)))
+
+        # 2. Compute slice bounds with center_idx at offset N // 2
+        start_idx = center_idx - (N // 2)
+        end_idx = start_idx + N
+
+        # 3. Verify bounds exist on both sides
+        if start_idx < 0 or end_idx > len(position_array):
+            raise ValueError(
+                f"Not enough SNPs around center index {center_idx} "
+                f"to extract a symmetric window of size N={N} "
+                f"(required range: [{start_idx}, {end_idx}), total SNPs: {len(position_array)})"
+            )
+
+        return np.arange(start_idx, end_idx)
+
+    # Non-symmetric: select N closest SNPs purely by coordinate distance
     distances = np.abs(position_array - center)
-    closest_indices = np.argsort(distances)[:N]
+    closest_indices = np.argsort(distances, kind="stable")[:N]
     return np.sort(closest_indices)
 
 

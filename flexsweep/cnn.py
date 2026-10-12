@@ -600,6 +600,25 @@ class CNN:
 
         return output
 
+    def cnn_hap_image(self, model_input, num_classes=1):
+        """
+        Image CNN for haplotype matrices (see :func:`hap_image_cnn`).
+
+        Parameters
+        ----------
+        model_input : tf.keras.layers.Input
+            Input tensor of shape ``(haplotypes, SNPs, 1)``.
+        num_classes : int, default=1
+            1 gives a sigmoid output, more gives softmax.
+
+        Returns
+        -------
+        tf.Tensor
+            Output tensor, to be passed to :meth:`train` as ``cnn=...``.
+        """
+        self.check_tf()
+        return hap_image_cnn(model_input, num_classes=num_classes)
+
     def load_training_data(self, _stats=None, w=None, n=None, one_dim=False):
         """
         Load and reshape training/validation/test tensors from table-format features.
@@ -615,7 +634,7 @@ class CNN:
         n : int | None
             Optional number of rows to sample from parquet.
         one_dim : bool, default=False
-            If True, flatten spatial grid to ``(W*C, S)`` for 1D models.
+            If True, return ``(W*C, S)`` inputs (positions x statistics) for 1D models.
 
         Returns
         -------
@@ -623,9 +642,12 @@ class CNN:
             ``(X_train, X_test, Y_train, Y_test, X_valid, Y_valid)`` with shapes:
 
             - if ``one_dim`` is False:
-              ``X_*`` → ``(N, W, C, S)``, labels are 0/1.
+              ``X_*`` -> ``(N, S, W*C, 1)``, labels are 0/1.
             - if ``one_dim`` is True:
-              ``X_*`` → ``(N, W*C, S)``.
+              ``X_*`` -> ``(N, W*C, S)``.
+
+            ``W*C`` follows the parquet column order of each statistic; the
+            geometry is read from the column names (see :meth:`_feature_tensor`).
 
         Raises
         ------
@@ -685,15 +707,10 @@ class CNN:
         if _stats is not None:
             stats = stats + _stats
 
-        train_stats = []
-        for i in stats:
-            train_stats.append(tmp.select(pl.col(f"^{i}_[0-9]+_[0-9]+$")))
-
-        train_stats = pl.concat(train_stats, how="horizontal")
         train_stats = pl.concat(
             [
                 tmp.select("model", "iter", "s", "f_i", "f_t", "t", "mu", "r"),
-                train_stats,
+                tmp.select(pl.col(f"^({'|'.join(stats)})_[0-9]+_[0-9]+$")),
             ],
             how="horizontal",
         )
@@ -714,77 +731,20 @@ class CNN:
         ) = train_test_split(
             train_stats, y, test_size=test_split, shuffle=True, random_state=self.seed
         )
-
-        X_train = (
-            X_train.select(X_train.columns[8:])
-            .to_numpy()
-            .reshape(
-                X_train.shape[0],
-                self.num_stats,
-                self.windows.size * self.center.size,
-                1,
-            )
-        )
-
         X_valid, X_test, Y_valid, Y_test = train_test_split(
             X_test, y_test, test_size=0.5, random_state=self.seed
         )
-
         X_test_params = X_test.select(X_test.columns[:6])
-        X_test = (
-            X_test.select(train_stats.columns[8:])
-            .to_numpy()
-            .reshape(
-                X_test.shape[0],
-                self.num_stats,
-                self.windows.size * self.center.size,
-                1,
-            )
-        )
-        X_valid = (
-            X_valid.select(train_stats.columns[8:])
-            .to_numpy()
-            .reshape(
-                X_valid.shape[0],
-                self.num_stats,
-                self.windows.size * self.center.size,
-                1,
-            )
-        )
+
+        X_train = self._feature_tensor(X_train, stats, one_dim)
+        X_test = self._feature_tensor(X_test, stats, one_dim)
+        X_valid = self._feature_tensor(X_valid, stats, one_dim)
 
         # Normalization on training data
         if self.normalize:
             self.stat_norm = tf.keras.layers.Normalization(axis=-1, name="stat_norm")
             self.stat_norm.adapt(X_train)
             # learns mean/std from training set only
-
-        # Input stats as channel to improve performance
-        # Avoiding changes stats order
-
-        X_train = X_train.reshape(
-            X_train.shape[0], self.windows.size, self.center.size, self.num_stats
-        )
-        X_test = X_test.reshape(
-            X_test.shape[0], self.windows.size, self.center.size, self.num_stats
-        )
-        X_valid = X_valid.reshape(
-            X_valid.shape[0], self.windows.size, self.center.size, self.num_stats
-        )
-
-        X_test = X_test.reshape(
-            X_test.shape[0], self.windows.size, self.center.size, self.num_stats
-        )
-
-        if one_dim:
-            X_train = X_train.reshape(
-                -1, self.windows.size * self.center.size, self.num_stats
-            )
-            X_valid = X_valid.reshape(
-                -1, self.windows.size * self.center.size, self.num_stats
-            )
-            X_test = X_test.reshape(
-                -1, self.windows.size * self.center.size, self.num_stats
-            )
 
         self.test_train_data = [X_test, X_test_params, Y_test]
 
@@ -823,7 +783,8 @@ class CNN:
             Defaults to :meth:`cnn_flexsweep`. If ``one_dim=True``, you must
             provide a compatible 1D architecture.
         one_dim : bool, default=False
-            If True, uses flattened ``(W*C, S)`` inputs.
+            If True, uses ``(W*C, S)`` inputs (positions x statistics); otherwise
+            ``(S, W*C, 1)``.
 
         Returns
         -------
@@ -894,16 +855,6 @@ class CNN:
 
         self.num_stats = len(_stats)
         self.feature_names = list(_stats)
-
-        X_train = X_train.reshape(
-            X_train.shape[0], self.num_stats, self.center.size * self.windows.size, 1
-        )
-        X_test = X_test.reshape(
-            X_test.shape[0], self.num_stats, self.center.size * self.windows.size, 1
-        )
-        X_valid = X_valid.reshape(
-            X_valid.shape[0], self.num_stats, self.center.size * self.windows.size, 1
-        )
 
         # put model together
         input_to_model = tf.keras.Input(X_train.shape[1:])
@@ -1049,10 +1000,6 @@ class CNN:
 
         test_X, test_X_params, test_Y = deepcopy(self.test_train_data)
 
-        test_X = test_X.reshape(
-            test_X.shape[0], self.num_stats, self.windows.size * self.center.size, 1
-        )
-
         # self.mean = test_X.mean(axis=(0, 1, 2), keepdims=False)
         # self.std = test_X.std(axis=(0, 1, 2), keepdims=False)
 
@@ -1107,16 +1054,7 @@ class CNN:
         else:
             df = pl.read_csv(self.train_data, separator=",")
 
-        stat_frames = [
-            df.select(pl.col(f"^{name}_[0-9]+_[0-9]+$")) for name in self.feature_names
-        ]
-        X_df = pl.concat(stat_frames, how="horizontal")
-        X = X_df.to_numpy().reshape(
-            df.shape[0],
-            len(self.feature_names),
-            self.center.size * self.windows.size,
-            1,
-        )
+        X = self._feature_tensor(df, list(self.feature_names))
         y = (~df["model"].str.contains("neutral")).cast(pl.Int8).to_numpy()
         return X, y
 
@@ -1200,7 +1138,7 @@ class CNN:
         return df, fig
 
     def predict(
-        self, _stats=None, w=None, one_dim=False, _iter=1, fname=None, preprocess=False
+        self, _stats=None, w=None, one_dim=None, _iter=1, fname=None, preprocess=False
     ):
         """
         Predict on a feature table using a trained model.
@@ -1211,8 +1149,9 @@ class CNN:
             Statistic base names to include; defaults to the 11 flex-sweep stats.
         w : int | list[int] | None
             Window size(s) to select.
-        simulations : bool, default=False
-            Reserved flag; has no effect here.
+        one_dim : bool | None, default=None
+            Input layout: ``(W*C, S)`` if True, ``(S, W*C, 1)`` if False. None infers
+            it from the model's input rank (3 -> 1D, 4 -> 2D).
         _iter : int, default=1
             Tag for output naming (unused).
 
@@ -1290,15 +1229,8 @@ class CNN:
         )
         regions = df_test["iter"].to_numpy()
 
-        stats = []
-        if _stats is not None:
-            stats = stats + _stats
-        test_stats = []
-
-        for i in stats:
-            test_stats.append(df_test.select(pl.col(f"^{i}_[0-9]+_[0-9]+$")))
-
-        X_test = pl.concat(test_stats, how="horizontal")
+        stats = list(_stats)
+        X_test = df_test.select(pl.col(f"^({'|'.join(stats)})_[0-9]+_[0-9]+$"))
 
         if w is not None:
             try:
@@ -1315,14 +1247,9 @@ class CNN:
             "model", "iter", "s", "f_i", "f_t", "t", "mu", "r"
         )
 
-        test_X = X_test.to_numpy().reshape(
-            X_test.shape[0], self.num_stats, self.windows.size * self.center.size, 1
-        )
-
-        if one_dim:
-            test_X = test_X.reshape(
-                -1, self.windows.size * self.center.size, self.num_stats
-            )
+        if one_dim is None:
+            one_dim = len(model.inputs[0].shape) == 3
+        test_X = self._feature_tensor(X_test, stats, one_dim)
 
         if preprocess:
             self.mean = test_X.mean(axis=(0, 1, 2), keepdims=False)
@@ -1635,6 +1562,53 @@ class CNN:
                 f"{shown}{' ...' if len(bad) > 10 else ''}. Regenerate the feature "
                 "vectors (fvs-discoal / fvs-vcf) or drop these columns."
             )
+
+    def _feature_tensor(self, df: pl.DataFrame, stats: list[str], one_dim: bool = False):
+        """
+        Supervised-CNN input tensor from ``{stat}_{window}_{center}`` columns.
+
+        The window/center geometry is read from the column names, so non-uniform
+        centers (e.g. log-distance or radial schemes) need no constructor arguments.
+        Sets :attr:`windows`, :attr:`center` (sorted unique values) and :attr:`n_pos`
+        (positions per statistic, in parquet column order).
+
+        Returns
+        -------
+        np.ndarray
+            ``(N, S, P, 1)`` for 2D models or ``(N, P, S)`` when ``one_dim`` is True,
+            with ``P`` positions (windows x centers) and ``S = len(stats)``.
+
+        Raises
+        ------
+        ValueError
+            If a statistic has no columns or its window/center columns differ from
+            those of the first statistic.
+        """
+        ref, blocks = None, []
+        for stat in stats:
+            blk = df.select(pl.col(f"^{stat}_[0-9]+_[0-9]+$"))
+            keys = [tuple(int(v) for v in c.rsplit("_", 2)[1:]) for c in blk.columns]
+            if ref is None:
+                ref = keys
+            if not keys or keys != ref:
+                raise ValueError(
+                    f"statistic {stat!r}: window/center columns are missing or differ "
+                    f"from those of {stats[0]!r}; every statistic needs the same "
+                    "{stat}_{window}_{center} columns in the same order"
+                )
+            blocks.append(blk)
+        self.windows = np.unique([w for w, _ in ref])
+        self.center = np.unique([c for _, c in ref])
+        self.n_pos = len(ref)
+        X = (
+            pl.concat(blocks, how="horizontal")
+            .to_numpy()
+            .reshape(df.height, len(stats), self.n_pos)
+        )
+        if one_dim:
+            # Stat-major columns -> positions as steps, statistics as channels
+            return np.ascontiguousarray(X.transpose(0, 2, 1))
+        return X[..., None]
 
     def _select_stats_matrix(self, df: pl.DataFrame, stats: list[str]):
         # Standardize model: anything not 'neutral' -> 'sweep'
@@ -3593,3 +3567,56 @@ def subset_genomic_windows(
         )
 
     return out
+
+
+def hap_image_cnn(model_input, num_classes=1, filters=64, dense=128, dropout=0.5):
+    """
+    Image CNN for haplotype matrices: two convolutions and a flattened dense head.
+
+    This is the architecture published with DANN-sweeps (Harris, Mo, Siepel and Garud
+    2025), itself in the ImaGene lineage (Torada et al. 2019): two 3x3 convolutions with
+    ``filters`` channels, each followed by 2x2 max pooling, then ``Flatten`` and two
+    ``dense``-unit layers with ReLU and dropout. It is meant for the images built by
+    :mod:`flexsweep.hap_matrix`, not for feature vectors; for those use
+    :meth:`CNN.cnn_flexsweep`, whose pooling assumes a small statistics x positions grid.
+
+    Parameters
+    ----------
+    model_input : tf.Tensor
+        Input tensor of shape ``(haplotypes, SNPs, 1)``.
+    num_classes : int, default=1
+        1 gives a sigmoid output (neutral vs sweep), more gives softmax.
+    filters : int, default=64
+        Channels in both convolutions.
+    dense : int, default=128
+        Units in each of the two dense layers.
+    dropout : float, default=0.5
+        Dropout rate after each dense layer.
+
+    Returns
+    -------
+    tf.Tensor
+        Output tensor. Pass the function to :meth:`CNN.train` as ``cnn=...`` or build a
+        model directly with ``tf.keras.Model(inp, hap_image_cnn(inp))``.
+
+    Notes
+    -----
+    The head flattens the last feature map instead of pooling it globally, so the
+    position of a feature along the SNP axis (its distance from the locus centre) is
+    kept. Almost all of the parameters sit in the first dense layer, so the count scales
+    with the image size: about 14.2 million for a 150 x 201 image, 20.5 million for
+    216 x 201.
+    """
+    x = tf.keras.layers.Conv2D(filters, 3, activation="relu", name="hap_conv1")(model_input)
+    x = tf.keras.layers.MaxPooling2D(2, name="hap_pool1")(x)
+    x = tf.keras.layers.Conv2D(filters, 3, activation="relu", name="hap_conv2")(x)
+    x = tf.keras.layers.MaxPooling2D(2, name="hap_pool2")(x)
+    x = tf.keras.layers.Flatten(name="feature_extractor")(x)
+    for i in (1, 2):
+        x = tf.keras.layers.Dense(dense, name=f"hap_dense{i}")(x)
+        x = tf.keras.layers.Activation("relu", name=f"hap_relu{i}")(x)
+        x = tf.keras.layers.Dropout(dropout, name=f"hap_drop{i}")(x)
+    activation = "sigmoid" if num_classes == 1 else "softmax"
+    return tf.keras.layers.Dense(
+        num_classes, activation=activation, name="out_dense"
+    )(x)
