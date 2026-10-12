@@ -185,6 +185,14 @@ def open_tree(ts, seq_len=1.2e6):
     """
     from allel import HaplotypeArray
 
+    if isinstance(ts, str):
+        try:
+            import tskit
+        except ImportError as e:
+            raise ImportError(
+                "Reading a tree sequence file needs tskit: pip install tskit"
+            ) from e
+
     try:
         if isinstance(ts, str):
             ts = tskit.load(ts)
@@ -1633,26 +1641,9 @@ def summary_statistics(
     """
 
     if only_normalize:
-        if vcf:
-            return _normalize_vcf_stats(
-                data_dir,
-                nthreads,
-                windows,
-                step,
-                locus_length,
-                r_bins,
-                suffix,
-            )
-        else:
-            return _normalize_sims_stats(
-                data_dir,
-                nthreads,
-                windows,
-                step,
-                locus_length,
-                r_bins,
-                suffix,
-            )
+        raise NotImplementedError(
+            "only_normalize is not implemented; run summary_statistics without it."
+        )
     else:
         if vcf:
             if func is not None and stats is None:
@@ -3138,6 +3129,14 @@ def normalize_stats(
     df_fv_w = pivot_feature_vectors(df_fv, vcf=vcf)
     df_fv_w_raw = pivot_feature_vectors(df_fv_raw, vcf=vcf)
 
+    # z-scores divide by std without a zero/null guard, so a group with std 0 yields
+    # +/-inf. Treat inf like NaN: it then follows the same rule below (windows with
+    # >= 10% missing features dropped, remaining missing values set to 0).
+    df_fv_w = df_fv_w.with_columns(
+        pl.when(pl.col(c).is_infinite()).then(None).otherwise(pl.col(c)).alias(c)
+        for c, dtype in df_fv_w.schema.items()
+        if dtype.is_float()
+    )
     df_fv_w = df_fv_w.fill_nan(None)
     num_nans = (
         df_fv_w.select(pl.exclude(["iter", "s", "t", "f_i", "f_t", "mu", "r", "model"]))
