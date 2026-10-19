@@ -57,15 +57,47 @@ Flex-sweep ships the ancestral-state polarization module
 from `est-sfs <https://doi.org/10.1534/genetics.118.301120>`_. The Rust sources
 are bound to Python with `maturin <https://www.maturin.rs/>`_, which is
 resolved automatically as a build dependency. The Rust toolchain itself is not,
-so a source build additionally requires ``cargo`` and ``rustc``:
+so a source build additionally requires ``cargo`` and ``rustc``.
+
+Rust links through the system C toolchain, so a source build also needs a C
+compiler and linker (``cc``), plus ``curl`` and ``git`` to fetch the installers
+and the repository. Minimal systems and container images (for example the
+``ubuntu`` or ``debian`` Docker images) ship none of them. Without ``cc`` the
+build fails with ``failed to find tool "cc"`` or ``no default linker (cc) was
+found in your PATH``. Install them first:
+
+.. code-block:: bash
+
+    # Debian / Ubuntu
+    sudo apt-get update
+    sudo apt-get install -y build-essential curl git ca-certificates
+
+    # Fedora / RHEL
+    sudo dnf install -y gcc gcc-c++ make curl git
+
+    # macOS (Apple command line tools: clang, make, git)
+    xcode-select --install
+
+Inside a container you are usually root: drop ``sudo``. The same compiler also
+covers the discoal fallback build described above.
+
+Then install the Rust toolchain and uv:
 
 .. code-block:: bash
 
     # Rust toolchain (skip if `cargo --version` already works)
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    . "$HOME/.cargo/env"    # put cargo on the PATH of the current shell
 
     # uv (skip if `uv --version` already works)
     curl -LsSf https://astral.sh/uv/install.sh | sh
+
+``rustup`` adds ``cargo`` to the ``PATH`` of new shells only. Source
+``$HOME/.cargo/env`` as shown, or open a new terminal, before building.
+
+The same prerequisites apply to ``pip install flexsweep`` on platforms without a
+published wheel (for example macOS or ARM), because pip then builds from the
+sdist.
 
 Clone the repository and build the wheel:
 
