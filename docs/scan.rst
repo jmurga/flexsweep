@@ -67,6 +67,26 @@ writes one file per statistic, ``results/yri.<stat>.txt``, at the statistic's ow
 resolution (:ref:`scan-output`). Options are listed in :ref:`scan-cli`; statistic
 parameters in :ref:`scan-window-mode` and the tables below.
 
+.. note::
+
+   **Temporary disk space.** All chromosomes are loaded and processed in a single
+   joblib task pool, and joblib writes the large haplotype arrays to a temporary
+   folder until the pool finishes. By default (``--tmp_dir`` unset) Flex-sweep keeps
+   joblib's own choice: the folder in ``JOBLIB_TEMP_FOLDER`` if set, otherwise
+   ``/dev/shm``, otherwise the system temporary folder (``TMPDIR``, typically
+   ``/tmp``). If a genome-wide scan fails with
+   ``OSError: [Errno 28] No space left on device``, point the temporary files to a
+   larger disk:
+
+   .. code-block:: bash
+
+       flexsweep scan --vcf_path yri_vcfs --out_prefix results/yri --stats ihs \
+           --tmp_dir /path/to/large/disk/tmp
+       # or, for any flexsweep command
+       export JOBLIB_TEMP_FOLDER=/path/to/large/disk/tmp
+
+   ``--tmp_dir`` (``tmp_dir=`` in Python) takes precedence over ``JOBLIB_TEMP_FOLDER``.
+
 Available statistics
 --------------------
 
@@ -542,6 +562,12 @@ CLI reference
    * - ``--nthreads INT``
      - 1
      - Number of parallel workers.
+   * - ``--tmp_dir PATH``
+     - joblib default
+     - Folder for joblib's temporary array files. Default order:
+       ``JOBLIB_TEMP_FOLDER``, then ``/dev/shm``, then ``/tmp``. All chromosomes
+       share one task pool, so point it (or ``JOBLIB_TEMP_FOLDER``) to a large disk
+       when ``/tmp`` is small.
 
 Examples:
 

@@ -1611,6 +1611,7 @@ def scan(
     min_rate=0.0,
     nthreads=1,
     window_mode="auto",
+    tmp_dir=None,
     **kwargs,
 ) -> dict[str, pl.DataFrame]:
     """Standalone outlier scan from a directory of per-chromosome VCF files.
@@ -1673,6 +1674,10 @@ def scan(
         "auto" (default) uses per-stat defaults from STAT_REGISTRY.
         "snp" forces SNP-count windows for all window stats.
         "bp" forces physical bp windows for all window stats.
+    tmp_dir:
+        Folder for joblib temporary memmap files of the global task pool.
+        ``None`` (default) -> joblib's default (``JOBLIB_TEMP_FOLDER``, then
+        ``/dev/shm``, then the system temp folder, typically ``/tmp``).
     kwargs:
         Shared overrides forwarded to all stats: max_extend, K_truncation,
         sweep_mode, raisd_window, tf, etc.
@@ -1965,7 +1970,9 @@ def scan(
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        task_results = Parallel(n_jobs=nthreads, backend="loky", verbose=2)(all_tasks)
+        task_results = Parallel(
+            n_jobs=nthreads, backend="loky", verbose=2, temp_folder=tmp_dir
+        )(all_tasks)
 
     # ------------------------------------------------------------------
     # Phase 4: Collect results and reassemble into raw_per_stat dict.

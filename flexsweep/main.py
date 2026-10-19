@@ -504,6 +504,13 @@ def fvs_discoal(
     default=False,
     help="Save raw statistics.",
 )
+@click.option(
+    "--tmp_dir",
+    type=str,
+    required=False,
+    default=None,
+    help="Folder for joblib temporary memmap files, cleaned after each VCF. Default: joblib's (JOBLIB_TEMP_FOLDER, then /dev/shm, then /tmp).",
+)
 def fvs_vcf(
     vcf_path,
     stats,
@@ -517,6 +524,7 @@ def fvs_vcf(
     save_stats,
     suffix,
     nthreads,
+    tmp_dir,
 ):
     """
     Estimate summary statistics from VCF files and build feature vectors.
@@ -564,6 +572,7 @@ def fvs_vcf(
         suffix=suffix,
         func=None,
         save_stats=save_stats,
+        tmp_dir=tmp_dir,
     )
 
 
@@ -1744,6 +1753,12 @@ def split_maf(maf, contig, outdir, sort, tmp_dir, chunk_bytes):
     show_default=True,
     help="Drop windows below this recombination rate (cM/Mb) when --r_bins is set.",
 )
+@click.option(
+    "--tmp_dir",
+    type=str,
+    default=None,
+    help="Folder for joblib temporary memmap files. Default: joblib's (JOBLIB_TEMP_FOLDER, then /dev/shm, then /tmp).",
+)
 def scan(
     vcf_path,
     out_prefix,
@@ -1764,6 +1779,7 @@ def scan(
     window_size,
     r_bins,
     min_rate,
+    tmp_dir,
 ):
     """Standalone outlier scan from a directory of per-chromosome VCF files.
 
@@ -1811,6 +1827,7 @@ def scan(
         min_rate=min_rate,
         nthreads=nthreads,
         window_mode=window_mode,
+        tmp_dir=tmp_dir,
         config={
             "lassi": {"K_truncation": K_truncation, "sweep_mode": sweep_mode},
             "lassip": {

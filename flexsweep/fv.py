@@ -1011,6 +1011,7 @@ def _process_vcf(
     save_stats=False,
     stats=None,
     centers=None,
+    tmp_dir=None,
 ):
     from . import Parallel, delayed
     from .data import Data
@@ -1039,6 +1040,9 @@ def _process_vcf(
         Optional suffix appended to output file names.
     :param callable func:
         Function to  estimate summary statistics. See ``calculate_stats_vcf_flat``.
+    :param str tmp_dir:
+        Folder for joblib temporary memmap files. If ``None``, joblib's default
+        is used (``JOBLIB_TEMP_FOLDER``, then ``/dev/shm``, then the system temp folder).
 
     :returns:
         A pair of Polars DataFrames:
@@ -1145,10 +1149,14 @@ def _process_vcf(
     df_r_l = []
 
     # Pool 1: summary statistics
-    # Single pool shared across all VCF files — workers stay warm,
-    # numba caches persist across chromosomes.
-    with Parallel(n_jobs=nthreads, backend="loky", verbose=2) as stats_pool:
-        for k, vcf_file in sims.items():
+    # One Parallel context per VCF file: joblib deletes its memmap temp folder
+    # when the context exits, so large haplotype arrays do not accumulate across
+    # chromosomes. loky reuses the same executor (warm workers, numba caches)
+    # because the arguments are identical.
+    for k, vcf_file in sims.items():
+        with Parallel(
+            n_jobs=nthreads, backend="loky", verbose=2, temp_folder=tmp_dir
+        ) as stats_pool:
             print(k)
 
             # compute center from region strings "chr: start-end"
@@ -1237,9 +1245,11 @@ def _process_vcf(
     df_fv_cnn = {}
     df_fv_cnn_raw = {}
 
-    # Pool 2: normalization
-    with Parallel(n_jobs=nthreads, backend="loky", verbose=2) as norm_pool:
-        for k, stats_values in results.items():
+    # Pool 2: normalization (one context per VCF file, see Pool 1)
+    for k, stats_values in results.items():
+        with Parallel(
+            n_jobs=nthreads, backend="loky", verbose=2, temp_folder=tmp_dir
+        ) as norm_pool:
             print(k)
             df_w, df_w_raw = normalize_stats(
                 stats_values,
@@ -1544,6 +1554,7 @@ def summary_statistics(
     only_normalize=False,
     stats=None,
     centers=None,
+    tmp_dir=None,
 ):
     """
     Compute summary statistics to create needed feature vectors for CNN training/prediction
@@ -1597,6 +1608,11 @@ def summary_statistics(
     :param callable func:
         Function used internally for computing summary statistics per replicate
         or genomic window. See ``calculate_stats_simulations`` or ``calculate_stats_vcf_flat``
+    :param str tmp_dir:
+        VCF path only. Folder for joblib temporary memmap files, cleaned after each
+        VCF file. If ``None``, joblib's default is used (``JOBLIB_TEMP_FOLDER``,
+        then ``/dev/shm``, then the system temp folder, typically ``/tmp``).
+        **Default:** ``None``.
 
     :returns:
         Feature-vector DataFrame combining all computed summary statistics.
@@ -1666,6 +1682,7 @@ def summary_statistics(
                 save_stats=save_stats,
                 stats=stats,
                 centers=centers,
+                tmp_dir=tmp_dir,
             )
         else:
             if func is not None:

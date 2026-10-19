@@ -87,6 +87,25 @@ deCODE map (GRCh38). Output, in the VCF folder:
   ``chr:start-end``); the CNN prediction input;
 * ``fvs_raw_yri.parquet`` and ``empirical_bins_yri.pickle``.
 
+.. note::
+
+   **Temporary disk space.** Workers receive the haplotype arrays through
+   joblib, which writes large arrays to a temporary folder. By default
+   (``--tmp_dir`` unset) Flex-sweep keeps joblib's own choice: the folder in
+   ``JOBLIB_TEMP_FOLDER`` if set, otherwise ``/dev/shm``, otherwise the system
+   temporary folder (``TMPDIR``, typically ``/tmp``). The folder is emptied after
+   each chromosome. On many-chromosome runs, or on servers with a small ``/tmp``,
+   this can still fail with ``OSError: [Errno 28] No space left on device``. Point
+   the temporary files to a larger disk with either option:
+
+   .. code-block:: bash
+
+       flexsweep fvs-vcf --vcf_path yri_vcfs --suffix yri --tmp_dir /path/to/large/disk/tmp
+       # or, for any flexsweep command
+       export JOBLIB_TEMP_FOLDER=/path/to/large/disk/tmp
+
+   ``--tmp_dir`` (``tmp_dir=`` in Python) takes precedence over ``JOBLIB_TEMP_FOLDER``.
+
 Options
 ~~~~~~~
 
@@ -150,6 +169,12 @@ Options
      - ``save_stats``
      - ``False``
      - Also save the raw per-replicate statistics.
+   * - ``--tmp_dir``
+     - ``tmp_dir``
+     - joblib default
+     - VCF only: folder for joblib's temporary array files, cleaned after each VCF.
+       Default order: ``JOBLIB_TEMP_FOLDER``, then ``/dev/shm``, then ``/tmp``. Point it
+       (or ``JOBLIB_TEMP_FOLDER``) to a large disk when ``/tmp`` is small.
 
 .. _fv-statistics:
 
