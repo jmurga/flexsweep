@@ -15,7 +15,8 @@ analysed in :doc:`basic_usage` and in the original Flex-sweep paper. The same st
 (sample subsetting, biallelic SNP filtering, allele count estimation, polarization and
 masking of difficult regions) apply to any phased VCF. Run them before
 :doc:`basic_usage`, or use ``flexsweep example`` (:doc:`quickstart`) for a
-ready-made 5 Mb subset of the same data.
+ready-made subset of the same data: 50 individuals, the whole of chr22 with
+``--full`` or chr22:20-25 Mb without it.
 
 .. _vcf-requirements:
 

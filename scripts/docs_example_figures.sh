@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run `flexsweep example` (docs/quickstart.rst) on the workstation for the 5 Mb and the
 # whole-chr22 data, record per-step timings, and write the scan figures embedded in the
-# documentation (docs/images/quickstart_*.svg).
+# documentation (docs/images/quickstart_scan_multi*.png).
 #
 # Usage (from the repository root):
 #     bash scripts/docs_example_figures.sh [OUT_DIR] [NTHREADS]
@@ -40,15 +40,21 @@ for f in ex_5mb/data/raw/{yri_chr22_hg38_high_coverage.vcf.gz,447.primates_chr22
 done
 "${FS}" example --output_folder ex_chr22 --nthreads "${NT}" --seed 1 --full 2>&1 | tee ex_chr22.log
 
-# Figures for docs/quickstart.rst (5 Mb run)
-S=ex_5mb/scan/yri
-"${FS}" scan-plot --stat "${S}.ihs.txt" --stat "${S}.nsl.txt" --stat "${S}.h12.txt" \
-    --stat "${S}.raisd.txt" --multi --out "${IMG}/quickstart_scan_multi.svg"
-"${FS}" scan-plot --stat "${S}.ihs.txt" --pvalue --out "${IMG}/quickstart_scan_ihs_pvalue.svg"
+# Figures for docs/quickstart.rst (whole-chr22 run): the PNGs written by the scan step,
+# downscaled to 1800 px wide (the full-size SVGs are ~35 MB, the PNGs ~4 MB)
+for f in scan scan_pvalue; do
+    "${OUT}/venv/bin/python" -I -c "
+import sys
+from PIL import Image
+im = Image.open(sys.argv[1]).convert('RGB')
+im = im.resize((1800, round(im.height * 1800 / im.width)), Image.LANCZOS)
+im.quantize(colors=64).save(sys.argv[2], optimize=True)
+" "ex_chr22/scan/yri.${f}.png" "${IMG}/quickstart_scan_multi${f#scan}.png"
+done
 
 echo
 for d in ex_5mb ex_chr22; do
     echo "== ${d}"
     column -t -s $'\t' "${d}/timings.tsv"
 done
-echo "Figures: ${IMG}/quickstart_scan_*.svg  Outputs: ${OUT}"
+echo "Figures: ${IMG}/quickstart_scan_multi*.png  Outputs: ${OUT}"
