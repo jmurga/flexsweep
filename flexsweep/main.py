@@ -2086,8 +2086,9 @@ def example(ctx, output_folder, nthreads, full, num_simulations, seed, steps, ov
     "stat_cols",
     type=str,
     multiple=True,
-    help="Column to plot per --stat, in the same order. Default: the stat's rank "
-    "column, inferred from the file name (e.g. yri.raisd.txt -> mu_total).",
+    help="Column to plot per --stat, in the same order. Default: inferred from the "
+    "file name: the DAF-standardized {rank}_std column when the file has one "
+    "(yri.ihs.txt -> ihs_std), else the stat's rank column (yri.raisd.txt -> mu_total).",
 )
 @click.option(
     "--multi",
@@ -2137,8 +2138,10 @@ def scan_plot(stat_files, stat_cols, multi, split_chr, pvalue, top_pct, out_file
     """
     import os
 
+    import polars as pl
+
     from flexsweep.scan import STAT_REGISTRY
-    from flexsweep.utils import plot_scan
+    from flexsweep.utils import default_scan_col, plot_scan
 
     stat_files = list(stat_files)
     if stat_cols:
@@ -2157,7 +2160,8 @@ def scan_plot(stat_files, stat_cols, multi, split_chr, pvalue, top_pct, out_file
                     f"Cannot infer the column for '{f}' (expected "
                     "{prefix}.{stat}.txt from flexsweep scan); pass --col."
                 )
-            stat_cols.append(STAT_REGISTRY[key].rank_col)
+            header = pl.read_csv(f, separator="\t", n_rows=0).columns
+            stat_cols.append(default_scan_col(key, header))
 
     try:
         plot_scan(

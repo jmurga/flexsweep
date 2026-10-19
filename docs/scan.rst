@@ -744,8 +744,9 @@ lines; the x-axis shows position in Mb within each chromosome.
     flexsweep scan-plot --stat results/YRI.ihs.txt --stat results/YRI.nsl.txt \
         --multi --split_chr --out results/YRI.svg
 
-``--col`` defaults to the statistic's rank column, inferred from the
-``{prefix}.{stat}.txt`` file name. ``--out`` defaults to ``scan_plot.svg``; a
+``--col`` is inferred from the ``{prefix}.{stat}.txt`` file name: the
+DAF-standardized ``{rank_col}_std`` column when the file has one (iHS, nSL and the
+other DAF-normalized per-SNP statistics), else the statistic's rank column. ``--out`` defaults to ``scan_plot.svg``; a
 ``.png`` or ``.pdf`` extension selects that format. SVG output keeps text as
 editable text and draws points as vectors; a panel with more than 200,000 points
 (e.g. genome-wide iHS) embeds its background points as a 300 dpi image to keep the
@@ -767,9 +768,9 @@ In Python, ``plot_scan`` from ``flexsweep.utils`` takes the same choices
 
     from flexsweep.utils import plot_scan
 
-    # When passing a scan() dict, stat_cols is resolved automatically
-    # from STAT_REGISTRY (e.g. "raisd" → "mu_total", "lassi" → "T_m").
-    # No need to specify stat_cols.
+    # When passing a scan() dict, stat_cols is resolved automatically:
+    # "{rank_col}_std" if the table has it ("ihs" -> "ihs_std"), else the
+    # rank column from STAT_REGISTRY ("raisd" -> "mu_total", "lassi" -> "T_m").
 
     # Single statistic — raw values, top 1% highlighted
     plot_scan({"ihs": results["ihs"]}, out="results/YRI.ihs.svg")

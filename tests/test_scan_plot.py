@@ -207,3 +207,44 @@ def test_raisd_label_is_mu():
     assert label == "mu"
     _, label, _ = _scan_track(df, "mu_total", pvalue=True, top_pct=0.01)
     assert label.startswith(r"$\mathrm{mu}:") and "total" not in label
+
+
+def test_default_col_prefers_std():
+    from flexsweep.utils import default_scan_col
+
+    assert default_scan_col("ihs", ["chr", "positions", "ihs", "ihs_std"]) == "ihs_std"
+    assert default_scan_col("ihs", ["chr", "positions", "ihs"]) == "ihs"
+    assert default_scan_col("raisd", ["chr", "positions", "mu_total"]) == "mu_total"
+
+
+def test_std_label():
+    df = pl.DataFrame(
+        {"chr": ["chr22"] * 3, "positions": [1, 2, 3], "ihs_std": [-1.0, 0.0, 1.0],
+         "ihs_std_pvalue": [0.5, 0.1, 0.01]}
+    )
+    _, label, _ = _scan_track(df, "ihs_std", pvalue=False, top_pct=0.01)
+    assert label == "ihs (std)"
+    _, label, _ = _scan_track(df, "ihs_std", pvalue=True, top_pct=0.01)
+    assert label.startswith(r"$\mathrm{ihs\ (std)}:")
+
+
+def test_cli_and_dict_default_to_std(tmp_path):
+    # Only the _std column has a p-value: --pvalue succeeds only if ihs_std is chosen
+    df = _scan_tsv(tmp_path / "x.ihs.txt").drop("ihs_pvalue")
+    df = df.with_columns(
+        ((pl.col("ihs") - pl.col("ihs").mean()) / pl.col("ihs").std()).alias("ihs_std")
+    ).with_columns(pl.col("ihs_std").rank().truediv(df.height).alias("ihs_std_pvalue"))
+    f = tmp_path / "y.ihs.txt"
+    df.write_csv(f, separator="\t")
+    out = tmp_path / "p.svg"
+    res = CliRunner().invoke(cli, ["scan-plot", "--stat", str(f), "--pvalue", "--out", str(out)])
+    assert res.exit_code == 0, res.output
+    assert out.exists()
+    # explicit --col still wins
+    res = CliRunner().invoke(cli, ["scan-plot", "--stat", str(f), "--col", "ihs", "--pvalue"])
+    assert res.exit_code != 0 and "ihs_pvalue" in res.output
+
+    from flexsweep.utils import _resolve_scan_inputs
+
+    _, cols = _resolve_scan_inputs({"ihs": df}, None)
+    assert cols == ["ihs_std"]

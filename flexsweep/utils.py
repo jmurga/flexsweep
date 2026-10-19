@@ -1378,12 +1378,7 @@ def _resolve_scan_inputs(stats, stat_cols):
         if isinstance(stat_cols, str):
             stat_cols = [stat_cols]
         elif stat_cols is None:
-            from .scan import STAT_REGISTRY
-
-            stat_cols = [
-                STAT_REGISTRY[s].rank_col if s in STAT_REGISTRY else s
-                for s in stats.keys()
-            ]
+            stat_cols = [default_scan_col(s, stats[s].columns) for s in stats.keys()]
         dfs = [_scan_coords(stats[s]) for s in stats.keys()]
     elif isinstance(stats, str):
         if stat_cols is None:
@@ -1409,8 +1404,25 @@ def _chr_to_float(col_expr):
     return col_expr.cast(pl.Utf8).str.replace("^chr", "").cast(pl.Float64)
 
 
+def default_scan_col(stat: str, columns: list[str]) -> str:
+    """Column to plot for a scan stat: ``{rank_col}_std`` when the table has it
+    (DAF-standardized iHS, nSL, ...), else the stat's rank column."""
+    from .scan import STAT_REGISTRY
+
+    rank_col = STAT_REGISTRY[stat].rank_col if stat in STAT_REGISTRY else stat
+    return f"{rank_col}_std" if f"{rank_col}_std" in columns else rank_col
+
+
 # Axis labels for scan columns whose names do not read well (RAiSD mu_total -> mu)
 _STAT_LABELS = {"mu_total": "mu"}
+
+
+def _stat_label(stat_col: str) -> str:
+    """Axis label: ``mu_total`` -> ``mu``, ``ihs_std`` -> ``ihs (std)``."""
+    if stat_col.endswith("_std"):
+        base = stat_col[: -len("_std")]
+        return f"{_STAT_LABELS.get(base, base)} (std)"
+    return _STAT_LABELS.get(stat_col, stat_col)
 
 
 def _scan_track(
@@ -1440,7 +1452,7 @@ def _scan_track(
         y = -np.log10(np.clip(y, 1e-10, None))
         cls = np.zeros(y.size, dtype=np.int8)
         signed = False
-        name = _STAT_LABELS.get(stat_col, stat_col)
+        name = _stat_label(stat_col).replace("_", r"\_").replace(" ", r"\ ")
         label = rf"$\mathrm{{{name}}}:\ -\log_{{10}}(p_{{\mathrm{{emp}}}})$"
     else:
         # Any negative value -> both tails (Fay-Wu H can be negative everywhere)
@@ -1450,7 +1462,7 @@ def _scan_track(
             cls[y >= np.quantile(y, 1 - top_pct)] = 1
             if signed:
                 cls[y <= np.quantile(y, top_pct)] = -1
-        label = _STAT_LABELS.get(stat_col, stat_col)
+        label = _stat_label(stat_col)
     df = df.with_columns(pl.Series("_y", y), pl.Series("_cls", cls)).sort(
         "chr_n", "positions"
     )
