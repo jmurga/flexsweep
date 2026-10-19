@@ -52,7 +52,7 @@ try:
 
     __version__ = _version.version
 except ImportError:
-    __version__ = "2.0"
+    __version__ = "2.0.1"
 
 
 # Lazy access to cnn module
