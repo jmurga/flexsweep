@@ -6548,7 +6548,69 @@ def tajima_d(ac, min_sites=3):
     return D
 
 
-@njit(cache=True)
+@lru_cache(maxsize=64)
+def _achaz_y_coeffs(n, folded):
+    """Exact null moments of Achaz's Y (``folded=False``) or Y* (``folded=True``).
+
+    The numerator is a linear SFS contrast ``sum_i c_i xi_i`` over the frequency
+    classes ``A`` (Y: 2..n-1, excludes derived singletons; Y*: 2..n-2, excludes
+    minor-allele singletons) with ``c_i = 2 i (n-i) / (n (n-1)) - f``. Its null
+    variance is ``alpha theta + beta theta^2`` with ``alpha = sum_i c_i^2 / i`` and
+    ``beta = c' Sigma c``, where ``Sigma`` holds Fu (1995) sigma_ij -- the same
+    construction as :func:`_achaz_t_coeffs`.
+
+    theta and theta^2 are estimated from ``S_A`` alone (singleton-free) via
+    ``E[S_A] = g1 theta`` and ``E[S_A (S_A - 1)] = g2 theta^2`` with
+    ``g1 = sum_{i in A} 1/i`` and ``g2 = g1^2 + sum_{i,j in A} sigma_ij``.
+
+    Cached per (n, folded).
+
+    :returns: ``(A, c, alpha, beta, g1, g2)``; ``A`` and ``c`` are indexed by
+        derived count 1..n-1 (position 0 is count 1).
+    """
+    k = np.arange(1, n, dtype=np.float64)  # derived count i = 1..n-1
+    a1 = np.sum(1.0 / k)
+    if folded:
+        A = (k >= 2) & (k <= n - 2)
+        f = (n - 3.0) / ((n - 1.0) * (a1 - n / (n - 1.0)))
+    else:
+        A = k >= 2
+        f = (n - 2.0) / (n * (a1 - 1.0))
+    c = np.where(A, 2.0 * k * (n - k) / (n * (n - 1.0)) - f, 0.0)
+
+    ki = k.astype(np.int64)
+    ii, jj = np.meshgrid(ki, ki, indexing="ij")
+    sig_mat = sigma(n, np.column_stack([ii.ravel(), jj.ravel()])).reshape(n - 1, n - 1)
+
+    ind = A.astype(np.float64)
+    alpha = float(np.sum(c * c / k))
+    beta = float(c @ sig_mat @ c)
+    g1 = float(np.sum(ind / k))
+    g2 = g1 * g1 + float(ind @ sig_mat @ ind)
+
+    A.setflags(write=False)
+    c.setflags(write=False)
+    return A, c, alpha, beta, g1, g2
+
+
+def _achaz_y_standardized(ac, n, folded):
+    """Standardized Achaz Y / Y* from allele counts (see :func:`_achaz_y_coeffs`)."""
+    A, c, alpha, beta, g1, g2 = _achaz_y_coeffs(n, folded)
+
+    # Unfolded SFS xi_i, i = 1..n-1
+    xi = np.bincount(np.asarray(ac[:, 1], dtype=np.int64), minlength=n + 1)[1:n]
+    xi = xi.astype(np.float64)
+
+    S_A = float(xi[A].sum())
+    if S_A < 1.0:
+        return np.nan
+
+    variance = alpha * S_A / g1 + beta * S_A * (S_A - 1.0) / g2
+    if variance <= 0.0:
+        return np.nan
+    return float(c @ xi) / np.sqrt(variance)
+
+
 def achaz_y(ac):
     """
     Achaz’s Y neutrality test (standardized).
@@ -6556,8 +6618,9 @@ def achaz_y(ac):
     Unfolded/polarized form — requires ancestral-state information (outgroup or
     polarization). Excludes ξ₁ (derived singletons) from both estimators.
 
-    Reference: Achaz 2008, Appendix B, Equations B28–B30.
-    f = (n-2) / (n·(a_n-1));  Var[Y] = α_n·θ + β_n·θ²
+    Numerator (Achaz 2008): ``π_{-ξ1} - f S_{-ξ1}`` with ``f = (n-2) / (n (a_n - 1))``.
+    The null variance ``α_n θ + β_n θ²`` is computed exactly from Fu (1995) σᵢⱼ
+    (:func:`_achaz_y_coeffs`), with θ and θ² estimated from ``S_{-ξ1}``.
 
     :param numpy.ndarray ac:
         Allele counts array of shape ``(S, 2)`` (ancestral, derived), constant ``n``.
@@ -6570,59 +6633,9 @@ def achaz_y(ac):
     n = int(ac[0, 0] + ac[0, 1])
     if n < 3:
         return np.nan
-    fs = sfs_nb(ac[:, 1], n)
-    a1, a2 = _harmonic_sums(n)
-    a1m1 = a1 - 1.0
-    ff = (n - 2.0) / (n * a1m1)
-    inv_n = 1.0 / n
-    inv_n1 = 1.0 / (n - 1.0)
-    inv_n2 = 1.0 / (n - 2.0)
-    n2 = n * n
-    alpha = (
-        ff * ff * a1m1
-        + ff
-        * (
-            a1 * (4.0 * (n + 1.0) * inv_n1 * inv_n1)
-            - 2.0 * (n + 1.0) * (n + 2.0) * inv_n * inv_n1
-        )
-        - a1 * 8.0 * (n + 1.0) * inv_n * inv_n1 * inv_n1
-        + (n * n2 + n2 + 60.0 * n + 12.0) * (inv_n * inv_n) * (1.0 / 3.0) * inv_n1
-    )
-    beta = (
-        ff * ff * (a2 + a1 * (4.0 * inv_n1 * inv_n2) - 4.0 * inv_n2)
-        + ff
-        * (
-            -a1 * (4.0 * (n + 2.0) * inv_n * inv_n1 * inv_n2)
-            - ((n * n2 - 3.0 * n2 - 16.0 * n + 20.0) * inv_n * inv_n1 * inv_n2)
-        )
-        + a1 * (8.0 * inv_n * inv_n1 * inv_n2)
-        + (2.0 * (2.0 * n2 * n2 - n2 * n - 17.0 * n2 - 42.0 * n + 72.0))
-        * (inv_n * inv_n)
-        * (inv_n1 * inv_n2)
-        * (1.0 / 9.0)
-    )
-    y = fs.copy()
-    y[0] = y[1] = y[n] = 0.0
-    S = 0.0
-    pi_sum = 0.0
-    for i in range(2, n + 1):
-        yi = y[i]
-        if i > 1 and i < n:
-            S += yi
-        if i < n:
-            pi_sum += yi * i * (n - i)
-
-    # At least 1 seg site
-    if S < 1:
-        return np.nan
-
-    pi_hat = pi_sum / (n * (n - 1.0) * 0.5)
-    that = S / a1m1
-    that_sq = S * (S - 1.0) / (a1m1 * a1m1)
-    return (pi_hat - ff * S) / np.sqrt(alpha * that + beta * that_sq)
+    return _achaz_y_standardized(ac, n, folded=False)
 
 
-@njit(cache=True)
 def achaz_y_star(ac):
     """
     Achaz's Y* neutrality test (standardized).
@@ -6631,8 +6644,10 @@ def achaz_y_star(ac):
     η₁ = ξ₁ + ξ_{n-1} (minor-allele singletons at frequency 1/n or (n-1)/n)
     from both the π and S estimators.
 
-    Reference: Achaz 2008, Appendix B, Equations B19–B21.
-    f* = (n-3) / (a_n·(n-1) - n);  Var[Y*] = α*_n·θ + β*_n·θ²
+    Numerator (Achaz 2008): ``π_{-η1} - f* S_{-η1}`` with
+    ``f* = (n-3) / (a_n (n-1) - n)``. The null variance ``α*_n θ + β*_n θ²`` is
+    computed exactly from Fu (1995) σᵢⱼ (:func:`_achaz_y_coeffs`), with θ and θ²
+    estimated from ``S_{-η1}``.
 
     :param numpy.ndarray ac:
         Allele counts array of shape ``(S, 2)`` (ancestral, derived), constant n.
@@ -6643,71 +6658,7 @@ def achaz_y_star(ac):
     n = int(ac[0, 0] + ac[0, 1])
     if n < 4:
         return np.nan
-
-    a1, a2 = _harmonic_sums(n)
-
-    inv_n1 = 1.0 / (n - 1.0)
-    # γ_n = E[S_{-η₁}] / θ = a_n - n/(n-1)
-    gamma_n = a1 - n * inv_n1
-    if gamma_n <= 0.0:
-        return np.nan
-
-    # f* = (n-3) / (a_n*(n-1) - n) = (n-3) / ((n-1)*γ_n)  [Achaz 2008 Eq 21]
-    fstar = (n - 3.0) / ((n - 1.0) * gamma_n)
-
-    inv_n = 1.0 / n
-    n2 = n * n
-
-    # α*_n  (Achaz 2008 Eq B20)
-    alpha_star = (
-        fstar * fstar * (a1 - n * inv_n1)
-        + fstar * (a1 * (4.0 * (n + 1.0) * inv_n1 * inv_n1) - 2.0 * (n + 3.0) * inv_n1)
-        - a1 * 8.0 * (n + 1.0) * inv_n * inv_n1 * inv_n1
-        + (n2 + n + 60.0) * inv_n * inv_n1 / 3.0
-    )
-
-    # β*_n  (Achaz 2008 Eq B21)
-    beta_star = (
-        fstar * fstar * (a2 - (2.0 * n - 1.0) * inv_n1 * inv_n1)
-        + fstar
-        * (
-            a2 * 8.0 * inv_n1
-            - a1 * 4.0 * inv_n * inv_n1
-            - (n * n2 + 12.0 * n2 - 35.0 * n + 18.0) * inv_n * inv_n1 * inv_n1
-        )
-        - a2 * 16.0 * inv_n * inv_n1
-        + a1 * 8.0 * inv_n * inv_n * inv_n1
-        + (2.0 * (2.0 * n2 * n2 + 110.0 * n2 - 255.0 * n + 126.0))
-        * (inv_n * inv_n)
-        * (inv_n1 * inv_n1)
-        / 9.0
-    )
-
-    # Compute S_{-η₁} and π_{-η₁}: sum over sites with 2 ≤ derived count ≤ n-2
-    S_total = ac.shape[0]
-    S_excl = 0.0
-    pi_excl = 0.0
-
-    for j in range(S_total):
-        k = int(ac[j, 1])
-        if k >= 2 and k <= n - 2:
-            S_excl += 1.0
-            pi_excl += k * (n - k)
-
-    if S_excl < 1.0:
-        return np.nan
-
-    pi_excl /= n * (n - 1.0) * 0.5
-
-    # θ̂ and θ̂² from S_{-η₁} (consistent with achaz_y approximation)
-    that = S_excl / gamma_n
-    that_sq = S_excl * (S_excl - 1.0) / (gamma_n * gamma_n)
-
-    variance = alpha_star * that + beta_star * that_sq
-    if variance <= 0.0:
-        return np.nan
-
-    return (pi_excl - fstar * S_excl) / np.sqrt(variance)
+    return _achaz_y_standardized(ac, n, folded=True)
 
 
 @lru_cache(maxsize=16)
@@ -6781,7 +6732,7 @@ def achaz_t(ac, decay=0.9):
     if S < 1.0:
         return np.nan
 
-    # θ̂ and θ̂² (exact Fu 1995 form; matches pg-gpu)
+    # θ̂ and θ̂² (exact Fu 1995 form)
     that = S / a1
     that_sq = S * (S - 1.0) / (a1 * a1 + a2)
 
@@ -6807,7 +6758,8 @@ def fay_wu_h_norm(ac, positions=None):
     Computes:
       - ``theta_h``: estimator that upweights high-frequency derived alleles.
       - ``h = pi - theta_h`` (Fay & Wu’s H).
-      - ``h_norm``: normalized H using variance terms.
+      - ``h_norm``: normalized H, ``(pi - theta_L) / sd`` (Zeng et al. 2006, Eqs. 11-12).
+        Since ``pi - theta_h = 2 (pi - theta_L)``, this is also ``h / sd(h)``.
 
     :param numpy.ndarray ac:
         Allele counts array of shape ``(S, 2)`` (ancestral, derived), constant ``n``.
@@ -6828,7 +6780,9 @@ def fay_wu_h_norm(ac, positions=None):
 
     i_arr = np.arange(1, int(n))
     a1 = np.sum(1.0 / i_arr)
-    bn = np.sum(1.0 / (i_arr * i_arr)) + 1.0 / (n * n)
+    a2 = np.sum(1.0 / (i_arr * i_arr))
+    # Zeng's b_{n+1} = sum_{i=1}^{n} 1/i^2 (variance only; theta^2 uses a2)
+    bn = a2 + 1.0 / (n * n)
     theta_w = S / a1
     pi = 0.0
     theta_h = 0.0
@@ -6841,18 +6795,20 @@ def fay_wu_h_norm(ac, positions=None):
         tl += k * fs[k - 1]
     tl /= n - 1.0
     var1 = (n - 2.0) / (6.0 * (n - 1.0)) * theta_w
-    theta_sq = S * (S - 1.0) / (a1 * a1 + bn)
+    theta_sq = S * (S - 1.0) / (a1 * a1 + a2)
 
+    # Var(pi - theta_L)
     var2 = (
-        ((18 * n * n * (3 * n + 2) * bn) - (88 * n * n * n + 9 * n * n - 13 * n - 6))
+        ((18 * n * n * (3 * n + 2) * bn) - (88 * n * n * n + 9 * n * n - 13 * n + 6))
         / (9.0 * n * (n - 1.0) * (n - 1.0))
     ) * theta_sq
 
     h = pi - theta_h
+    h_norm = (pi - tl) / np.sqrt(var1 + var2)
 
     if positions is not None:
         theta_h = theta_h / (positions[-1] - (positions[0] - 1))
-    return theta_h, h, h / np.sqrt(var1 + var2)
+    return theta_h, h, h_norm
 
 
 @njit(cache=True)
@@ -7159,7 +7115,8 @@ def neutrality_stats(ac, positions):
     d_stdev = np.sqrt(e1_d * S + e2_d * S * (S - 1.0))
     tajima_d_val = (pi - theta_w) / d_stdev if d_stdev > 0.0 else np.nan
 
-    # Fay & Wu's H + normalized
+    # Fay & Wu's H + normalized: (pi - theta_L) / sd (Zeng et al. 2006, Eqs. 11-12),
+    # equal to h_raw / sd(h_raw) since pi - theta_H = 2 (pi - theta_L)
     h_raw = pi - theta_h
     bn_h = bn + 1.0 / (n_f * n_f)
     var1_h = (n_f - 2.0) / (6.0 * (n_f - 1.0)) * theta_w
@@ -7167,13 +7124,13 @@ def neutrality_stats(ac, positions):
     var2_h = (
         (
             (18.0 * n_f**2 * (3.0 * n_f + 2.0) * bn_h)
-            - (88.0 * n_f**3 + 9.0 * n_f**2 - 13.0 * n_f - 6.0)
+            - (88.0 * n_f**3 + 9.0 * n_f**2 - 13.0 * n_f + 6.0)
         )
         / (9.0 * n_f * (n_f - 1.0) ** 2)
         * th_sq
     )
     denom_h = var1_h + var2_h
-    h_norm = h_raw / np.sqrt(denom_h) if denom_h > 0.0 else np.nan
+    h_norm = (pi - theta_l) / np.sqrt(denom_h) if denom_h > 0.0 else np.nan
 
     # Output
     out[0] = tajima_d_val
