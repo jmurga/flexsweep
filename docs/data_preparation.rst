@@ -55,6 +55,45 @@ one per chromosome. Each file must be:
   (``--recombination_map decode``) is on GRCh38; Flex-sweep warns when a VCF header
   looks like GRCh37.
 
+.. _accessibility-mask:
+
+Accessibility mask (optional)
+-----------------------------
+
+Mask difficult regions before running Flex-sweep (step 5 below). Masking removes the
+SNPs, but each window keeps its full length, so per-bp statistics of a partly masked
+window are too low: a window with 40% of its bases masked shows about 40% less
+nucleotide diversity, the same direction as a sweep. Pass the same BED with
+``--accessibility_mask`` (``fvs-vcf`` and ``scan``) to correct this.
+
+* The BED lists regions to **exclude** (GIAB convention, e.g.
+  ``GRCh38_alldifficultregions.bed.gz``), one file for all chromosomes; ``chr22`` and
+  ``22`` are matched.
+* SNPs inside the BED are dropped when the VCF is read, so an unmasked VCF is masked
+  on the fly and an already masked VCF is unchanged.
+* Per-bp statistics are divided by the accessible bases of each window (window
+  length minus masked bases) instead of its length: ``pi``, ``theta_w`` and
+  ``dist_var`` in ``fvs-vcf``; ``pi`` and ``theta_w`` (also in ``neutrality``) in
+  ``scan``. A fully masked window gives a missing value.
+* Statistics without a per-bp denominator are unchanged. In bp windows, haplotype
+  statistics (H12, number of haplotypes, HAF) see fewer SNPs when heavily masked,
+  which mimics a sweep: on YRI chr20-22 (100 kb windows), H12 is inflated 1.3x in
+  windows 40-50% accessible and 15x below 10%, and matches fully accessible windows
+  from 50% up. In SNP-count windows (``scan`` h12, garud, haf) a masked gap instead
+  stretches the window over more sequence, which lowers H12.
+  Windows below ``--min_accessible`` (default 0.6) are therefore excluded: missing
+  window statistics in ``fvs-vcf``, left out of the window-statistic tables in
+  ``scan``. Per-SNP statistics (iHS, nSL, iSAFE, ...) and whole-chromosome
+  window statistics in ``scan`` (lassi, lassip, raisd, beta, ncd) are not filtered.
+* In ``fvs-vcf``, loci with many windows below ``--min_accessible`` can exceed the 10%
+  missing-feature filter and are dropped from the output (13% of loci on YRI chr20-22
+  at 0.6); lower the cutoff to keep more loci.
+* Simulations are not masked, so their windows are fully accessible.
+
+Sites with missing genotype calls (``.``) are always dropped when the VCF is read,
+and Flex-sweep warns when they exceed 1% of the sites. Impute missing genotypes
+during phasing (Beagle, SHAPEIT) rather than relying on this filter.
+
 Example: 1000GP YRI pre-processing
 ----------------------------------
 

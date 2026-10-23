@@ -175,6 +175,18 @@ Options
      - VCF only: folder for joblib's temporary array files, cleaned after each VCF.
        Default order: ``JOBLIB_TEMP_FOLDER``, then ``/dev/shm``, then ``/tmp``. Point it
        (or ``JOBLIB_TEMP_FOLDER``) to a large disk when ``/tmp`` is small.
+   * - ``--accessibility_mask``
+     - ``accessibility_mask``
+     - none
+     - VCF only: BED of regions to exclude, GIAB convention (e.g.
+       ``GRCh38_alldifficultregions.bed.gz``), all chromosomes. SNPs inside it are
+       dropped, and ``pi``, ``theta_w`` and ``dist_var`` are divided by the accessible
+       bases of each window instead of its length. See :ref:`accessibility-mask`.
+   * - ``--min_accessible``
+     - ``min_accessible``
+     - 0.6
+     - VCF only, with ``--accessibility_mask``: windows with a smaller accessible
+       fraction get missing window statistics (handled like any missing feature).
 
 .. _fv-statistics:
 

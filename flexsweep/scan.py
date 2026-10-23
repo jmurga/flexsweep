@@ -78,7 +78,9 @@ from .fv import (
     fuli_f,
     fuli_f_star,
     garud_h,
+    excluded_bp,
     genome_reader,
+    load_accessibility_mask,
     get_cm,
     haf_top,
     hapdaf_from_pairs,
@@ -502,6 +504,34 @@ def _get_windows(positions, params):
         w_size = int(params.get("w_size", 201))
         step = int(params.get("step", 10))
         return _sliding_windows(positions, w_size, step)
+
+
+# Window stats reported per bp (pi, theta_w and the same columns of neutrality)
+_PER_BP = {"pi", "theta_w", "neutrality"}
+
+
+def _window_lengths(positions, i, j, center, params, mask=None):
+    """``(accessible_bp, length)`` of window (i, j, center).
+
+    bp mode: ``[center - w//2, center - w//2 + w]`` (as built by ``_bp_windows``),
+    length ``w``. SNP mode: ``[positions[i], positions[j-1]]``. With an
+    accessibility mask (``load_accessibility_mask``), excluded bases are removed
+    from the accessible count; without one it equals the length.
+    """
+    if params.get("window_mode", "snp") == "bp":
+        w = int(params.get("w_size_bp", 1_000_000))
+        a = int(center) - w // 2
+        b, length = a + w, w
+    else:
+        a, b = int(positions[i]), int(positions[j - 1])
+        length = b - a + 1
+    acc = length - int(excluded_bp(mask, a, b)) if mask is not None else length
+    return float(acc), float(length)
+
+
+def _window_bp(positions, i, j, center, params, mask=None):
+    """Per-bp denominator of window (i, j, center): accessible bases (see _window_lengths)."""
+    return _window_lengths(positions, i, j, center, params, mask)[0]
 
 
 def _snp_cm_mb(positions: np.ndarray, rec_map: np.ndarray) -> np.ndarray:
@@ -1104,9 +1134,12 @@ def _run_garud(hap, positions, ac, rec_map, genetic_pos, _single_window=None, **
 
 
 def _run_neutrality(
-    hap, positions, ac, rec_map, genetic_pos, _single_window=None, **params
+    hap, positions, ac, rec_map, genetic_pos, _single_window=None, _denom=None, **params
 ):
+    """Tajima's D, normalized H, and pi / theta_w per bp (÷ ``_denom``)."""
     if _single_window is not None:
+        if _denom is None:
+            _denom = _window_bp(positions, 0, len(positions), _single_window, params)
         res = neutrality_stats(ac.astype(np.int32), positions)
         return pl.DataFrame(
             [
@@ -1115,22 +1148,23 @@ def _run_neutrality(
                     "n_snps": len(positions),
                     "tajima_d": float(res[0]),
                     "fay_wu_h_norm": float(res[3]),
-                    "pi": float(res[4]),
-                    "theta_w": float(res[5]),
+                    "pi": float(res[4]) / _denom if _denom > 0 else np.nan,
+                    "theta_w": float(res[5]) / _denom if _denom > 0 else np.nan,
                 }
             ]
         )
     rows = []
     for i, j, center in _get_windows(positions, params):
         res = neutrality_stats(ac[i:j].astype(np.int32), positions[i:j])
+        den = _window_bp(positions, i, j, center, params)
         rows.append(
             {
                 "positions": center,
                 "n_snps": j - i,
                 "tajima_d": float(res[0]),
                 "fay_wu_h_norm": float(res[3]),
-                "pi": float(res[4]),
-                "theta_w": float(res[5]),
+                "pi": float(res[4]) / den,
+                "theta_w": float(res[5]) / den,
             }
         )
     return pl.DataFrame(rows) if rows else None
@@ -1284,26 +1318,31 @@ def _run_ncd(hap, positions, ac, rec_map, genetic_pos, **params):
 
 
 def _run_single_neutrality_array(
-    hap, positions, ac, params, col_name, arr_idx, _single_window=None
+    hap, positions, ac, params, col_name, arr_idx, _single_window=None,
+    per_bp=False, _denom=None,
 ):
-    """Run per-window, extract from neutrality_stats() array by index."""
+    """Run per-window, extract from neutrality_stats() array by index.
+
+    ``per_bp=True`` divides the value by the window's bp denominator
+    (``_denom`` if given, else the window length; see ``_window_bp``).
+    """
     if _single_window is not None:
         res = neutrality_stats(ac.astype(np.int32), positions)
+        val = float(res[arr_idx])
+        if per_bp:
+            if _denom is None:
+                _denom = _window_bp(positions, 0, len(positions), _single_window, params)
+            val = val / _denom if _denom > 0 else np.nan
         return pl.DataFrame(
-            [
-                {
-                    "positions": _single_window,
-                    "n_snps": len(positions),
-                    col_name: float(res[arr_idx]),
-                }
-            ]
+            [{"positions": _single_window, "n_snps": len(positions), col_name: val}]
         )
     rows = []
     for i, j, center in _get_windows(positions, params):
         res = neutrality_stats(ac[i:j].astype(np.int32), positions[i:j])
-        rows.append(
-            {"positions": center, "n_snps": j - i, col_name: float(res[arr_idx])}
-        )
+        val = float(res[arr_idx])
+        if per_bp:
+            val /= _window_bp(positions, i, j, center, params)
+        rows.append({"positions": center, "n_snps": j - i, col_name: val})
     return pl.DataFrame(rows) if rows else None
 
 
@@ -1343,17 +1382,21 @@ def _run_tajima_d(
     )
 
 
-def _run_pi(hap, positions, ac, rec_map, genetic_pos, _single_window=None, **params):
+def _run_pi(
+    hap, positions, ac, rec_map, genetic_pos, _single_window=None, _denom=None, **params
+):
     return _run_single_neutrality_array(
-        hap, positions, ac, params, "pi", 4, _single_window=_single_window
+        hap, positions, ac, params, "pi", 4, _single_window=_single_window,
+        per_bp=True, _denom=_denom,
     )
 
 
 def _run_theta_w(
-    hap, positions, ac, rec_map, genetic_pos, _single_window=None, **params
+    hap, positions, ac, rec_map, genetic_pos, _single_window=None, _denom=None, **params
 ):
     return _run_single_neutrality_array(
-        hap, positions, ac, params, "theta_w", 5, _single_window=_single_window
+        hap, positions, ac, params, "theta_w", 5, _single_window=_single_window,
+        per_bp=True, _denom=_denom,
     )
 
 
@@ -1568,7 +1611,10 @@ def _run_window_batch(
     runner = _RUNNERS[stat_key]
     parts = []
     first_error = None
-    for i, j, center_pos in window_batch:
+    for win in window_batch:
+        i, j, center_pos = win[:3]
+        # per-bp stats carry their denominator as a 4th element (see _window_bp)
+        extra = {"_denom": win[3]} if len(win) > 3 else {}
         try:
             df = runner(
                 hap[i:j],
@@ -1577,6 +1623,7 @@ def _run_window_batch(
                 rec_map,
                 genetic_pos,
                 _single_window=center_pos,
+                **extra,
                 **params,
             )
         except Exception as e:
@@ -1612,6 +1659,8 @@ def scan(
     nthreads=1,
     window_mode="auto",
     tmp_dir=None,
+    accessibility_mask=None,
+    min_accessible=0.6,
     **kwargs,
 ) -> dict[str, pl.DataFrame]:
     """Standalone outlier scan from a directory of per-chromosome VCF files.
@@ -1678,6 +1727,14 @@ def scan(
         Folder for joblib temporary memmap files of the global task pool.
         ``None`` (default) -> joblib's default (``JOBLIB_TEMP_FOLDER``, then
         ``/dev/shm``, then the system temp folder, typically ``/tmp``).
+    accessibility_mask:
+        Optional GIAB-style BED of regions to exclude (all chromosomes). SNPs inside
+        it are dropped on read, and ``pi`` / ``theta_w`` (also in ``neutrality``),
+        which are reported per bp, are divided by the accessible bases of each
+        window instead of its length.
+    min_accessible:
+        With ``accessibility_mask``: sliding windows whose accessible fraction is
+        below this value are left out of the window-statistic tables. Default 0.6.
     kwargs:
         Shared overrides forwarded to all stats: max_extend, K_truncation,
         sweep_mode, raisd_window, tf, etc.
@@ -1833,10 +1890,17 @@ def scan(
     def _open_vcf(vcf_file, recombination_map):
         # Perform the heavy lifting inside this function
         hap_int, rec_map, ac, _, position_masked, genetic_pos = genome_reader(
-            vcf_file, recombination_map=recombination_map
+            vcf_file,
+            recombination_map=recombination_map,
+            accessibility_mask=accessibility_mask,
         )
 
         chrom = str(int(rec_map[0, 0]))
+        mask = (
+            load_accessibility_mask(accessibility_mask, chrom)
+            if accessibility_mask is not None
+            else None
+        )
 
         # Return the key and the data as a pair
         return chrom, (
@@ -1845,6 +1909,7 @@ def scan(
             ac,
             position_masked,
             genetic_pos,
+            mask,
         )
 
     # read vcf in parallel
@@ -1872,6 +1937,7 @@ def scan(
         ac,
         position_masked,
         genetic_pos,
+        mask,
     ) in chrom_data.items():
         for stat_key in stats:
             params = _make_params(stat_key)
@@ -1921,6 +1987,25 @@ def scan(
                         f"'step' are missing from STAT_REGISTRY default_params."
                     )
                 all_windows = list(_get_windows(position_masked, params))
+                if mask is not None or stat_key in _PER_BP:
+                    lens = [
+                        _window_lengths(position_masked, i, j, c, params, mask)
+                        for i, j, c in all_windows
+                    ]
+                    if mask is not None:
+                        # drop windows below the accessible-fraction cutoff
+                        n_all = len(all_windows)
+                        keep = [acc >= min_accessible * L for acc, L in lens]
+                        all_windows = [wn for wn, k in zip(all_windows, keep) if k]
+                        lens = [ln for ln, k in zip(lens, keep) if k]
+                        print(
+                            f"{stat_key} {chrom}: {n_all - len(all_windows)} of {n_all} "
+                            f"windows below {min_accessible:.0%} accessible left out"
+                        )
+                    if stat_key in _PER_BP:
+                        all_windows = [
+                            (i, j, c, acc) for (i, j, c), (acc, _) in zip(all_windows, lens)
+                        ]
                 if not all_windows:
                     span = int(position_masked[-1] - position_masked[0])
                     warnings.warn(

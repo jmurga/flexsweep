@@ -241,12 +241,14 @@ One score per physical window. All configurable via shared ``w_size_bp``
      - ``pi``
      - 1 Mb
      - 10 kb
-     - Nucleotide diversity θ\ :sub:`π`.
+     - Nucleotide diversity θ\ :sub:`π` per bp (per accessible bp with
+       ``--accessibility_mask``).
    * - ``theta_w``
      - ``theta_w``
      - 1 Mb
      - 10 kb
-     - Watterson's θ\ :sub:`W`.
+     - Watterson's θ\ :sub:`W` per bp (per accessible bp with
+       ``--accessibility_mask``).
    * - ``fay_wu_h``
      - ``fay_wu_h``
      - 1 Mb
@@ -568,6 +570,16 @@ CLI reference
        ``JOBLIB_TEMP_FOLDER``, then ``/dev/shm``, then ``/tmp``. All chromosomes
        share one task pool, so point it (or ``JOBLIB_TEMP_FOLDER``) to a large disk
        when ``/tmp`` is small.
+   * - ``--accessibility_mask PATH``
+     - none
+     - BED of regions to exclude, GIAB convention, all chromosomes. SNPs inside it
+       are dropped, and ``pi`` and ``theta_w`` (also in ``neutrality``) are divided by
+       the accessible bases of each window instead of its length. See
+       :ref:`accessibility-mask`.
+   * - ``--min_accessible FLOAT``
+     - 0.6
+     - With ``--accessibility_mask``: sliding windows with a smaller accessible
+       fraction are left out of the window-statistic tables.
 
 Examples:
 

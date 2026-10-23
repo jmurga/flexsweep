@@ -636,7 +636,135 @@ def cleaning_summaries(summ_stats, params, model):
     return summ_stats_filtered, params, malformed_files
 
 
-def genome_reader(hap_data, recombination_map=None, region=None, samples=None):
+@lru_cache(maxsize=2)
+def _read_mask_bed(bed_path):
+    """All rows of a BED file as a polars DataFrame (chrom, start, end); cached per path."""
+    return pl.read_csv(
+        bed_path,
+        separator="\t",
+        has_header=False,
+        comment_prefix="#",
+        columns=[0, 1, 2],
+        new_columns=["chrom", "start", "end"],
+        schema_overrides={
+            "column_1": pl.String,
+            "column_2": pl.Int64,
+            "column_3": pl.Int64,
+        },
+    )
+
+
+def load_accessibility_mask(bed_path, chrom):
+    """
+    Merged excluded intervals of one chromosome from a GIAB-style BED.
+
+    The BED lists regions to EXCLUDE (e.g. GIAB ``GRCh38_alldifficultregions.bed.gz``),
+    0-based half-open, so VCF position ``p`` (1-based) is excluded when
+    ``start < p <= end``. Chromosomes match with or without the ``chr`` prefix.
+
+    :param str bed_path: BED file (plain or gzipped), all chromosomes.
+    :param str chrom: Chromosome name as in the VCF (``chr22`` or ``22``).
+    :returns: ``(starts, ends, cum)``: sorted, merged int64 intervals and
+        ``cum[k]`` = excluded bases in intervals ``0..k-1`` (length ``k + 1``).
+        Empty arrays if the chromosome is absent from the BED.
+    """
+    key = str(chrom).removeprefix("chr")
+    df = (
+        _read_mask_bed(bed_path)
+        .filter(pl.col("chrom").str.strip_prefix("chr") == key)
+        .sort("start")
+    )
+    if df.height == 0:
+        print(f"accessibility mask: no intervals for {chrom} in {bed_path}; nothing excluded")
+        empty = np.zeros(0, dtype=np.int64)
+        return empty, empty, np.zeros(1, dtype=np.int64)
+
+    starts = df["start"].to_numpy()
+    ends = df["end"].to_numpy()
+    # merge overlapping or adjacent intervals
+    run_end = np.maximum.accumulate(ends)
+    new_block = np.ones(starts.size, dtype=bool)
+    new_block[1:] = starts[1:] > run_end[:-1]
+    block = np.cumsum(new_block) - 1
+    m_starts = starts[new_block]
+    m_ends = np.zeros(m_starts.size, dtype=np.int64)
+    np.maximum.at(m_ends, block, ends)
+    cum = np.concatenate([[0], np.cumsum(m_ends - m_starts)]).astype(np.int64)
+    return m_starts.astype(np.int64), m_ends, cum
+
+
+def _excluded_upto(mask, x):
+    """Excluded bases at 1-based positions ``<= x`` (vectorized over ``x``)."""
+    starts, ends, cum = mask
+    x = np.asarray(x, dtype=np.int64)
+    if starts.size == 0:
+        return np.zeros_like(x)
+    k = np.searchsorted(starts, x, side="left")  # intervals with start < x
+    km1 = np.maximum(k - 1, 0)
+    partial_len = np.minimum(x, ends[km1]) - starts[km1]
+    return np.where(k > 0, cum[km1] + partial_len, 0)
+
+
+def excluded_bp(mask, a, b):
+    """Excluded bases in the 1-based closed window ``[a, b]`` (vectorized)."""
+    return _excluded_upto(mask, b) - _excluded_upto(mask, np.asarray(a) - 1)
+
+
+def is_excluded(mask, pos):
+    """True for 1-based positions inside an excluded interval."""
+    starts, ends, _ = mask
+    pos = np.asarray(pos, dtype=np.int64)
+    if starts.size == 0:
+        return np.zeros(pos.shape, dtype=bool)
+    k = np.searchsorted(starts, pos, side="left") - 1  # last interval with start < pos
+    return (k >= 0) & (pos <= ends[np.maximum(k, 0)])
+
+
+def clean_genotypes(gt, pos, chrom, mask=None, max_missing_warn=0.01):
+    """
+    Site filter applied once when a VCF is read, so every statistic sees clean input.
+
+    Keeps sites where (1) every sample has a call (no ``.`` alleles, so the sample
+    size is the same at every site), (2) the site is biallelic for alleles 0/1, and
+    (3) the SNP lies outside the accessibility mask, if one is given.
+
+    :param allel.GenotypeArray gt: Genotypes ``(n_sites, n_samples, ploidy)``.
+    :param numpy.ndarray pos: 1-based positions ``(n_sites,)``.
+    :param str chrom: Chromosome label, for the log line.
+    :param tuple mask: Output of :func:`load_accessibility_mask`, or None.
+    :param float max_missing_warn: Warn when more than this fraction of sites is
+        dropped for missing calls.
+    :returns: ``(keep, ac)``: boolean site mask and the allele counts of all sites.
+    """
+    ac = gt.count_alleles()
+    complete = ~gt.is_missing().any(axis=1)
+    biallelic = ac.is_biallelic_01()
+    keep = complete & biallelic
+    n_missing = int((~complete).sum())
+    n_masked = 0
+    if mask is not None:
+        excluded = is_excluded(mask, pos)
+        n_masked = int((excluded & complete & biallelic).sum())
+        keep &= ~excluded
+
+    n_sites = pos.size
+    print(
+        f"{chrom}: kept {int(keep.sum())} of {n_sites} sites; dropped "
+        f"{n_missing} with missing calls ({100 * n_missing / max(n_sites, 1):.2f}%), "
+        f"{n_masked} inside the accessibility mask"
+    )
+    if n_sites and n_missing / n_sites > max_missing_warn:
+        warn(
+            f"{chrom}: {100 * n_missing / n_sites:.1f}% of sites have missing calls and "
+            "were dropped. Impute missing genotypes during phasing (Beagle, SHAPEIT): "
+            "removing many sites leaves SNP gaps that look like reduced diversity."
+        )
+    return keep, ac
+
+
+def genome_reader(
+    hap_data, recombination_map=None, region=None, samples=None, accessibility_mask=None
+):
     """
     Read a VCF/BCF region and return haplotypes, recombination map, allel count array, biallelic masking, physical and genetic positions arrays.
 
@@ -646,6 +774,9 @@ def genome_reader(hap_data, recombination_map=None, region=None, samples=None):
             Optional TSV map with columns: chr, start, end, cm_mb, cm.
         region (str | None, default=None): Region string 'CHR:START-END' for subsetting.
         samples (list[str] | np.ndarray | None, default=None): Optional sample subset.
+        accessibility_mask (str | tuple | None, default=None): GIAB-style BED of
+            regions to exclude (path) or the output of ``load_accessibility_mask``.
+            SNPs inside excluded regions are dropped (see ``clean_genotypes``).
 
     Returns:
         dict[str, tuple]:
@@ -675,15 +806,19 @@ def genome_reader(hap_data, recombination_map=None, region=None, samples=None):
         return {region: None}
 
     pos = raw_data["variants/POS"]
+    chrom_label = str(raw_data["variants/CHROM"][0])
     np_chrom = np.char.replace(raw_data["variants/CHROM"].astype(str), "chr", "")
     try:
         np_chrom = np_chrom.astype(int)
     except Exception:
         pass
-    _ac = gt.count_alleles()
 
-    # Filtering monomorphic just in case
-    biallelic_filter = _ac.is_biallelic_01()
+    mask = accessibility_mask
+    if isinstance(mask, (str, os.PathLike)):
+        mask = load_accessibility_mask(mask, chrom_label)
+
+    # Complete-call, biallelic 0/1 sites outside the mask (drops monomorphic too)
+    biallelic_filter, _ac = clean_genotypes(gt, pos, chrom_label, mask=mask)
     ac = _ac[biallelic_filter]
     hap_int = gt.to_haplotypes().values[biallelic_filter].astype(np.int8)
     position_masked = pos[biallelic_filter].astype(np.int64)
@@ -1012,6 +1147,8 @@ def _process_vcf(
     stats=None,
     centers=None,
     tmp_dir=None,
+    accessibility_mask=None,
+    min_accessible=0.6,
 ):
     from . import Parallel, delayed
     from .data import Data
@@ -1043,6 +1180,13 @@ def _process_vcf(
     :param str tmp_dir:
         Folder for joblib temporary memmap files. If ``None``, joblib's default
         is used (``JOBLIB_TEMP_FOLDER``, then ``/dev/shm``, then the system temp folder).
+    :param str accessibility_mask:
+        Optional GIAB-style BED of regions to exclude (all chromosomes). SNPs inside
+        it are dropped and per-bp window statistics (pi, theta_w, dist_var) are
+        divided by the accessible bases of each window instead of its length.
+    :param float min_accessible:
+        With ``accessibility_mask``: windows whose accessible fraction is below this
+        value get missing window statistics. Default ``0.6``.
 
     :returns:
         A pair of Polars DataFrames:
@@ -1221,6 +1365,8 @@ def _process_vcf(
                 nthreads=nthreads,
                 parallel_manager=stats_pool,
                 centers=centers,
+                accessibility_mask=accessibility_mask,
+                min_accessible=min_accessible,
             )
             snps_df, window_df = _tmp_stats
             tmp_bins.append({"snps": snps_df, "windows": window_df})
@@ -1555,6 +1701,8 @@ def summary_statistics(
     stats=None,
     centers=None,
     tmp_dir=None,
+    accessibility_mask=None,
+    min_accessible=0.6,
 ):
     """
     Compute summary statistics to create needed feature vectors for CNN training/prediction
@@ -1683,6 +1831,8 @@ def summary_statistics(
                 stats=stats,
                 centers=centers,
                 tmp_dir=tmp_dir,
+                accessibility_mask=accessibility_mask,
+                min_accessible=min_accessible,
             )
         else:
             if func is not None:
@@ -2348,8 +2498,11 @@ def batch_windowed_stats_flat(
         Allele counts array.
     position_masked : (S,) int32 ndarray
         Absolute physical positions after biallelic filtering.
-    combos : list of (int, int)
-        (abs_center, window_size) pairs to compute in this batch.
+    combos : list of (int, int, float)
+        (abs_center, window_size, denom) triples to compute in this batch.
+        ``denom`` is the per-bp denominator passed to stat_func as
+        ``window_size``: the window length, or its accessible bases when an
+        accessibility mask is used (<= 0 gives a NaN row).
     stat_func : callable
         run_windows_stat or partial(compute_window_stats, ...).
     stat_cols : list of str
@@ -2361,17 +2514,17 @@ def batch_windowed_stats_flat(
     """
     iu, ju = np.triu_indices(hap_f.shape[1], k=1)
     results = []
-    for abs_center, w in combos:
+    for abs_center, w, denom in combos:
         left = np.searchsorted(position_masked, abs_center - w // 2, side="left")
         right = np.searchsorted(position_masked, abs_center + w // 2, side="right")
         _hap = hap_f[left:right]
-        if _hap.size == 0:
+        if _hap.size == 0 or denom <= 0:
             results.append((abs_center, w, (np.nan,) * len(stat_cols)))
             continue
         _ac = ac[left:right]
         _pos = position_masked[left:right]
         _f = _hap.mean(axis=1)
-        sv = stat_func(_hap, _pos, _ac, _f, window_size=w, iu=iu, ju=ju)
+        sv = stat_func(_hap, _pos, _ac, _f, window_size=denom, iu=iu, ju=ju)
         results.append((abs_center, w, sv))
     return results
 
@@ -2394,6 +2547,8 @@ def calculate_stats_vcf_flat(
     parallel_manager=None,
     isafe_region_size=int(2e6),
     centers=None,
+    accessibility_mask=None,
+    min_accessible=0.6,
 ):
     """Compute per-locus-window summary statistics from a VCF with O(N) window work.
 
@@ -2453,6 +2608,11 @@ def calculate_stats_vcf_flat(
         compute_isafe = compute_snp_stats
         snp_cols = None
 
+    # accessibility mask (outside the try below: a bad BED must fail loudly)
+    mask = None
+    if accessibility_mask is not None:
+        mask = load_accessibility_mask(accessibility_mask, region[0].split(":")[0])
+
     # read VCF
     try:
         (
@@ -2462,7 +2622,12 @@ def calculate_stats_vcf_flat(
             biallelic_mask,
             position_masked,
             genetic_position_masked,
-        ) = genome_reader(vcf_file, recombination_map=recombination_map, region=None)
+        ) = genome_reader(
+            vcf_file,
+            recombination_map=recombination_map,
+            region=None,
+            accessibility_mask=mask,
+        )
         freqs = np.ascontiguousarray(ac[:, 1] / ac.sum(axis=1), dtype=np.float64)
     except Exception:
         return None
@@ -2545,7 +2710,33 @@ def calculate_stats_vcf_flat(
     unique_abs_centers = sorted(
         {int(lw[0]) + int(c) - 1 for lw in genomic_windows for c in centers}
     )
-    unique_combos = [(abs_c, w) for abs_c in unique_abs_centers for w in windows]
+    # Per-bp denominator of each window [c - w//2, c + w//2]: its length w, or w
+    # minus the bases excluded by the accessibility mask.
+    _abs = np.asarray(unique_abs_centers, dtype=np.int64)
+    denoms = {
+        w: (
+            np.full(_abs.size, float(w))
+            if mask is None
+            else (w - excluded_bp(mask, _abs - int(w) // 2, _abs + int(w) // 2)).astype(float)
+        )
+        for w in windows
+    }
+    if mask is not None:
+        # windows below the accessible-fraction cutoff get missing window stats
+        n_low = 0
+        for w in windows:
+            low = denoms[w] < min_accessible * w
+            n_low += int(low.sum())
+            denoms[w][low] = 0.0
+        print(
+            f"{nchr}: {n_low} of {_abs.size * len(windows)} windows below "
+            f"{min_accessible:.0%} accessible -> missing window statistics"
+        )
+    unique_combos = [
+        (abs_c, w, denoms[w][i])
+        for i, abs_c in enumerate(unique_abs_centers)
+        for w in windows
+    ]
 
     hap_f = np.ascontiguousarray(hap_int.astype(np.float64))
     chunk_size = max(1, ceil(len(unique_combos) / (nthreads * 2)))

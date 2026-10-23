@@ -511,6 +511,19 @@ def fvs_discoal(
     default=None,
     help="Folder for joblib temporary memmap files, cleaned after each VCF. Default: joblib's (JOBLIB_TEMP_FOLDER, then /dev/shm, then /tmp).",
 )
+@click.option(
+    "--accessibility_mask",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Optional GIAB-style BED of regions to EXCLUDE (e.g. GRCh38_alldifficultregions.bed.gz), all chromosomes. SNPs inside it are dropped and per-bp statistics (pi, theta_w, dist_var) are divided by the accessible bases of each window instead of its length.",
+)
+@click.option(
+    "--min_accessible",
+    type=click.FloatRange(0, 1),
+    default=0.6,
+    show_default=True,
+    help="With --accessibility_mask: windows whose accessible fraction is below this value get missing window statistics.",
+)
 def fvs_vcf(
     vcf_path,
     stats,
@@ -525,6 +538,8 @@ def fvs_vcf(
     suffix,
     nthreads,
     tmp_dir,
+    accessibility_mask,
+    min_accessible,
 ):
     """
     Estimate summary statistics from VCF files and build feature vectors.
@@ -573,6 +588,8 @@ def fvs_vcf(
         func=None,
         save_stats=save_stats,
         tmp_dir=tmp_dir,
+        accessibility_mask=accessibility_mask,
+        min_accessible=min_accessible,
     )
 
 
@@ -1759,6 +1776,19 @@ def split_maf(maf, contig, outdir, sort, tmp_dir, chunk_bytes):
     default=None,
     help="Folder for joblib temporary memmap files. Default: joblib's (JOBLIB_TEMP_FOLDER, then /dev/shm, then /tmp).",
 )
+@click.option(
+    "--accessibility_mask",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Optional GIAB-style BED of regions to EXCLUDE (e.g. GRCh38_alldifficultregions.bed.gz), all chromosomes. SNPs inside it are dropped and per-bp pi and theta_w (also in neutrality) are divided by the accessible bases of each window instead of its length.",
+)
+@click.option(
+    "--min_accessible",
+    type=click.FloatRange(0, 1),
+    default=0.6,
+    show_default=True,
+    help="With --accessibility_mask: sliding windows whose accessible fraction is below this value are left out of the window-statistic tables.",
+)
 def scan(
     vcf_path,
     out_prefix,
@@ -1780,6 +1810,8 @@ def scan(
     r_bins,
     min_rate,
     tmp_dir,
+    accessibility_mask,
+    min_accessible,
 ):
     """Standalone outlier scan from a directory of per-chromosome VCF files.
 
@@ -1828,6 +1860,8 @@ def scan(
         nthreads=nthreads,
         window_mode=window_mode,
         tmp_dir=tmp_dir,
+        accessibility_mask=accessibility_mask,
+        min_accessible=min_accessible,
         config={
             "lassi": {"K_truncation": K_truncation, "sweep_mode": sweep_mode},
             "lassip": {
