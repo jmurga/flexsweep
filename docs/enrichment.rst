@@ -211,9 +211,12 @@ enrichment curves, and the FDR results (one row per sweep file; columns ``scope`
 Plotting the enrichment curves
 ------------------------------
 
-``flexsweep enrichment --output_folder`` writes ``enrichment_curves.txt`` and one
-``enrichment_curves_<sweep file name>.svg`` per sweep file. To redraw from the saved
-table without rerunning the bootstrap, e.g. with other scopes or one panel per scope:
+``flexsweep enrichment`` writes ``case_set.txt``, ``control_set.txt``,
+``used_genes.txt``, ``enrichment_curves.txt``, ``fdr.txt`` and one
+``enrichment_curves_<sweep file name>.svg`` per sweep file to ``--output_folder``
+(default: the current directory). ``--facet``, ``--plot_groups`` and ``--ci`` set how that
+first plot is drawn. To redraw from the saved table without rerunning the bootstrap, e.g.
+with other scopes or a title:
 
 .. code-block:: bash
 

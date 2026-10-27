@@ -1286,6 +1286,12 @@ def rank(prediction, prediction_dir, populations, pattern, feature_coordinates, 
     help="Plot group curves (--groups labels) instead of population curves.",
 )
 @click.option(
+    "--ci",
+    is_flag=True,
+    default=False,
+    help="Shade the 95% interval of the ratio across matched control sets.",
+)
+@click.option(
     "--seed",
     type=int,
     default=None,
@@ -1300,8 +1306,9 @@ def rank(prediction, prediction_dir, populations, pattern, feature_coordinates, 
 @click.option(
     "--output_folder",
     type=str,
-    default=None,
-    help="Folder to output files).",
+    default=".",
+    help="Folder for case_set.txt, control_set.txt, used_genes.txt, enrichment_curves.txt, "
+    "fdr.txt and the curve SVGs. Default: current directory.",
 )
 def enrichment(
     sweep_files,
@@ -1325,6 +1332,7 @@ def enrichment(
     distance_file,
     facet,
     plot_groups,
+    ci,
     seed,
     reuse_bootstrap,
     output_folder,
@@ -1358,9 +1366,12 @@ def enrichment(
             --populations YRI \\
             --groups AFR \\
             --thresholds 6000,5000,2000,1000,500,200,100,50,20 \\
-            --nthreads 8
+            --nthreads 8 \\
+            --output_folder enrichment_out
+
+    Tables and SVGs go to the current directory when --output_folder is omitted.
     """
-    from flexsweep.enrichment import np, plot_enrichment, run_enrichment
+    from flexsweep.enrichment import _curve_svg_path, np, plot_enrichment, run_enrichment
 
     if len(groups.split(",")) != len(populations.split(",")):
         raise click.BadParameter(
@@ -1394,15 +1405,17 @@ def enrichment(
         shuffle_blocks=shuffle_blocks,
     )
 
-    plot_enrichment(
+    figs = plot_enrichment(
         df_curves,
         scopes=list(np.unique(groups.split(",")))
         if plot_groups
         else list(np.unique(populations.split(","))),
         facet=facet,
+        ci=ci,
         output_folder=output_folder,
-        show=output_folder is None,
     )
+    for dataset in figs:
+        click.echo(f"{dataset} -> {_curve_svg_path(output_folder, dataset)}")
 
 
 @cli.command("enrichment-plot")
@@ -1410,7 +1423,7 @@ def enrichment(
     "--curves",
     type=str,
     required=True,
-    help="enrichment_curves.txt written by 'flexsweep enrichment --output_folder'.",
+    help="enrichment_curves.txt written by 'flexsweep enrichment'.",
 )
 @click.option(
     "--scopes",
