@@ -1,4 +1,4 @@
-[![CI](https://github.com/jmurga/flexsweep/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jmurga/flexsweep/actions/workflows/ci.yml) [![Documentation Status](https://readthedocs.org/projects/flexsweep/badge/?version=latest)](https://flexsweep.readthedocs.io/en/latest/?badge=latest) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![CI](https://github.com/jmurga/flexsweep/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/jmurga/flexsweep/actions/workflows/ci.yml) [![Documentation Status](https://app.readthedocs.org/projects/flexsweep/badge/?version=latest)](https://flexsweep.readthedocs.io/en/latest/?badge=latest) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 # Flexsweep v2.0
 
