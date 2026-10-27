@@ -71,6 +71,71 @@ Command line and Python interface
 above reproduce the CLI. In particular ``preprocess`` is off in both: the feature vectors
 written by ``fvs-discoal`` and ``fvs-vcf`` are already standardized.
 
+Worked example on the YRI chr22 data
+------------------------------------
+
+This example trains the DANN with the simulations of the :doc:`quickstart` as labelled
+source and the YRI chr22 VCF as unlabelled target, then compares its predictions with
+those of the quickstart CNN. It assumes the quickstart has already run:
+
+.. code-block:: bash
+
+    flexsweep example --output_folder yri_chr22 --nthreads 24 --full
+
+which leaves the simulation feature vectors in ``yri_chr22/sims/fvs.parquet``, the VCF
+feature vectors in ``yri_chr22/data/vcfs/fvs_yri.parquet`` and the CNN predictions in
+``yri_chr22/cnn/yri_predictions.txt``. Simulations and VCF both have 100 haplotypes. With
+1,000 simulations per class this is a test of the workflow, not a usable sweep scan.
+
+**1. Train and predict.** From the command line:
+
+.. code-block:: bash
+
+    flexsweep dann \
+        --source_data yri_chr22/sims/fvs.parquet \
+        --target_data yri_chr22/data/vcfs/fvs_yri.parquet \
+        --output_folder yri_chr22/dann \
+        --seed 1
+
+or from Python (one IPython session for this and the next step):
+
+.. code-block:: python
+
+    import polars as pl
+    import flexsweep as fs
+
+    fs_dann = fs.CNN(
+        source_data="yri_chr22/sims/fvs.parquet",
+        target_data="yri_chr22/data/vcfs/fvs_yri.parquet",
+        output_folder="yri_chr22/dann",
+        seed=1,
+    )
+    fs_dann.train_da()
+    fs_dann.predict_da()
+
+Both write ``model_da.keras``, ``calibration.json`` and the VCF predictions
+``yri_chr22/dann/yri_da_predictions.txt`` (columns as in :doc:`cnn`).
+
+**2. Compare with the CNN.** Both models classify the same ``fvs-vcf`` regions, so the
+predictions join on chromosome and start:
+
+.. code-block:: python
+
+    cols = ["chr", "start", "end", "prob_sweep"]
+    cnn = pl.read_csv("yri_chr22/cnn/yri_predictions.txt").select(cols)
+    dann = pl.read_csv("yri_chr22/dann/yri_da_predictions.txt").select(cols)
+    both = cnn.join(dann, on=["chr", "start", "end"], suffix="_dann")
+
+    print(both.height, both.select(pl.corr("prob_sweep", "prob_sweep_dann", method="spearman")))
+    # regions called sweeps by each model at P(sweep) >= 0.5
+    print(both.select((pl.col("prob_sweep") >= 0.5).sum().alias("cnn"),
+                      (pl.col("prob_sweep_dann") >= 0.5).sum().alias("dann")))
+
+The VCF has no labels, so this comparison shows how much the two models agree, not which
+is right. To measure whether the DANN helps under a given misspecification, test it on
+simulations (:ref:`demography-misspecification`). Here source and target share the YRI
+demographic model, so little difference is expected.
+
 Options
 -------
 
@@ -217,5 +282,12 @@ with tree-sequence recording), write the replicates as ms-format files in the fo
 layout of ``flexsweep simulator`` (``neutral/``, ``sweep/`` and ``params.txt.gz``), and
 compute feature vectors with ``flexsweep fvs-discoal``.
 
-The benchmark of the CNN and the DANN under misspecified demography (size change and
-recent admixture) is in progress and will be added here with its results.
+The Flex-sweep 2.0 paper runs this comparison with a constant-size population as the
+labelled source and, as the target standing in for empirical data, either the YRI size
+history or the West Eurasian admixture history of Souilmi et al. (2022), simulated with SLiM
+so that demography is the only difference. On held-out target simulations the ROC-AUC was
+0.947 (YRI) and 0.949 (admixture) for the CNN without adaptation, 0.947 and 0.950 for the
+DANN, and 0.977 and 0.974 for a CNN trained on the true demography. Each model was trained
+once, on one demography and one simulator. The DANN therefore preserved the accuracy of the
+CNN, whose robustness here comes mostly from standardizing each statistic within its own
+dataset, but did not recover the accuracy lost to the misspecification.
