@@ -388,6 +388,13 @@ listing all valid names.
      - SFS (balancing selection)
      - `Siewert & Voight 2020 <https://doi.org/10.1093/gbe/evaa013>`_
 
+.. warning::
+
+   The balancing-selection statistics (``ncd1``, ``beta``, ``beta_t``) follow their
+   original publications but are not evaluated in Flex-sweep, neither as CNN features nor
+   for detecting balancing selection. If you use them, first evaluate their behaviour
+   with simulations of your own population and study design.
+
 .. note::
 
    ``ihs`` and ``nsl`` are computed with `scikit-allel
@@ -570,11 +577,20 @@ Haplotype statistics correlate with the local recombination rate: low-recombinat
 regions have longer haplotypes and look more sweep-like. With ``r_bins``, Flex-sweep
 standardizes each statistic within recombination-rate strata as well, so that a region
 is compared with regions of similar recombination rate
-(`Johnson and Voight 2018 <https://doi.org/10.1038/s41559-018-0478-6>`_). This makes
-predictions more robust to differences in recombination rate between the simulations
+(`Johnson and Voight 2018 <https://doi.org/10.1038/s41559-018-0478-6>`_). The aim is to
+make predictions robust to differences in recombination rate between the simulations
 and the data. In simulations the rate of each replicate is known (``r`` in
 ``params.txt.gz``); in VCFs it is interpolated from the recombination map. The strata
 are dropped from the output, so the feature vector keeps the same shape.
+
+.. warning::
+
+   Recombination-rate stratified normalisation is not fully evaluated. We used it in the
+   genome-wide analyses of the Flex-sweep 2.0 paper, but we have not measured with
+   simulations how it changes power or the false positive rate. Before relying on it,
+   evaluate it with simulations of your own population and recombination map, for
+   example by classifying the same neutral and sweep simulations with and without
+   ``r_bins``.
 
 **Recombination map format.** A tab-separated file with ``#`` comment lines, one
 header line, and five columns: chromosome, start and end of the interval (bp), rate in

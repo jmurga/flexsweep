@@ -318,6 +318,12 @@ One score per physical window. All configurable via shared ``w_size_bp``
      - NCD1 for balancing selection (`Bitarello et al. 2018 <https://doi.org/10.1093/gbe/evy054>`_). Configurable:
        ``tf`` (0.5), ``w`` (3000), ``minIS`` (2).
 
+.. warning::
+
+   ``beta`` and ``ncd`` follow their original publications but are not evaluated in
+   Flex-sweep. Before interpreting their outliers, evaluate them with simulations of
+   your own population and study design.
+
 .. _scan-window-mode:
 
 Window mode
@@ -423,6 +429,12 @@ so low-recombination regions would otherwise dominate the outlier tail. Normalis
 within joint allele-frequency and recombination-rate strata follows
 `Johnson and Voight 2018 <https://doi.org/10.1038/s41559-018-0478-6>`_, who normalised
 iHS within 50 derived allele frequency bins x 10 local recombination-rate bins.
+
+.. warning::
+
+   Joint DAF x recombination-rate normalization is not fully evaluated in Flex-sweep: we
+   have not measured with simulations how it changes the outlier tail. Before relying on
+   it, evaluate it with simulations of your own population and recombination map.
 
 To enable it, pass both ``recombination_map`` and ``r_bins``, the recombination-rate
 bin edges in cM/Mb. First compute equal-frequency edges (deciles by default) from your
