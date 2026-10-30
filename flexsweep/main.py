@@ -14,6 +14,44 @@ def parse_float_list(value):
     return None
 
 
+def caldas_window_centers(locus_length=1_200_000, d=15, smallest_window=10_000):
+    """Caldas et al. 2022 geometry as a ``{window: [centers]}`` mapping.
+
+    d log-spaced window sizes from ``smallest_window`` to ``locus_length/((d+1)/2)``; for
+    each size, d centers spaced by half the window and fanned on the locus center.
+    Defaults are the human-tuned d=15, 10 kb (Caldas: d=21, 1 kb). Same values as
+    ``flexsweep/test_code/caldas_geometry.py``.
+    """
+    import numpy as np
+
+    sizes = np.round(
+        np.exp(np.linspace(np.log(smallest_window), np.log(locus_length / ((d + 1) / 2)), d))
+    ).astype(int)
+    mid = locus_length // 2
+    return {
+        int(ws): sorted(
+            np.round(np.linspace(mid - (d - 1) * ws / 4, mid + (d - 1) * ws / 4, d))
+            .astype(int)
+            .tolist()
+        )
+        for ws in sizes
+    }
+
+
+def load_window_centers(path):
+    """Read a ``{window: [centers]}`` JSON file (keys are window sizes in bp)."""
+    import json
+
+    with open(path) as fh:
+        raw = json.load(fh)
+    try:
+        return {int(w): [int(c) for c in cs] for w, cs in raw.items()}
+    except (AttributeError, TypeError, ValueError):
+        raise click.BadParameter(
+            f"{path}: expected a JSON object {{window: [centers, ...]}}"
+        )
+
+
 def _resolve_map_option(ctx, param, value):
     """Click callback: accept 'decode' for the bundled deCODE map, else a path."""
     if value is None:
@@ -291,18 +329,13 @@ def simulator(
 #   radial        --windows 4000,8000,16000,32000,64000,128000,256000,512000
 #                 --centers 600000  (single sweep center)                          1 x 8
 #
-#   caldas        Caldas et al. 2022 geometry (biorxiv 2022.07.19.500702), the
-#                 d x d subwindow cube with d = 14 rescaled to L = 1.2 Mb.
-#                 NOT a single call: summary_statistics applies ONE --centers to
-#                 ALL --windows (rectangular product, fv.py:1934), but Caldas
-#                 centers are SIZE-DEPENDENT (spacing = size/2, fanned on sweep).
-#                 => run ONCE PER size s_i, each with its own 21-center fan, then
-#                 hstack the 21 parquets on the index cols. Driver: scripts/caldas_geometry.
-#                   sizes (21, geometric lmin=1e3 -> L/11=109091, ratio 1.2644):
-#                     1000,1264,1599,2021,2556,3232,4086,5167,6533,8260,10445,
-#                     13206,16698,21114,26696,33755,42681,53966,68235,86278,109091
-#                   per size s: --centers = [600000 + (j-10)*(s/2) for j in 0..20]
-#                     (21 windows overlapping neighbours by half, fanned @ 600k)  21 x 21
+#   caldas        Caldas et al. 2022 geometry (biorxiv 2022.07.19.500702): d window
+#                 sizes, each with its OWN d centers (spacing = size/2, fanned on the
+#                 locus center). One call:  --geometry caldas [--caldas_d 15
+#                 --caldas_lmin 10000]. Defaults are the human-tuned cube used so far
+#                 (15 sizes, 10 kb - 150 kb; Caldas: d=21, 1 kb). Built in ONE pass via a
+#                 {window: [centers]} mapping (any such layout: --window_centers FILE.json).
+#                                                                                 15 x 15
 # ─────────────────────────────────────────────────────────────────────────────
 @cli.command()
 @click.option(
@@ -374,6 +407,26 @@ def simulator(
     default=False,
     help="Save raw statistics.",
 )
+@click.option(
+    "--window_centers",
+    type=click.Path(exists=True, dir_okay=False),
+    required=False,
+    default=None,
+    help="JSON file {window: [centers]} giving each window size its own centers "
+    "(evaluated in one pass). Overrides --windows/--centers/--step.",
+)
+@click.option(
+    "--geometry",
+    type=click.Choice(["caldas"]),
+    required=False,
+    default=None,
+    help="Preset per-window geometry. caldas: Caldas et al. 2022 cube, --caldas_d sizes x "
+    "--caldas_d centers fanned on the locus center. Overrides --windows/--centers/--step.",
+)
+@click.option("--caldas_d", type=int, default=15, show_default=True,
+              help="caldas: number of window sizes (and of centers per size).")
+@click.option("--caldas_lmin", type=int, default=10000, show_default=True,
+              help="caldas: smallest window size in bp.")
 def fvs_discoal(
     simulations_path,
     stats,
@@ -385,6 +438,10 @@ def fvs_discoal(
     save_stats,
     suffix,
     nthreads,
+    window_centers,
+    geometry,
+    caldas_d,
+    caldas_lmin,
 ):
     """
     Estimate summary statistics from discoal simulations and build feature vectors.
@@ -397,6 +454,17 @@ def fvs_discoal(
     r_bins_list = parse_float_list(r_bins)
     windows_list = parse_float_list(windows)
     center_list = parse_float_list(centers)
+
+    if window_centers is not None and geometry is not None:
+        raise click.UsageError("use either --window_centers or --geometry, not both")
+    if geometry == "caldas":
+        center_list = caldas_window_centers(int(locus_length), caldas_d, caldas_lmin)
+    elif window_centers is not None:
+        center_list = load_window_centers(window_centers)
+    if isinstance(center_list, dict):
+        windows_list = sorted(center_list)
+        n_pairs = sum(len(c) for c in center_list.values())
+        print(f"Per-window centers: {len(center_list)} windows, {n_pairs} (window, center) pairs")
 
     stats_list = stats.split(",") if stats is not None else None
 

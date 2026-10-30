@@ -1742,6 +1742,10 @@ def summary_statistics(
         for both statistic computation and normalization, so the ``(center, window)``
         feature layout stays internally consistent. Applies to both the simulation
         and VCF paths; for VCF the list is the sim-relative grid, remapped per region.
+        Simulations only: a ``{window: [centers]}`` mapping gives each window size its
+        own centers (e.g. the Caldas et al. 2022 geometry, whose centers are spaced by
+        half the window), evaluated in ONE pass; ``windows`` is then set to the mapping's
+        keys. The default list behaviour crosses every center with every window.
         **Default:** ``None``.
     :param int locus_length:
         Total locus length in base pairs.
@@ -1809,6 +1813,13 @@ def summary_statistics(
             "only_normalize is not implemented; run summary_statistics without it."
         )
     else:
+        if isinstance(centers, dict):
+            if vcf:
+                raise ValueError(
+                    "per-window centers ({window: [centers]}) are only supported for "
+                    "simulations (vcf=False)"
+                )
+            windows = sorted(int(w) for w in centers)
         if vcf:
             if func is not None and stats is None:
                 assert (
@@ -2113,13 +2124,13 @@ def calculate_stats_simulations(
         window_data = None
     else:
         if centers is not None:
-            centers = np.asarray(sorted(int(c) for c in centers)).astype(int)
+            centers = _sort_centers(centers)
         elif len(center) == 1:
             centers = np.arange(center[0], center[0] + step, step).astype(int)
         else:
             centers = np.arange(center[0], center[1] + step, step).astype(int)
 
-        all_combos = list(product(centers, windows))
+        all_combos = _window_center_pairs(centers, windows)
         lowers = np.array([c - w // 2 for c, w in all_combos])
         uppers = np.array([c + w // 2 for c, w in all_combos])
 
@@ -2906,6 +2917,32 @@ def relative_position(positions, window):
     return positions - window[0] + 1
 
 
+def _sort_centers(centers):
+    """Sorted int centers. A ``{window: [centers]}`` mapping (per-window centers, e.g. the
+    Caldas et al. 2022 geometry) is returned as a mapping with int keys and sorted int
+    centers; a flat list as a sorted int array (the layout used everywhere else)."""
+    if isinstance(centers, dict):
+        return {int(w): sorted(int(c) for c in cs) for w, cs in centers.items()}
+    return np.asarray(sorted(int(c) for c in centers)).astype(int)
+
+
+def _window_center_pairs(centers, windows):
+    """(center, window) pairs to evaluate.
+
+    A flat center list is crossed with every window (``product(centers, windows)``,
+    unchanged behaviour). A ``{window: [centers]}`` mapping gives only its own pairs, so
+    each window size can have its own centers in ONE pass over the simulations; the
+    ``windows`` argument is then ignored.
+    """
+    if isinstance(centers, dict):
+        return [
+            (int(c), int(w))
+            for w in sorted(centers, key=int)
+            for c in sorted(int(x) for x in centers[w])
+        ]
+    return list(product(centers, windows))
+
+
 def cut_snps(df, centers, windows, stats_names, fixed_center=None, iter_value=1):
     """
     Processes data within windows across multiple centers and window sizes.
@@ -2939,24 +2976,32 @@ def cut_snps(df, centers, windows, stats_names, fixed_center=None, iter_value=1)
 
     # reset centers
 
-    if centers is None:
-        centers = np.arange(5e5, 7e5 + 1e4, 1e4).astype(int)
-        sim_mid = 6e5
+    if isinstance(centers, dict):
+        # per-window centers (simulations only): explicit (center, window) pairs
+        if fixed_center is not None:
+            raise ValueError("per-window centers ({window: [centers]}) are not supported "
+                             "with fixed_center (VCF path)")
+        pairs = _window_center_pairs(centers, windows)
     else:
-        sim_mid = (centers[0] + centers[-1]) // 2
+        if centers is None:
+            centers = np.arange(5e5, 7e5 + 1e4, 1e4).astype(int)
+            sim_mid = 6e5
+        else:
+            sim_mid = (centers[0] + centers[-1]) // 2
 
-    centers = np.asarray(centers).astype(int)
+        centers = np.asarray(centers).astype(int)
 
-    if fixed_center is not None:
-        centers_abs = np.array([fixed_center + c - sim_mid for c in centers]).astype(
-            int
-        )
-    else:
-        centers_abs = centers
+        if fixed_center is not None:
+            centers_abs = np.array(
+                [fixed_center + c - sim_mid for c in centers]
+            ).astype(int)
+        else:
+            centers_abs = centers
+        pairs = list(product(centers_abs, windows))
 
     results = []
     # out = []
-    for c, w in list(product(centers_abs, windows)):
+    for c, w in pairs:
         query = df.lazy()
 
         # HUGE BUG, REPEATING ACTUAL CENTER/WINDOW VALUES BASED ON ALL CENTERS SIZE
@@ -3558,7 +3603,7 @@ def normalization_raw(
 
             # centers range
             if centers is not None:
-                centers = np.asarray(sorted(int(c) for c in centers)).astype(int)
+                centers = _sort_centers(centers)
             elif len(center) == 2:
                 centers = np.arange(center[0], center[1] + step, step).astype(int)
             else:
@@ -3806,7 +3851,7 @@ def normalize_cut_raw(
         return None, None
 
     if centers is not None:
-        centers = np.asarray(sorted(int(c) for c in centers)).astype(int)
+        centers = _sort_centers(centers)
     elif len(center) == 2:
         centers = np.arange(center[0], center[1] + step, step).astype(int)
     else:
