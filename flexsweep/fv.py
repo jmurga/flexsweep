@@ -1543,7 +1543,11 @@ def _process_sims(
             else:
                 mask = np.arange(0, len(sim_list))
 
-            params = df_params.filter(pl.col("model") == sim_type)[mask, 1:].to_numpy()
+            # writable=True: polars may return a read-only zero-copy view when the
+            # columns happen to be contiguous; params[:, 0] is modified in place below
+            params = (
+                df_params.filter(pl.col("model") == sim_type)[mask, 1:].to_numpy(writable=True)
+            )
             d_centers[sim_type] = np.array(center).astype(int)
 
             if r_bins is not None:
