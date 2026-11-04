@@ -785,6 +785,7 @@ def fit_npe(
     transforms: int = 5,
     flow: str = "nsf",
     z_score_theta: str = "independent",
+    z_score_x: str = "independent",
     batch: int = 512,
     max_epochs: int = 300,
     n_pca: int = 50,
@@ -843,6 +844,12 @@ def fit_npe(
         ``s_transform`` this is the knob for the s-parametrization / transform-
         invariance check (a flat ``s`` that is genuinely identifiability-limited is
         invariant to all of these).
+    z_score_x : {"independent", "structured", "none"}
+        How ``sbi`` standardizes the FEATURES before the embedding (passed through to
+        ``posterior_nn``). ``"independent"`` (sbi's default) re-scales each column by
+        its mean and SD over the training rows, on top of the neutral-based z-scores
+        already in the parquet. ``"none"`` passes the parquet values to the embedding
+        unchanged.
     conformal : {"global","normalized","pred","conservative"}
         Conditional-conformal mode (see module docstring). ``"global"`` keeps the
         legacy single radius; the others adapt the radius per locus to even out
@@ -986,6 +993,7 @@ def fit_npe(
         emb = _make_cond_embedding(emb, X.shape[1], len(cond_cols))
         emb_kind = emb_kind + "+cond"
     de = posterior_nn(model=flow, embedding_net=emb, z_score_theta=z_score_theta,
+                      z_score_x=z_score_x,
                       hidden_features=hidden, num_transforms=transforms)
     inf = NPE(prior=prior, density_estimator=de, device=dev)
     # data_device="cpu" keeps the full (theta, x) master tensors in host RAM; sbi
@@ -1062,7 +1070,7 @@ def fit_npe(
         cond_cols=cond_cols, cond_transform=cond_transform,
         meta=dict(parquet=parquet, n_train=int(len(tr)), n_calib=int(len(cal)),
                   flow=flow, hidden=hidden, transforms=transforms,
-                  z_score_theta=z_score_theta,
+                  z_score_theta=z_score_theta, z_score_x=z_score_x,
                   embedding=emb_kind, grid=grid, condition_on=cond_cols,
                   conformal=conformal),
     )
