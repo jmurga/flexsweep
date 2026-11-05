@@ -115,7 +115,8 @@ def test_legacy_columns_and_split_chr(tmp_path):
     _scan_tsv(f, chroms=("7", "chr22"), legacy=True)
     figs = plot_scan(str(f), "ihs", split_chr=True, out=str(tmp_path / "s.svg"))
     assert len(figs) == 2
-    assert (tmp_path / "s.chr7.svg").exists()
+    # Files carry the name in the table, so "7" stays "7".
+    assert (tmp_path / "s.7.svg").exists()
     assert (tmp_path / "s.chr22.svg").exists()
 
 

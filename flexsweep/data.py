@@ -45,6 +45,58 @@ def _chrom_id(s):
     return chrom
 
 
+# Coordinates are always <CONTIG NAME>:start-end. The name is everything before the last
+# ":", so it may hold any character the VCF allows (scaffold-1, HLA:DRB1, NC_000001.11).
+REGION_PATTERN = r"^(.+):(\d+)-(\d+)$"
+_REGION = re.compile(REGION_PATTERN)
+
+
+def parse_region(region: str) -> tuple[str, int, int]:
+    """Split ``<CONTIG NAME>:start-end`` into ``(name, start, end)``.
+
+    The contig name is returned unchanged.
+
+    :raises ValueError: If ``region`` has any other format.
+    """
+    match = _REGION.match(region)
+    if match is None:
+        raise ValueError(
+            f"Invalid region {region!r}: expected <CONTIG NAME>:start-end, e.g. chr1:1-1200000."
+        )
+    return match.group(1), int(match.group(2)), int(match.group(3))
+
+
+def contig_ids(names) -> dict[str, int]:
+    """Number contig names 1..N in natural order (chr2 before chr10, SUPER__2 before SUPER__10).
+
+    The numbers only sort chromosomes in a table: they depend on which names are present,
+    so they must never be written out. Output always carries the real name.
+    """
+
+    def key(name: str) -> list:
+        # re.split with a group alternates text and digits, so items of two keys at the
+        # same index always have the same type.
+        return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", name)]
+
+    return {name: i + 1 for i, name in enumerate(sorted(set(names), key=key))}
+
+
+def check_one_vcf_per_contig(contigs: dict[str, str]) -> None:
+    """Stop if two VCF files hold the same contig.
+
+    :param dict contigs: ``{vcf_path: contig_name}``.
+    :raises ValueError: Naming both files, if a contig appears twice.
+    """
+    seen: dict[str, str] = {}
+    for path, name in contigs.items():
+        if name in seen:
+            raise ValueError(
+                f"{seen[name]} and {path} both hold contig {name}. Each VCF must hold one "
+                "contig and each contig one VCF: remove one of them."
+            )
+        seen[name] = path
+
+
 _CONTIG_LINE = re.compile(r"^##contig=<(.*)>\s*$")
 _CONTIG_FIELD = re.compile(r'([A-Za-z_][A-Za-z0-9_.]*)=("(?:[^"\\]|\\.)*"|[^,]*)')
 

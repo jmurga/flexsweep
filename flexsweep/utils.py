@@ -24,6 +24,7 @@ from numba import int64, njit
 from polars_bio import merge, nearest, overlap
 
 from . import Parallel, delayed, np, pl
+from .data import contig_ids
 from .fv import get_cm
 
 
@@ -88,8 +89,11 @@ def plot_diversity(data_dir, figsize=None, title=None, out=None, nthreads=1):
 
         _out.append(pl.concat([tmp_1, tmp_2]))
 
-    df = pl.concat(_out).sort(
-        pl.col("contig").str.replace("chr", "").cast(pl.Int64),
+    df = pl.concat(_out)
+    df = df.sort(
+        pl.col("contig").replace_strict(
+            contig_ids(df["contig"].unique().to_list()), return_dtype=pl.Int64
+        ),
         "window_size",
         "start",
     )
@@ -411,10 +415,6 @@ NEUTRAL_SWEEP_CMAP = LinearSegmentedColormap.from_list(
 )
 
 
-def _mh_chr_label(i: int) -> str:
-    return {23: "X", 24: "Y", 25: "MT"}.get(int(i), str(int(i)))
-
-
 def _mh_to_y(P, eps, log_transform):
     """P → -log10(1 - P) (or raw P when log_transform is False)."""
     P = np.asarray(P, dtype=float)
@@ -482,6 +482,7 @@ def _mh_draw_marginal(
 def _mh_facets(
     df,
     *,
+    chr_names,
     log_transform,
     eps,
     ncols,
@@ -554,7 +555,7 @@ def _mh_facets(
         for (p_val, ls, _lbl), yt in zip(lines, thr_ys):
             if (not log_transform) or yt <= ymax:
                 ax.axhline(yt, color="black", ls=ls, lw=0.8, zorder=20)
-        ax.set_title(f"chr {_mh_chr_label(c)}", fontsize=10)
+        ax.set_title(chr_names[c], fontsize=10)
         ax.spines[["top", "right"]].set_visible(False)
         ax.grid(axis="y", color="lightgray", lw=0.4)
         ax.tick_params(labelsize=7)
@@ -612,38 +613,6 @@ def plot_manhattan(
     dpi: int = 300,
 ):
     # ----------------------------
-    # Stable chromosome encoding
-    # ----------------------------
-    def _chr_to_int(expr: pl.Expr) -> pl.Expr:
-        cleaned = (
-            expr.cast(pl.Utf8)
-            .str.to_uppercase()
-            .str.replace(chr_prefix_pattern, "")
-            .str.extract(r"(\d+|X|Y|MT|M)$", 1)
-        )
-
-        return cleaned.replace({"X": "23", "Y": "24", "MT": "25", "M": "25"}).cast(
-            pl.Int32
-        )
-
-    def _chr_str_to_int(val: str | int) -> int:
-        s = str(val)
-        s = pl.Series([s]).str.replace(chr_prefix_pattern, "").to_list()[0]
-
-        if s == "X":
-            return 23
-        if s == "Y":
-            return 24
-        if s in {"MT", "M"}:
-            return 25
-        return int(s)
-
-    # ----------------------------
-    # Fixed chromosome color map
-    # ----------------------------
-    _CHR_COLORS = {i: ("black" if i % 2 == 1 else "0.8") for i in range(1, 26)}
-
-    # ----------------------------
     # Load data
     # ----------------------------
     df = pl.read_csv(prediction) if isinstance(prediction, str) else prediction
@@ -656,12 +625,26 @@ def plot_manhattan(
     is_regional = chrom is not None
 
     # ----------------------------
+    # Chromosome numbers: only order and colour the plot; labels use the real names.
+    # ----------------------------
+    def _bare(name) -> str:
+        return re.sub(chr_prefix_pattern, "", str(name))
+
+    _ids = contig_ids(df[_chr_col].cast(pl.Utf8).drop_nulls().unique().to_list())
+    _ids_bare = {_bare(name): i for name, i in _ids.items()}
+    _chr_names = {i: name for name, i in _ids.items()}
+    _CHR_COLORS = {i: ("black" if i % 2 == 1 else "0.8") for i in _ids.values()}
+
+    # ----------------------------
     # Normalize input
     # ----------------------------
     df = (
         df.with_columns(
             [
-                _chr_to_int(pl.col(_chr_col)).alias("CHR_INT"),
+                pl.col(_chr_col)
+                .cast(pl.Utf8)
+                .replace_strict(_ids, default=None, return_dtype=pl.Int32)
+                .alias("CHR_INT"),
                 pl.col(_pos_col).cast(pl.Int64).alias("BP_START"),
                 pl.col(_end_col).cast(pl.Int64).alias("BP_END"),
             ]
@@ -682,6 +665,7 @@ def plot_manhattan(
     if facet:
         return _mh_facets(
             df,
+            chr_names=_chr_names,
             log_transform=log_transform,
             eps=eps,
             ncols=ncols,
@@ -712,7 +696,12 @@ def plot_manhattan(
                     ]
                 ),
             )
-            .with_columns(_chr_to_int(pl.col("chr")).alias("chr"))
+            .with_columns(
+                pl.col("chr")
+                .str.replace(chr_prefix_pattern, "")
+                .replace_strict(_ids_bare, default=None, return_dtype=pl.Int32)
+                .alias("chr")
+            )
             .filter(pl.col("chr").is_not_null())
         )
 
@@ -746,13 +735,13 @@ def plot_manhattan(
                 how="left",
             )
 
-    chrom_order = list(range(1, 26))
-
     # ----------------------------
     # Regional mode
     # ----------------------------
     if is_regional:
-        target_chrom = _chr_str_to_int(chrom)
+        if _bare(chrom) not in _ids_bare:
+            raise ValueError(f"chrom {chrom!r} is not in the predictions: {list(_ids)}")
+        target_chrom = _ids_bare[_bare(chrom)]
         df_plot = df.filter(pl.col("CHR_INT") == target_chrom)
 
         if center is not None:
@@ -774,8 +763,6 @@ def plot_manhattan(
 
         df_plot = df_plot.sort("BP_START")
     else:
-        df = df.filter(pl.col("CHR_INT").is_in(chrom_order))
-
         # cumulative coordinate with an inter-chromosome whitespace gap so each
         # chromosome sits in its own bounded block (gap = chrom_gap × genome len)
         chr_lens = (
@@ -1022,7 +1009,12 @@ def plot_manhattan(
 
     # x-axis: chromosome labels + split axis line (one segment per chromosome)
     x_axis_ax.set_xticks(axisdf["center"].to_list())
-    x_axis_ax.set_xticklabels([str(c) for c in axisdf["CHR_INT"].to_list()], fontsize=7)
+    tick_names = [_bare(_chr_names[c]) for c in axisdf["CHR_INT"].to_list()]
+    x_axis_ax.set_xticklabels(
+        tick_names,
+        fontsize=7,
+        rotation=90 if max(len(n) for n in tick_names) > 3 else 0,
+    )
     x_axis_ax.set_xlabel("Chromosome")
     x_axis_ax.spines["bottom"].set_visible(False)
     x_axis_ax.tick_params(axis="x", length=0)
@@ -1090,11 +1082,8 @@ def plot_sweep_density(prediction, output_path=None):
     else:
         df = prediction
 
-    def _chr_key(x):
-        s = str(x).replace("chr", "")
-        return int(s) if s.isdigit() else ord(s[0])
-
-    chroms = sorted(df["chr"].unique().to_list(), key=_chr_key)
+    _ids = contig_ids(str(c) for c in df["chr"].unique().to_list())
+    chroms = sorted(df["chr"].unique().to_list(), key=lambda c: _ids[str(c)])
     ncols = 4
     nrows = math.ceil(len(chroms) / ncols)
     fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 3 * nrows), sharey=True)
@@ -1399,11 +1388,6 @@ def _resolve_scan_inputs(stats, stat_cols):
     return dfs, stat_cols
 
 
-def _chr_to_float(col_expr):
-    """Polars expression: strip 'chr' prefix and cast to Float64 for sorting."""
-    return col_expr.cast(pl.Utf8).str.replace("^chr", "").cast(pl.Float64)
-
-
 def default_scan_col(stat: str, columns: list[str]) -> str:
     """Column to plot for a scan stat: ``{rank_col}_std`` when the table has it
     (DAF-standardized iHS, nSL, ...), else the stat's rank column."""
@@ -1428,7 +1412,7 @@ def _stat_label(stat_col: str) -> str:
 def _scan_track(
     df: pl.DataFrame, stat_col: str, pvalue: bool, top_pct: float
 ) -> tuple[pl.DataFrame, str, bool]:
-    """Plot-ready track: ``chr_n``, ``positions``, ``_y`` and outlier class ``_cls``.
+    """Plot-ready track: ``chr``, ``positions``, ``_y`` and outlier class ``_cls``.
 
     ``_cls`` is +1 / -1 for the upper / lower ``top_pct`` tail and 0 otherwise.
     Stats with any negative value (iHS, nSL, Tajima's D, Fay-Wu H) get both
@@ -1443,7 +1427,7 @@ def _scan_track(
         )
     use_p = pvalue
     df = df.select(
-        _chr_to_float(pl.col("chr")).cast(pl.Int64).alias("chr_n"),
+        pl.col("chr").cast(pl.Utf8),
         pl.col("positions").cast(pl.Int64),
         pl.col(pval_col if use_p else stat_col).cast(pl.Float64).alias("_y"),
     ).filter(pl.col("_y").is_not_null() & pl.col("_y").is_not_nan())
@@ -1463,8 +1447,9 @@ def _scan_track(
             if signed:
                 cls[y <= np.quantile(y, top_pct)] = -1
         label = _stat_label(stat_col)
+    _ids = contig_ids(df["chr"].unique().to_list())
     df = df.with_columns(pl.Series("_y", y), pl.Series("_cls", cls)).sort(
-        "chr_n", "positions"
+        pl.col("chr").replace_strict(_ids, return_dtype=pl.Int64), "positions"
     )
     return df, label, signed
 
@@ -1472,16 +1457,20 @@ def _scan_track(
 def _chr_layout(tracks: list[pl.DataFrame], gap_frac: float = 0.03) -> pl.DataFrame:
     """Concatenated x layout: one block per chromosome spanning its data range.
 
-    Returns ``chr_n``, ``lo``, ``hi`` (bp) and ``offset`` such that
-    ``x = positions - lo + offset``; blocks are separated by ``gap_frac`` of the
-    total span.
+    Returns ``chr`` (real name), ``chr_n`` (1..N in natural order, for block colours),
+    ``lo``, ``hi`` (bp) and ``offset`` such that ``x = positions - lo + offset``; blocks
+    are separated by ``gap_frac`` of the total span.
     """
     lay = (
-        pl.concat([t.select("chr_n", "positions") for t in tracks])
-        .group_by("chr_n")
+        pl.concat([t.select("chr", "positions") for t in tracks])
+        .group_by("chr")
         .agg(pl.min("positions").alias("lo"), pl.max("positions").alias("hi"))
-        .sort("chr_n")
     )
+    lay = lay.with_columns(
+        pl.col("chr")
+        .replace_strict(contig_ids(lay["chr"].to_list()), return_dtype=pl.Int64)
+        .alias("chr_n")
+    ).sort("chr_n")
     span = (lay["hi"] - lay["lo"]).to_numpy().astype(np.float64)
     gap = gap_frac * span.sum() if len(span) > 1 else 0.0
     offset = np.concatenate([[0.0], np.cumsum(span + gap)[:-1]])
@@ -1703,13 +1692,13 @@ def plot_scan(
             )
             continue
         tracks = [b[0] for b in sub]
-        chroms = layout["chr_n"].to_list()
+        chroms = layout["chr"].to_list()
         if split_chr and len(chroms) > 1:
             parts = [
                 (
-                    [t.filter(pl.col("chr_n") == c) for t in tracks],
+                    [t.filter(pl.col("chr") == c) for t in tracks],
                     _chr_layout_subset(layout, c),
-                    _out_tag(g_out, f"chr{c}"),
+                    _out_tag(g_out, c.replace("/", "_")),
                 )
                 for c in chroms
             ]
@@ -1749,7 +1738,12 @@ def _plot_scan_region(
 ) -> plt.Figure:
     """Stacked panels over ``[center +/- window_bp]`` on one chromosome."""
     n = len(built)
-    chr_n = int(float(str(chrom).removeprefix("chr")))
+    bare = str(chrom).removeprefix("chr")
+    # chrom may come with or without the chr prefix; labels use the name in the table.
+    name = next(
+        (c for b in built for c in b[0]["chr"].unique().to_list() if c.removeprefix("chr") == bare),
+        str(chrom),
+    )
     lo, hi = center - window_bp, center + window_bp
     fig, axes = plt.subplots(
         n,
@@ -1760,9 +1754,7 @@ def _plot_scan_region(
     )
     axes = [axes] if n == 1 else list(axes)
     for ax, (t, label, signed) in zip(axes, built):
-        t = t.filter(
-            (pl.col("chr_n") == chr_n) & pl.col("positions").is_between(lo, hi)
-        )
+        t = t.filter((pl.col("chr") == name) & pl.col("positions").is_between(lo, hi))
         x = t["positions"].to_numpy()
         _draw_scan_track(
             ax,
@@ -1785,7 +1777,7 @@ def _plot_scan_region(
     ax.xaxis.set_minor_locator(mticker.AutoMinorLocator())
     ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda v, _: f"{v / 1e6:g}"))
     ax.tick_params(axis="x", labelsize=7)
-    ax.set_xlabel(f"chr{chr_n} position (Mb)")
+    ax.set_xlabel(f"{name} position (Mb)")
     if title:
         axes[0].set_title(title)
     fig.tight_layout()
@@ -1793,9 +1785,9 @@ def _plot_scan_region(
     return fig
 
 
-def _chr_layout_subset(layout: pl.DataFrame, chr_n: int) -> pl.DataFrame:
+def _chr_layout_subset(layout: pl.DataFrame, name: str) -> pl.DataFrame:
     """Single-chromosome layout: same ``lo``/``hi``, offset reset to 0."""
-    return layout.filter(pl.col("chr_n") == chr_n).with_columns(
+    return layout.filter(pl.col("chr") == name).with_columns(
         pl.lit(0.0).alias("offset")
     )
 
@@ -1826,7 +1818,7 @@ def _plot_scan_genome(
 
     n_chr = layout.height
     for ax, t, label, sgn in zip(axes, tracks, labels, signed):
-        t = t.join(layout, on="chr_n", how="inner").with_columns(
+        t = t.join(layout, on="chr", how="inner").with_columns(
             (pl.col("positions") - pl.col("lo") + pl.col("offset")).alias("_x")
         )
         _draw_scan_track(
@@ -1881,7 +1873,7 @@ def _plot_scan_genome(
     ax.set_xticks(minor, minor=True)
     pad = 0.01 * total
     ax.set_xlim(-pad, total + pad)
-    chr_names = [f"chr{c}" for c in layout["chr_n"].to_list()]
+    chr_names = layout["chr"].to_list()
     if n_chr == 1:
         ax.set_xlabel(f"{chr_names[0]} position (Mb)")
     else:
@@ -2434,17 +2426,6 @@ def interpolate_rates(
         ``plt.show()``) as a side effect.
     """
 
-    def _chr_key(s):
-        s = str(s)
-        m = re.match(r"^chr(\d+)$", s)
-        if m:
-            return (0, int(m.group(1)))
-        m = re.match(r"^chr([XYM]|MT)$", s)
-        if m:
-            order = {"X": 23, "Y": 24, "M": 25, "MT": 25}
-            return (1, order[m.group(1)])
-        return (2, s)
-
     def _bin_group(g, n_bins=bins):
         g = g.sort("cm_mb")
         n = g.height
@@ -2512,7 +2493,13 @@ def interpolate_rates(
 
     df_rate = (
         pl.concat(rate_frames)
-        .with_columns(pl.col("chr").str.replace("chr", "").cast(pl.Int32).alias("nchr"))
+        .with_columns(
+            pl.col("chr")
+            .replace_strict(
+                contig_ids(df_pred["chr"].unique().to_list()), return_dtype=pl.Int64
+            )
+            .alias("nchr")
+        )
         .sort(["nchr", "start"])
         .select(["chr", "start", "end", "cm_mb"])
     )
@@ -2561,7 +2548,8 @@ def interpolate_rates(
 
         df_trend = df_corr_binned.join(df_bins, on="chr", how="left")
 
-        chrs = sorted(df_trend["chr"].unique().to_list(), key=_chr_key)
+        _ids = contig_ids(df_trend["chr"].unique().to_list())
+        chrs = sorted(_ids, key=_ids.get)
         ncols = 4 if len(chrs) >= 4 else len(chrs)
         nrows = math.ceil(len(chrs) / ncols)
 

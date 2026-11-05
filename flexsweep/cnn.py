@@ -29,6 +29,7 @@ from tensorflow.keras.saving import register_keras_serializable
 from tensorflow.keras.utils import Sequence
 
 from . import np, pl
+from .data import REGION_PATTERN, contig_ids, parse_region
 
 
 @register_keras_serializable(package="fs", name="masked_bce")
@@ -1315,18 +1316,7 @@ class CNN:
         df_prediction = df_prediction.with_columns(pl.Series("region", regions))
 
         try:
-            chr_start_end = np.array(
-                [item.replace(":", "-").split("-") for item in regions]
-            )
-            df_prediction = df_prediction.with_columns(
-                pl.Series("chr", chr_start_end[:, 0]),
-                pl.Series("start", chr_start_end[:, 1], dtype=pl.Int64),
-                pl.Series("end", chr_start_end[:, 2], dtype=pl.Int64),
-                pl.Series(
-                    "nchr",
-                    pl.Series(chr_start_end[:, 0]).str.replace("chr", "").cast(int),
-                ),
-            )
+            df_prediction = df_prediction.with_columns(*_region_columns(regions))
             df_prediction = df_prediction.sort("nchr", "start").select(
                 pl.exclude("region", "iter", "model", "nchr")
             )
@@ -2969,19 +2959,7 @@ class CNN:
         )
 
         df_prediction = df_pred.with_columns(pl.Series("region", regions))
-        chr_start_end = np.array(
-            [item.replace(":", "-").split("-") for item in regions]
-        )
-
-        df_prediction = df_prediction.with_columns(
-            pl.Series("chr", chr_start_end[:, 0]),
-            pl.Series("start", chr_start_end[:, 1], dtype=pl.Int64),
-            pl.Series("end", chr_start_end[:, 2], dtype=pl.Int64),
-            pl.Series(
-                "nchr",
-                pl.Series(chr_start_end[:, 0]).str.replace("chr", "").cast(int),
-            ),
-        )
+        df_prediction = df_prediction.with_columns(*_region_columns(regions))
         df_prediction = df_prediction.sort("nchr", "start").select(
             [
                 "chr",
@@ -3152,19 +3130,7 @@ class CNN:
         )
 
         df_prediction = df_pred.with_columns(pl.Series("region", regions))
-        chr_start_end = np.array(
-            [item.replace(":", "-").split("-") for item in regions]
-        )
-
-        df_prediction = df_prediction.with_columns(
-            pl.Series("chr", chr_start_end[:, 0]),
-            pl.Series("start", chr_start_end[:, 1], dtype=pl.Int64),
-            pl.Series("end", chr_start_end[:, 2], dtype=pl.Int64),
-            pl.Series(
-                "nchr",
-                pl.Series(chr_start_end[:, 0]).str.replace("chr", "").cast(int),
-            ),
-        )
+        df_prediction = df_prediction.with_columns(*_region_columns(regions))
         df_prediction = df_prediction.sort("nchr", "start").select(
             [
                 "chr",
@@ -3562,6 +3528,23 @@ class DAParquetSequence(Sequence):
         return X, {"classifier": y_cls, "discriminator": y_dis}
 
 
+def _region_columns(regions) -> list[pl.Series]:
+    """``chr``, ``start``, ``end`` and the sort key ``nchr`` from ``<CONTIG NAME>:start-end``.
+
+    ``chr`` keeps the real name. ``nchr`` only orders the output (natural order) and must
+    be dropped before writing.
+    """
+    parsed = [parse_region(r) for r in regions]
+    names = [p[0] for p in parsed]
+    ids = contig_ids(names)
+    return [
+        pl.Series("chr", names, dtype=pl.String),
+        pl.Series("start", [p[1] for p in parsed], dtype=pl.Int64),
+        pl.Series("end", [p[2] for p in parsed], dtype=pl.Int64),
+        pl.Series("nchr", [ids[n] for n in names], dtype=pl.Int64),
+    ]
+
+
 def subset_genomic_windows(
     df: pl.DataFrame,
     centers: list[int],
@@ -3605,9 +3588,9 @@ def subset_genomic_windows(
     if update_iter and "iter" in out.columns:
         out = (
             out.with_columns(
-                pl.col("iter").str.extract(r"(chr\w+):(\d+)-", 1).alias("_chrom"),
+                pl.col("iter").str.extract(REGION_PATTERN, 1).alias("_chrom"),
                 pl.col("iter")
-                .str.extract(r":(\d+)-", 1)
+                .str.extract(REGION_PATTERN, 2)
                 .cast(pl.Int64)
                 .alias("_start"),
             )

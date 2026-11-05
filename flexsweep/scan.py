@@ -60,7 +60,14 @@ from math import ceil
 from allel import nsl, windowed_statistic
 
 from . import Parallel, delayed, np, pl
-from .data import Data, check_genome_build
+from .data import (
+    REGION_PATTERN,
+    Data,
+    check_genome_build,
+    check_one_vcf_per_contig,
+    contig_ids,
+    parse_region,
+)
 from .simulate_discoal import resolve_recombination_map
 from .fv import (
     Lambda_statistic_fast,
@@ -678,10 +685,15 @@ def snps_to_r_bins(
     return snps.join(matches, on=["chr", "positions"], how="left")
 
 
+def _sort_by_contig(df: pl.DataFrame) -> pl.DataFrame:
+    """Sort by contig in natural order, then position. ``chr`` keeps the real name."""
+    df = df.with_columns(pl.col("chr").cast(pl.Utf8))
+    ids = contig_ids(df["chr"].unique().to_list())
+    return df.sort(pl.col("chr").replace_strict(ids, return_dtype=pl.Int64), "positions")
+
+
 def normalize_stat_scan(df, df_r_bins=None):
     # For VCF, associate each SNP to the nearest window center (default) to assign r_bins
-
-    df = df.with_columns((pl.lit("chr") + pl.col("chr").cast(str)).alias("chr"))
 
     stat_cols = [
         c
@@ -693,13 +705,13 @@ def normalize_stat_scan(df, df_r_bins=None):
         df_r_bins_w = (
             df_r_bins.with_columns(
                 [
-                    pl.col("iter").str.extract(r"^([^:]+)", 1).alias("chr"),
+                    pl.col("iter").str.extract(REGION_PATTERN, 1).alias("chr"),
                     pl.col("iter")
-                    .str.extract(r":(\d+)-", 1)
+                    .str.extract(REGION_PATTERN, 2)
                     .cast(pl.Int64)
                     .alias("start"),
                     pl.col("iter")
-                    .str.extract(r"-(\d+)$", 1)
+                    .str.extract(REGION_PATTERN, 3)
                     .cast(pl.Int64)
                     .alias("end"),
                 ]
@@ -1820,6 +1832,7 @@ def scan(
 
     df_params_l = []
     df_r_l = []
+    contigs = {}
     for vcf_file in vcf_files[:]:
         fs_data = Data(vcf_file, nthreads=nthreads, window_size=w_size_bp, step=step_bp)
         sim_dict = fs_data.read_vcf()
@@ -1842,7 +1855,8 @@ def scan(
         center_coords = [
             tuple(map(int, r.split(":")[-1].split("-"))) for r in sim_dict["region"]
         ]
-        nchr = sim_dict["region"][0].split(":")[0]
+        nchr = parse_region(sim_dict["region"][0])[0]
+        contigs[vcf_file] = nchr
 
         if recombination_map is not None:
             cm_mb = get_cm(
@@ -1880,6 +1894,8 @@ def scan(
 
         df_params_l.append(tmp_params)
 
+    check_one_vcf_per_contig(contigs)
+
     df_params = pl.concat(df_params_l)
 
     try:
@@ -1887,7 +1903,7 @@ def scan(
     except:
         df_r = None
 
-    def _open_vcf(vcf_file, recombination_map):
+    def _open_vcf(vcf_file, recombination_map, chrom):
         # Perform the heavy lifting inside this function
         hap_int, rec_map, ac, _, position_masked, genetic_pos = genome_reader(
             vcf_file,
@@ -1895,7 +1911,6 @@ def scan(
             accessibility_mask=accessibility_mask,
         )
 
-        chrom = str(int(rec_map[0, 0]))
         mask = (
             load_accessibility_mask(accessibility_mask, chrom)
             if accessibility_mask is not None
@@ -1914,7 +1929,8 @@ def scan(
 
     # read vcf in parallel
     results = Parallel(n_jobs=nthreads, verbose=2)(
-        delayed(_open_vcf)(vcf_file, recombination_map) for vcf_file in vcf_files
+        delayed(_open_vcf)(vcf_file, recombination_map, contigs[vcf_file])
+        for vcf_file in vcf_files
     )
 
     # Convert the list of tuples back into the chrom_data dictionary
@@ -2134,11 +2150,7 @@ def scan(
         defn = STAT_REGISTRY[stat_key]
         rank_col = defn.rank_col
 
-        df_all = (
-            pl.concat([t[0] for t in raw_per_stat[stat_key]])
-            .with_columns(pl.col("chr").cast(int))
-            .sort("chr", "positions")
-        )
+        df_all = _sort_by_contig(pl.concat([t[0] for t in raw_per_stat[stat_key]]))
 
         # Genome-wide DAF-bin normalization for frequency-sensitive per-SNP stats.
         # Every other stat (window stats, hscan, isafe) is ranked on its raw value.
@@ -2153,15 +2165,7 @@ def scan(
                     normalized_df, col, abs_rank=(stat_key in _ABS_RANK)
                 )
 
-        # normalize_stat_scan prefixes "chr" (needed for the r_bins join); give
-        # every stat the same "chr<N>" labels, sorted numerically.
-        normalized_df = (
-            normalized_df.with_columns(
-                pl.col("chr").cast(pl.Utf8).str.replace("^chr", "").cast(int)
-            )
-            .sort("chr", "positions")
-            .with_columns(pl.format("chr{}", pl.col("chr")).alias("chr"))
-        )
+        normalized_df = _sort_by_contig(normalized_df)
         normalized_df.write_csv(f"{out_prefix}.{stat_key}.txt", separator="\t")
         results[stat_key] = normalized_df
 
@@ -2172,12 +2176,12 @@ def windowed_snps_stats(df, df_params, stat_col):
     df_window = (
         df_params.with_columns(
             [
-                pl.col("model").str.extract(r"^([^:]+)", 1).alias("chr"),
+                pl.col("model").str.extract(REGION_PATTERN, 1).alias("chr"),
                 pl.col("model")
-                .str.extract(r":(\d+)-", 1)
+                .str.extract(REGION_PATTERN, 2)
                 .cast(pl.Int64)
                 .alias("start"),
-                pl.col("model").str.extract(r"-(\d+)$", 1).cast(pl.Int64).alias("end"),
+                pl.col("model").str.extract(REGION_PATTERN, 3).cast(pl.Int64).alias("end"),
             ]
         ).sort(["chr", "start"])
     ).select("chr", "start", "end")

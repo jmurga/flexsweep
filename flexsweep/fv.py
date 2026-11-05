@@ -24,6 +24,7 @@ from numba import float32, float64, int32, int64, njit, prange, uint64
 from numba.typed import Dict
 
 from . import np, pl
+from .data import REGION_PATTERN, check_one_vcf_per_contig, contig_ids, parse_region
 
 filterwarnings("ignore", message="invalid INFO header", module="allel.io.vcf_read")
 filterwarnings(
@@ -785,7 +786,7 @@ def genome_reader(
 
         Where:
             - hap_int: (S x N) np.int8 haplotypes.
-            - rec_map: array with columns [chrom, idx, pos, cm].
+            - rec_map: numeric array with columns [1 (placeholder), idx, pos, cm].
             - ac.values: allele counts (scikit-allel).
             - biallelic_filter: boolean mask on original sites.
             - position_masked: np.int64 physical positions after biallelic filtering.
@@ -807,11 +808,6 @@ def genome_reader(
 
     pos = raw_data["variants/POS"]
     chrom_label = str(raw_data["variants/CHROM"][0])
-    np_chrom = np.char.replace(raw_data["variants/CHROM"].astype(str), "chr", "")
-    try:
-        np_chrom = np_chrom.astype(int)
-    except Exception:
-        pass
 
     mask = accessibility_mask
     if isinstance(mask, (str, os.PathLike)):
@@ -822,10 +818,13 @@ def genome_reader(
     ac = _ac[biallelic_filter]
     hap_int = gt.to_haplotypes().values[biallelic_filter].astype(np.int8)
     position_masked = pos[biallelic_filter].astype(np.int64)
-    np_chrom = np_chrom[biallelic_filter]
 
     if hap_int.shape[0] == 0:
         return {region: None}
+
+    # rec_map goes to numba, so it must stay numeric. One VCF holds one contig, so its
+    # first column is a placeholder: the real name travels in the region strings.
+    np_chrom = np.ones(position_masked.size, dtype=np.int64)
 
     # if region is None:
     #     d_pos = dict(zip(np.arange(position_masked.size + 1), position_masked))
@@ -862,7 +861,7 @@ def genome_reader(
                     ]
                 ),
             )
-            .filter(pl.col("chr") == "chr" + str(np_chrom[0]))
+            .filter(pl.col("chr").str.strip_prefix("chr") == chrom_label.removeprefix("chr"))
             .sort("start")
         )
         genetic_distance = get_cm(df_recombination_map, position_masked)
@@ -1131,6 +1130,25 @@ def get_closest_snps(position_array, center, N, symmetric=False):
 ################## Summaries
 
 
+def _sort_by_region(df: pl.DataFrame) -> pl.DataFrame:
+    """Sort rows by the ``iter`` region: contig in natural order, then start and end."""
+    df = df.with_columns(
+        pl.col("iter")
+        .str.extract_groups(REGION_PATTERN)
+        .struct.rename_fields(["_contig", "_start", "_end"])
+        .alias("_g")
+    ).unnest("_g")
+    ids = contig_ids(df["_contig"].drop_nulls().unique().to_list())
+    return (
+        df.with_columns(
+            pl.col("_contig").replace_strict(ids, default=None, return_dtype=pl.Int64),
+            pl.col(["_start", "_end"]).cast(pl.Int64),
+        )
+        .sort(["_contig", "_start", "_end"])
+        .drop(["_contig", "_start", "_end"])
+    )
+
+
 def _process_vcf(
     data_dir,
     nthreads,
@@ -1226,6 +1244,7 @@ def _process_vcf(
     fvs_file = {}
     sims = {}
     regions = {}
+    contigs = {}
     df_params_l = []
 
     vcf_files = sorted(
@@ -1267,6 +1286,9 @@ def _process_vcf(
         sims[key] = sim_dict["sweep"]
         regions[key] = sim_dict["region"]
         fvs_file[key] = os.path.join(data_dir, "vcfs", f"fvs_{key}.parquet")
+        contigs[vcf_path] = parse_region(sim_dict["region"][0])[0]
+
+    check_one_vcf_per_contig(contigs)
 
     df_params = pl.concat(df_params_l)
 
@@ -1307,8 +1329,8 @@ def _process_vcf(
             center_coords = [
                 tuple(map(int, r.split(":")[-1].split("-"))) for r in regions[k]
             ]
-            nchr = regions[k][0].split(":")[0]
-            params = df_params.filter(pl.col("model").str.contains(f"{nchr}:"))
+            nchr = parse_region(regions[k][0])[0]
+            params = df_params.filter(pl.col("model").str.starts_with(f"{nchr}:"))
 
             if recombination_map is not None:
                 cm_mb = get_cm(
@@ -1417,30 +1439,8 @@ def _process_vcf(
     df_pred = pl.concat(df_fv_cnn.values(), how="vertical")
     df_pred_raw = pl.concat(df_fv_cnn_raw.values(), how="vertical")
 
-    df_pred = (
-        df_pred.with_columns(
-            pl.col("iter")
-            .str.extract_groups(r"chr(\d+):(\d+)-(\d+)")
-            .struct.rename_fields(["chrom", "start", "end"])
-            .alias("g")
-        )
-        .unnest("g")
-        .with_columns(pl.col(["chrom", "start", "end"]).cast(pl.Int64))
-        .sort(["chrom", "start", "end"])
-        .select(pl.exclude(["chrom", "start", "end"]))
-    )
-    df_pred_raw = (
-        df_pred_raw.with_columns(
-            pl.col("iter")
-            .str.extract_groups(r"chr(\d+):(\d+)-(\d+)")
-            .struct.rename_fields(["chrom", "start", "end"])
-            .alias("g")
-        )
-        .unnest("g")
-        .with_columns(pl.col(["chrom", "start", "end"]).cast(pl.Int64))
-        .sort(["chrom", "start", "end"])
-        .select(pl.exclude(["chrom", "start", "end"]))
-    )
+    df_pred = _sort_by_region(df_pred)
+    df_pred_raw = _sort_by_region(df_pred_raw)
 
     with open(os.path.join(data_dir, f"empirical_bins{suffix_str}.pickle"), "wb") as f:
         pickle.dump(empirical_bins, f)
@@ -2626,7 +2626,7 @@ def calculate_stats_vcf_flat(
     # accessibility mask (outside the try below: a bad BED must fail loudly)
     mask = None
     if accessibility_mask is not None:
-        mask = load_accessibility_mask(accessibility_mask, region[0].split(":")[0])
+        mask = load_accessibility_mask(accessibility_mask, parse_region(region[0])[0])
 
     # read VCF
     try:
@@ -2653,7 +2653,7 @@ def calculate_stats_vcf_flat(
     genomic_windows = np.asarray(
         [tuple(map(int, r.split(":")[-1].split("-"))) for r in region]
     )
-    nchr = region[0].split(":")[0]
+    nchr = parse_region(region[0])[0]
 
     if centers is not None:
         centers = np.asarray(sorted(int(c) for c in centers)).astype(int)
@@ -3488,7 +3488,7 @@ def normalization_raw(
     windows = np.asarray(windows).astype(int)
 
     if vcf:
-        nchr = region[0].split(":")[0]
+        nchr = parse_region(region[0])[0]
         center_coords = [tuple(map(int, r.split(":")[-1].split("-"))) for r in region]
         center_g = np.array([(a + b) // 2 for a, b in center_coords])
 
@@ -3517,14 +3517,14 @@ def normalization_raw(
                             df_r_bins.with_columns(
                                 [
                                     pl.col("iter")
-                                    .str.extract(r"^([^:]+)", 1)
+                                    .str.extract(REGION_PATTERN, 1)
                                     .alias("chr"),
                                     pl.col("iter")
-                                    .str.extract(r":(\d+)-", 1)
+                                    .str.extract(REGION_PATTERN, 2)
                                     .cast(pl.Int64)
                                     .alias("start"),
                                     pl.col("iter")
-                                    .str.extract(r"-(\d+)$", 1)
+                                    .str.extract(REGION_PATTERN, 3)
                                     .cast(pl.Int64)
                                     .alias("end"),
                                 ]

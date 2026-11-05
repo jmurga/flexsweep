@@ -41,12 +41,19 @@ one per chromosome. Each file must be:
 * **bgzip-compressed and indexed** with tabix (``.tbi``) or ``bcftools index``
   (``.csi``). Flex-sweep stops with the command to fix the file if it is plain gzip or
   has no index.
-* **Any chromosome naming** (``22``, ``chr22``, ``NC_000022.11``, ``scaffold_12``,
-  ``Chr2``). The chromosome is taken from the first record and matched to its
+* **One contig per file, one file per contig.** Flex-sweep stops if two files hold the
+  same contig. A file holding several contigs is not supported and is not detected.
+* **Any chromosome naming** (``22``, ``chr22``, ``chrX``, ``NC_000022.11``,
+  ``scaffold_12``, ``SUPER__1``, ``Chr2``). The name is never changed: the output
+  carries the name in the VCF, and chromosomes are sorted in natural order (``SUPER__2``
+  before ``SUPER__10``). The chromosome is taken from the first record and matched to its
   ``##contig`` header line, whose keys may appear in any order, so unmodified 1000GP
   phase 3 headers (``##contig=<ID=22,assembly=b37,length=51304566>``) are supported.
   If the first record has no matching ``##contig`` line, the chromosome in the filename
   (``yri_chr22.vcf.gz``) is used instead.
+* **Coordinates as** ``<CONTIG NAME>:start-end``. Wherever coordinates are given or
+  written they have this format, e.g. ``SUPER__1:1-1200000``. The name is everything
+  before the last ``:``.
 * **Chromosome length** in the ``##contig`` line (``length=``). If it is missing,
   Flex-sweep uses the position of the last variant and warns, so the 1.2 Mb regions
   stop at the last variant rather than at the chromosome end. Add the lengths from the
