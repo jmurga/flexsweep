@@ -712,7 +712,7 @@ Each statistic writes one tab-separated file ``{out_prefix}.{stat}.txt``:
    * - Column
      - Description
    * - ``chr``
-     - Chromosome, written as ``chr<N>`` for every statistic.
+     - Chromosome, with the name in the VCF, for every statistic.
    * - ``positions``
      - Genomic position (bp). SNP stats: SNP position. Window stats: centre
        of window.
@@ -750,16 +750,17 @@ independent flags choose the figures; with ``--out x.svg``:
      - ``x.<col>.svg``
    * - ``--split_chr``
      - one per statistic and chromosome
-     - ``x.<col>.chr<N>.svg``
+     - ``x.<col>.<chromosome>.svg``
    * - ``--multi``
      - all statistics stacked, all chromosomes
      - ``x.svg``
    * - ``--multi --split_chr``
      - all statistics stacked, one per chromosome
-     - ``x.chr<N>.svg``
+     - ``x.<chromosome>.svg``
 
-The ``<col>`` and ``chr<N>`` parts are added only when there is more than one
-statistic or chromosome. Chromosomes sharing a figure are separated by dashed
+The ``<col>`` and ``<chromosome>`` parts are added only when there is more than one
+statistic or chromosome; ``<chromosome>`` is the name in the table (``chr22``,
+``SUPER__1``). Chromosomes sharing a figure are separated by dashed
 lines; the x-axis shows position in Mb within each chromosome.
 
 .. code-block:: bash
@@ -882,7 +883,7 @@ In Python, ``plot_scan`` from ``flexsweep.utils`` takes the same choices
        statistic, saved as ``{stem}.<col>{ext}``.
    * - ``split_chr``
      - False
-     - One figure per chromosome, saved as ``{stem}.chr<N>{ext}``. By default all
+     - One figure per chromosome, saved as ``{stem}.<chromosome>{ext}``. By default all
        chromosomes share one figure, separated by dashed vertical lines, with
        Mb ticks within each chromosome.
    * - ``out``

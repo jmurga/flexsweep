@@ -1595,13 +1595,13 @@ def plot_scan(
     - ``multi=True,  split_chr=False``: all stats stacked, all chromosomes
       -> ``x.svg``
     - ``multi=True,  split_chr=True``: all stats stacked, one figure per
-      chromosome -> ``x.chr<N>.svg``
+      chromosome -> ``x.<chromosome>.svg``
     - ``multi=False, split_chr=False``: one figure per stat, all chromosomes
       -> ``x.<stat>.svg``
     - ``multi=False, split_chr=True``: one figure per stat and chromosome
-      -> ``x.<stat>.chr<N>.svg``
+      -> ``x.<stat>.<chromosome>.svg``
 
-    The ``<stat>`` / ``chr<N>`` parts are only added when there is more than one
+    The ``<stat>`` / ``<chromosome>`` parts are only added when there is more than one
     stat / chromosome. The x-axis shows position in Mb within each chromosome;
     chromosomes sharing a figure are separated by dashed vertical lines.
     ``pvalue=False`` plots raw values; the top ``top_pct`` of each tail is

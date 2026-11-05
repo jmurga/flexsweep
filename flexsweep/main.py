@@ -712,6 +712,7 @@ def recombination_bins(vcf_path, recombination_map, bins, window_size, step, min
 
     import flexsweep as fs
     from flexsweep import pl
+    from flexsweep.data import REGION_PATTERN
     from flexsweep.fv import get_cm
 
     def read_regions(vcf_path):
@@ -722,7 +723,8 @@ def recombination_bins(vcf_path, recombination_map, bins, window_size, step, min
             pl.DataFrame(vcf_dict["region"])
             .with_columns(
                 pl.col("column_0")
-                .str.extract_groups(r"^(?P<chr>[^:]+):(?P<start>\d+)-(?P<end>\d+)$")
+                .str.extract_groups(REGION_PATTERN)
+                .struct.rename_fields(["chr", "start", "end"])
                 .alias("g")
             )
             .unnest("g")
@@ -754,9 +756,14 @@ def recombination_bins(vcf_path, recombination_map, bins, window_size, step, min
     if recombination_map is None:
         raise click.UsageError("--recombination_map is required (a path or 'decode').")
 
-    from flexsweep.data import check_genome_build
+    from flexsweep.data import (
+        check_genome_build,
+        check_one_vcf_per_contig,
+        get_contig_from_vcf_filename,
+    )
 
     check_genome_build(vcf_files, recombination_map)
+    check_one_vcf_per_contig({f: get_contig_from_vcf_filename(f)[0] for f in vcf_files})
 
     df_recombination_map = pl.read_csv(
         recombination_map,
@@ -2238,8 +2245,8 @@ def example(ctx, output_folder, nthreads, full, num_simulations, seed, steps, ov
     default="scan_plot.svg",
     show_default=True,
     help="Output path; SVG unless the extension says otherwise (.png, .pdf). "
-    "Without --multi, '.{col}' is added per stat; with --split_chr, '.chr{N}' "
-    "per chromosome.",
+    "Without --multi, '.{col}' is added per stat; with --split_chr, the chromosome "
+    "name as in the table (e.g. '.SUPER__1', '.chr22').",
 )
 def scan_plot(stat_files, stat_cols, multi, split_chr, pvalue, top_pct, out_file):
     """Visualize outlier scan results.
@@ -2249,7 +2256,7 @@ def scan_plot(stat_files, stat_cols, multi, split_chr, pvalue, top_pct, out_file
         flexsweep scan-plot --stat yri.ihs.txt --stat yri.nsl.txt
     All stats stacked in one figure:
         flexsweep scan-plot --stat yri.ihs.txt --stat yri.nsl.txt --multi
-    Add --split_chr to either for one figure per chromosome (.chr{N}).
+    Add --split_chr to either for one figure per chromosome, named as in the table.
     """
     import os
 

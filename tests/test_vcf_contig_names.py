@@ -361,3 +361,58 @@ def test_scan_plot_region_uses_real_name(tmp_path):
     _scan_table(f, ["SUPER__10", "SUPER__2"])
     fig = plot_scan(str(f), "ihs", chrom="SUPER__10", center=2_000_000, out=str(tmp_path / "r.svg"))
     assert fig.axes[-1].get_xlabel() == "SUPER__10 position (Mb)"
+
+
+# -- CLI ------------------------------------------------------------------------
+
+
+def _write_map(path, name):
+    rng = np.random.default_rng(3)
+    cm = np.cumsum(rng.uniform(0.1, 3.0, 40)) * 0.05
+    rows = "".join(f"{name}\t{i * 50000}\t{(i + 1) * 50000}\t1.0\t{cm[i]}\n" for i in range(40))
+    path.write_text("chr\tstart\tend\tcm_mb\tcm\n" + rows)
+
+
+def _recombination_bins(tmp_path, name, files=("a.vcf.gz",)):
+    from click.testing import CliRunner
+
+    from flexsweep.main import cli
+
+    d = tmp_path / "vcf"
+    d.mkdir()
+    for f in files:
+        _write_vcf(str(d / f), name)
+    _write_map(tmp_path / "map.tsv", name)
+    return CliRunner().invoke(
+        cli, ["recombination-bins", "--vcf_path", str(d), "--recombination_map", str(tmp_path / "map.tsv")]
+    )
+
+
+def _bins_line(output: str) -> str:
+    return next(line for line in output.splitlines() if line.startswith("Recombination bins:"))
+
+
+@pytest.mark.parametrize("name", ["SUPER__1", "chrX", "scaffold-1", "HLA:DRB1", "22"])
+def test_recombination_bins_any_name_gives_same_bins(tmp_path, name):
+    (tmp_path / "ref").mkdir()
+    (tmp_path / "got").mkdir()
+    ref = _recombination_bins(tmp_path / "ref", "chr22")
+    got = _recombination_bins(tmp_path / "got", name)
+    assert ref.exit_code == 0, ref.output
+    assert got.exit_code == 0, got.output
+    assert _bins_line(got.output) == _bins_line(ref.output)
+
+
+def test_recombination_bins_rejects_two_vcfs_for_one_contig(tmp_path):
+    res = _recombination_bins(tmp_path, "SUPER__1", files=("a.vcf.gz", "b.vcf.gz"))
+    assert res.exit_code != 0
+    assert "both hold contig SUPER__1" in str(res.exception)
+
+
+def test_scan_plot_help_describes_real_names():
+    from click.testing import CliRunner
+
+    from flexsweep.main import cli
+
+    help_text = CliRunner().invoke(cli, ["scan-plot", "--help"]).output
+    assert "chr{N}" not in help_text
