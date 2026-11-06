@@ -2383,8 +2383,9 @@ def interpolate_rates(
 
     If ``corr=True``, the function computes correlations between ``prob_sweep`` and
     ``cm_mb`` per chromosome, bins windows by ``cm_mb`` within each chromosome
-    (via ``_bin_group``), plots the binned trend per chromosome, and returns both
-    the augmented predictions and the per-chromosome binned trend table.
+    (via ``_bin_group``), plots the binned trend per chromosome, and returns the
+    augmented predictions, the per-chromosome binned trend table and the
+    per-chromosome correlation table.
 
     Input expectations:
       - The **prediction** file must contain at least ``chr``, ``start``, and ``end``,
@@ -2404,13 +2405,15 @@ def interpolate_rates(
         If provided, ``prob_sweep`` and ``prob_neutral`` are replaced for windows
         where ``cm_mb < 0.5`` using values from this file.
     :param bool corr: If ``True``, compute and plot per-chromosome binned trends
-        and return ``(df_pred_rate, df_trend)``; if ``False`` (default), return only
-        the augmented predictions.
+        and return ``(df_pred_rate, df_trend, df_corr)``; if ``False`` (default),
+        return only the augmented predictions.
     :returns: If ``corr=False``, returns **df_pred_rate**, a DataFrame containing
-        all original prediction columns plus ``cm_mb``. If ``corr=True``, returns a
-        pair ``(df_pred_rate, df_trend)``, where **df_trend** is a per-chromosome
-        binned table suitable for plotting (sorted by ``chr`` and ``bin``).
-    :rtype: polars.DataFrame | tuple[polars.DataFrame, polars.DataFrame]
+        all original prediction columns plus ``cm_mb``. If ``corr=True``, returns
+        ``(df_pred_rate, df_trend, df_corr)``, where **df_trend** is a per-chromosome
+        binned table suitable for plotting, whose ``corr`` is computed on the bin
+        means (chromosomes in natural order, then ``bin``), and **df_corr** holds
+        ``chr``, ``n`` and ``corr`` computed on the unbinned windows.
+    :rtype: polars.DataFrame | tuple[polars.DataFrame, polars.DataFrame, polars.DataFrame]
 
     :notes:
       - Recombination rate interpolation is delegated to ``get_cm`` and is performed
@@ -2599,7 +2602,9 @@ def interpolate_rates(
 
         return (
             df_pred_rate,
-            df_trend.sort("chr", "bin").select(pl.exclude("n", "n_in_bin")),
+            df_trend.sort(
+                pl.col("chr").replace_strict(_ids, return_dtype=pl.Int64), "bin"
+            ).select(pl.exclude("n", "n_in_bin")),
             df_corr,
         )
 

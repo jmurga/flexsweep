@@ -326,15 +326,16 @@ def test_interpolate_rates_keeps_real_names(tmp_path):
     assert sorted(out["chr"].unique().to_list()) == sorted(names)
 
 
-@pytest.mark.parametrize("names", [["chr1", "chr2", "chr10"], ["SUPER__10", "SUPER__2"]])
+@pytest.mark.parametrize("names", [["chr1", "chr2", "chr10"], ["SUPER__2", "SUPER__10"]])
 def test_interpolate_rates_corr_covers_every_contig(tmp_path, names):
     # Oracle: numpy correlation per contig on the returned windows. Every contig must
-    # appear, whether or not one of them is called chr1.
+    # appear, whether or not one of them is called chr1. names is in natural order; the
+    # input is reversed so the trend table has to sort it.
     from flexsweep.utils import interpolate_rates
 
     rng = np.random.default_rng(1)
     pred = tmp_path / "pred.csv"
-    _windows(names).drop("cm_mb").write_csv(pred)
+    _windows(names[::-1]).drop("cm_mb").write_csv(pred)
     rows = []
     for c in names:
         cm = 0.0
@@ -350,7 +351,9 @@ def test_interpolate_rates_corr_covers_every_contig(tmp_path, names):
     )
     assert windows.height == 30 * len(names)
     assert sorted(corr["chr"].to_list()) == sorted(names)
-    assert sorted(trend["chr"].unique().to_list()) == sorted(names)
+    assert trend["chr"].unique(maintain_order=True).to_list() == names
+    for c in names:
+        assert trend.filter(pl.col("chr") == c)["bin"].to_list() == list(range(10))
     for row in corr.iter_rows(named=True):
         w = windows.filter(pl.col("chr") == row["chr"])
         expected = np.corrcoef(w["prob_sweep"].to_numpy(), w["cm_mb"].to_numpy())[0, 1]
