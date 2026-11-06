@@ -2534,7 +2534,6 @@ def interpolate_rates(
         df_pred_rate = df_pred_rate.select(df_pred.columns + ["cm_mb"])
 
     if corr:
-        df_pred_rate = df_pred_rate.filter(pl.col("chr") == "chr1")
         df_corr = df_pred_rate.group_by("chr").agg(
             pl.len().alias("n"),
             pl.corr("prob_sweep", "cm_mb").alias("corr"),

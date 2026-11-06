@@ -326,6 +326,37 @@ def test_interpolate_rates_keeps_real_names(tmp_path):
     assert sorted(out["chr"].unique().to_list()) == sorted(names)
 
 
+@pytest.mark.parametrize("names", [["chr1", "chr2", "chr10"], ["SUPER__10", "SUPER__2"]])
+def test_interpolate_rates_corr_covers_every_contig(tmp_path, names):
+    # Oracle: numpy correlation per contig on the returned windows. Every contig must
+    # appear, whether or not one of them is called chr1.
+    from flexsweep.utils import interpolate_rates
+
+    rng = np.random.default_rng(1)
+    pred = tmp_path / "pred.csv"
+    _windows(names).drop("cm_mb").write_csv(pred)
+    rows = []
+    for c in names:
+        cm = 0.0
+        for s in range(0, 6000000, 200000):
+            rate = rng.uniform(0.1, 3.0)
+            cm += rate * 0.2
+            rows.append(f"{c}\t{s}\t{s + 200000}\t{rate}\t{cm}\n")
+    rec = tmp_path / "map.tsv"
+    rec.write_text("chr\tstart\tend\tcm_mb\tcm\n" + "".join(rows))
+
+    windows, trend, corr = interpolate_rates(
+        str(pred), str(rec), corr=True, out=str(tmp_path / "corr.png")
+    )
+    assert windows.height == 30 * len(names)
+    assert sorted(corr["chr"].to_list()) == sorted(names)
+    assert sorted(trend["chr"].unique().to_list()) == sorted(names)
+    for row in corr.iter_rows(named=True):
+        w = windows.filter(pl.col("chr") == row["chr"])
+        expected = np.corrcoef(w["prob_sweep"].to_numpy(), w["cm_mb"].to_numpy())[0, 1]
+        assert row["n"] == 30 and row["corr"] == pytest.approx(expected, abs=1e-12)
+
+
 def _scan_table(path, names, n=300):
     rng = np.random.default_rng(0)
     pl.concat(
