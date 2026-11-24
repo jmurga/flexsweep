@@ -74,7 +74,11 @@ Design choices (kept identical to the validated experiments):
     (``SpectralConvEmbedding`` — an FNO-style spectral conv over the sequence, suited
     to the smooth spatial/LD decay; a ``Linear`` head maps its variable-length output
     to ``emb_out``). All grid embeddings fall back to ``"fc"`` if the columns are not
-    a complete ``{stat}_{window}_{center}`` grid.
+    a complete ``{stat}_{window}_{center}`` grid. ``"geometry"`` is the exception: it
+    raises instead of falling back. It is the fixed-size ``cnn_flexsweep`` tower used to
+    compare geometries (:class:`FvGeometryEmbedding`), identical for every grid, and the
+    shared tower of ``cnn_regressor.geometry_regressor``. ``geometry_dim="1d"`` runs a
+    single-axis grid on Conv1d instead, as a supplementary check.
   * ``condition_on=("r",)`` makes the flow learn ``q(s, t | x, r)`` — the known
     per-region recombination rate enters as a CONDITIONING channel (standardized
     ``log10``) that bypasses the embedding (ReLERNN-style side branch), NOT as a
@@ -130,6 +134,11 @@ DEFAULT_TARGETS = ("s", "t")
 
 #: Credible levels for which intervals (and conformal radii) are produced.
 ALPHAS = (0.50, 0.80, 0.90, 0.95)
+
+# Bounded rejection sampling, see _sample_batch
+SAMPLE_CHUNK_TIME_S = 30.0
+SAMPLE_MIN_ACCEPT = 0.01
+SAMPLE_CHECK_DRAWS = 5000
 
 
 # ---------------------------------------------------------------------------
@@ -377,25 +386,75 @@ def _stratified_split(model: np.ndarray, frac: float, seed: int):
     return ~mask, mask
 
 
-def _sample_batch(posterior, X, n_post: int, dev: str, chunk: int = 400):
-    """List of (n_post, 2) numpy draws, one per row of ``X`` (batched w/ fallback)."""
+def _row_acceptance(posterior, xb, n_check: int = SAMPLE_CHECK_DRAWS, per_iter: int = 250) -> np.ndarray:
+    """Share of unrejected flow draws inside the prior, for each row of the tensor ``xb``."""
     import torch
+    from sbi.utils.sbiutils import within_support
+
+    est, prior = posterior.posterior_estimator, posterior.prior
+    n_iter = max(1, n_check // per_iter)
+    ok = torch.zeros(xb.shape[0], device=xb.device)
+    with torch.no_grad():
+        for _ in range(n_iter):
+            th = est.sample(torch.Size((per_iter,)), condition=xb)
+            ok += within_support(prior, th).reshape(per_iter, xb.shape[0]).sum(0)
+    return (ok / (n_iter * per_iter)).cpu().numpy()
+
+
+def _clipped_draws(posterior, x, n_post: int) -> np.ndarray:
+    """(n_post, D) unrejected flow draws for one row, clipped to the prior box."""
+    import torch
+
+    prior = posterior.prior
+    with torch.no_grad():
+        th = posterior.posterior_estimator.sample(torch.Size((n_post,)), condition=x[None])
+    return torch.clamp(th[:, 0, :], min=prior.base_dist.low, max=prior.base_dist.high).cpu().numpy()
+
+
+def _sample_batch(posterior, X, n_post: int, dev: str, chunk: int = 400, flagged: list | None = None,
+                  max_time: float = SAMPLE_CHUNK_TIME_S, min_accept: float = SAMPLE_MIN_ACCEPT):
+    """List of (n_post, D) numpy draws, one per row of ``X``, with bounded rejection sampling.
+
+    sbi keeps a batch going until every row has ``n_post`` accepted draws, so one row whose
+    posterior lies outside the prior holds the whole batch and fills the GPU. A batch that
+    fails or exceeds ``max_time`` seconds is logged, and each of its rows is measured with
+    ``_row_acceptance``. Rows under ``min_accept`` get unrejected draws clipped to the prior
+    box, and their indices in ``X`` are appended to ``flagged``. The other rows are sampled
+    again under the same limit; a second failure raises. Batches that finish in time are
+    sampled exactly as before.
+    """
+    import torch
+
+    def batched(xb):
+        return posterior.sample_batched((n_post,), x=xb, show_progress_bars=False,
+                                        max_sampling_time=max_time).cpu().numpy()
 
     out = []
     for i in range(0, X.shape[0], chunk):
         xb = torch.as_tensor(X[i:i + chunk]).to(dev)
         try:
-            s = posterior.sample_batched(
-                (n_post,), x=xb, show_progress_bars=False
-            ).cpu().numpy()
-            for j in range(s.shape[1]):
-                out.append(s[:, j, :])
-        except Exception:
-            for j in range(xb.shape[0]):
-                out.append(
-                    posterior.sample((n_post,), x=xb[j], show_progress_bars=False)
-                    .cpu().numpy()
-                )
+            s = batched(xb)
+            out.extend(s[:, j, :] for j in range(s.shape[1]))
+        except Exception as exc:
+            logger.warning("sampling rows %d-%d failed (%s: %s); measuring acceptance per row",
+                           i, i + xb.shape[0] - 1, type(exc).__name__, str(exc).split("\n")[0][:160])
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            acc = _row_acceptance(posterior, xb)
+            low = acc < min_accept
+            rows: list = [None] * xb.shape[0]
+            for j in np.where(low)[0]:
+                logger.warning("row %d: acceptance %.5f is under %g; clipped draws, flagged",
+                               i + j, acc[j], min_accept)
+                rows[j] = _clipped_draws(posterior, xb[j], n_post)
+                if flagged is not None:
+                    flagged.append(int(i + j))
+            keep = np.where(~low)[0]
+            if keep.size:
+                s = batched(xb[torch.as_tensor(keep, device=xb.device)])
+                for k, j in enumerate(keep):
+                    rows[j] = s[:, k, :]
+            out.extend(rows)
         logger.info("sampled %d/%d", min(i + chunk, X.shape[0]), X.shape[0])
     return out
 
@@ -481,6 +540,12 @@ def _parse_grid(feat: list[str]):
     return stats, wins, list(range(C)), np.asarray(perm, dtype=np.int64)
 
 
+# Fixed-size tower shared by every geometry (FvGeometryEmbedding). Filters and dense
+# layers come from cnn.py's cnn_flexsweep; the cells are 4 x 4 in 2D and 16 in 1D.
+GEOMETRY_WIDTHS = (64, 128, 256)
+GEOMETRY_DENSE = (512, 128)
+GEOMETRY_CELLS = 16
+
 # Embedding-net classes are defined lazily (torch is an optional heavy import) but
 # registered at MODULE level so ``pickle`` can resolve them by qualname when the
 # saved sbi posterior is reloaded in a fresh interpreter. ``__getattr__`` (PEP 562)
@@ -543,6 +608,82 @@ def _embedding_classes() -> dict:
                 x = x.reshape(x.shape[0], self.S, self.W * self.C)
             f = torch.cat([self.b1(x), self.b2(x), self.b3(x)], dim=-1)
             return self.head(f)
+
+    class FvGeometryEmbedding(nn.Module):
+        """Fixed-size ``cnn_flexsweep`` tower, for comparing feature-vector geometries.
+
+        Keeps the branches, filters (64, 128, 256), dropouts and dense layers (512,
+        128) of :meth:`flexsweep.cnn.CNN.cnn_flexsweep`, with statistics as channels on
+        the real grid. Each branch ends in the same max pool to 16 cells, so nothing
+        after the convolutions depends on the grid. With the default ``dim="2d"`` (Conv2d,
+        4 x 4 cells) every geometry has the same parameters and differs only in its input.
+
+        Parameters
+        ----------
+        S, W, C : int
+            Statistics, windows and centers of the grid.
+        perm : array of int
+            Gather from the flat feature vector to stat-major order
+            (:func:`_parse_grid`).
+        dim : {"2d", "1d"}
+            ``"2d"`` works for every grid. ``"1d"`` (Conv1d, 16 cells) is a supplementary
+            option for single-axis grids; a true 2D grid cannot run as ``"1d"``.
+
+        Notes
+        -----
+        In 2D a grid with one center (8 x 1) runs as 1 x 8, because the dilated branches
+        act along the center axis and would otherwise have nothing to dilate over.
+        Pooling compresses large grids more: 15 x 15 goes to 4 x 4. A grid axis shorter
+        than its cells is stretched by repeating values, which adds no information.
+        """
+
+        def __init__(self, S, W, C, perm, dim="2d"):
+            super().__init__()
+            self.S, self.W, self.C = int(S), int(W), int(C)
+            if dim not in ("1d", "2d"):
+                raise ValueError(f"dim={dim!r} is not '1d' or '2d'")
+            if dim == "1d" and self.W > 1 and self.C > 1:
+                raise ValueError(f"a {self.W}x{self.C} grid cannot run as 1d")
+            if self.C == 1:
+                self.W, self.C = self.C, self.W
+            self.dim = dim
+            self.register_buffer("perm", torch.as_tensor(perm, dtype=torch.long))
+            is2d = dim == "2d"
+            Conv = nn.Conv2d if is2d else nn.Conv1d
+            pool = nn.AdaptiveMaxPool2d((4, 4)) if is2d else nn.AdaptiveMaxPool1d(16)
+            c1, c2, c3 = GEOMETRY_WIDTHS
+
+            def branch(k, dil):
+                return nn.Sequential(
+                    Conv(self.S, c1, k, padding="same", dilation=dil), nn.ReLU(),
+                    Conv(c1, c2, k, padding="same", dilation=dil), nn.ReLU(),
+                    Conv(c2, c3, k, padding="same", dilation=dil), nn.ReLU(),
+                    pool, nn.Dropout(0.15), nn.Flatten(),
+                )
+
+            if is2d:
+                self.b1, self.b2, self.b3 = (branch((3, 3), (1, 1)),
+                                             branch((2, 2), (1, 3)),
+                                             branch((2, 2), (1, 5)))
+            else:
+                self.b1, self.b2, self.b3 = branch(3, 1), branch(2, 3), branch(2, 5)
+            d1, d2 = GEOMETRY_DENSE
+            self.head = nn.Sequential(
+                nn.Linear(3 * c3 * GEOMETRY_CELLS, d1), nn.ReLU(), nn.Dropout(0.20),
+                nn.Linear(d1, d2), nn.ReLU(), nn.Dropout(0.10),
+            )
+            for m in self.modules():  # glorot_uniform, as in cnn_flexsweep
+                if isinstance(m, (nn.Conv1d, nn.Conv2d, nn.Linear)):
+                    nn.init.xavier_uniform_(m.weight)
+                    nn.init.zeros_(m.bias)
+
+        def forward(self, x):
+            x = x.index_select(-1, self.perm)
+            if self.dim == "2d":
+                x = x.reshape(x.shape[0], self.S, self.W, self.C)
+            else:
+                x = x.reshape(x.shape[0], self.S, self.W * self.C)
+            return self.head(torch.cat([self.b1(x), self.b2(x), self.b3(x)], dim=-1))
 
     class FvCNNEmbedding(nn.Module):
         """sbi's built-in ``CNNEmbedding`` wired for the fv grid (stats as channels).
@@ -680,7 +821,7 @@ def _embedding_classes() -> dict:
             return self.head(self.net(x))
 
     # Make pickle resolve these as top-level module attributes (no <locals> qualname).
-    for cls in (FvConvEmbedding, FvCNNEmbedding, FvCondEmbedding,
+    for cls in (FvConvEmbedding, FvGeometryEmbedding, FvCNNEmbedding, FvCondEmbedding,
                 FvCausalCNNEmbedding, FvResNet2DEmbedding, FvSpectralConvEmbedding):
         cls.__module__ = __name__
         cls.__qualname__ = cls.__name__
@@ -689,8 +830,8 @@ def _embedding_classes() -> dict:
 
 
 def __getattr__(name):  # PEP 562 — lazily expose the embedding classes for pickle
-    if name in ("FvConvEmbedding", "FvCNNEmbedding", "FvCondEmbedding",
-                "FvCausalCNNEmbedding", "FvResNet2DEmbedding",
+    if name in ("FvConvEmbedding", "FvGeometryEmbedding", "FvCNNEmbedding",
+                "FvCondEmbedding", "FvCausalCNNEmbedding", "FvResNet2DEmbedding",
                 "FvSpectralConvEmbedding"):
         return _embedding_classes()[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -701,6 +842,11 @@ def _make_conv_embedding(S, W, C, perm, *, emb_out, widths=(32, 64, 128),
     """Instantiate the custom three-branch dilated-conv embedding tower."""
     cls = _embedding_classes()["FvConvEmbedding"]
     return cls(S, W, C, perm, emb_out, tuple(widths), dense, dropout)
+
+
+def _make_geometry_embedding(S, W, C, perm, *, dim="2d"):
+    """Instantiate the fixed-size tower that every geometry shares."""
+    return _embedding_classes()["FvGeometryEmbedding"](S, W, C, perm, dim)
 
 
 def _make_cnn_embedding(S, W, C, perm, *, emb_out,
@@ -792,6 +938,7 @@ def fit_npe(
     ood_fit_rows: int = 30000,
     ood_quantile: float = 0.99,
     embedding: str = "fc",
+    geometry_dim: str = "2d",
     conv_widths: tuple = (32, 64, 128),
     conv_dense: int = 128,
     cnn_out_channels: tuple = (32, 64),
@@ -936,11 +1083,23 @@ def fit_npe(
     tr = rest_idx[~cal_within]
     logger.info("train=%d calib=%d holdout=%d", len(tr), len(cal), int(hold.sum()))
 
-    low = torch.from_numpy(theta.min(0) - 0.05 * np.abs(theta.min(0))).float()
-    high = torch.from_numpy(theta.max(0) + 0.05 * np.abs(theta.max(0))).float()
+    # The prior box comes from training rows only: calibration and holdout labels must not shape it.
+    theta_tr = theta[tr]
+    low = torch.from_numpy(theta_tr.min(0) - 0.05 * np.abs(theta_tr.min(0))).float()
+    high = torch.from_numpy(theta_tr.max(0) + 0.05 * np.abs(theta_tr.max(0))).float()
     prior = BoxUniform(low=low, high=high, device=dev)
     emb_kind, grid = "fc", None
-    if embedding in ("conv", "cnn", "causalcnn", "resnet2d", "spectralconv"):
+    if embedding == "geometry":  # never falls back: a comparison needs this exact tower
+        stats, wins, cens, perm = _parse_grid(feat)
+        if perm is None:
+            raise ValueError("embedding='geometry' needs a complete "
+                             "{stat}_{window}_{center} grid")
+        S, W, C = len(stats), len(wins), len(cens)
+        grid = dict(S=S, W=W, C=C)
+        emb = _make_geometry_embedding(S, W, C, perm, dim=geometry_dim)
+        emb_kind = f"geometry{emb.dim}"
+        logger.info("geometry embedding: S=%d W=%d C=%d -> %s", S, W, C, emb_kind)
+    elif embedding in ("conv", "cnn", "causalcnn", "resnet2d", "spectralconv"):
         stats, wins, cens, perm = _parse_grid(feat)
         if perm is None:
             logger.warning(
@@ -1014,7 +1173,8 @@ def fit_npe(
 
     # ---- global conformal q on calib ----
     logger.info("sampling calib for conformal ...")
-    dcal = _sample_batch(post, Xpost[cal], n_post, dev)  # list of (n_post, D) natural draws
+    flagged_calib: list = []
+    dcal = _sample_batch(post, Xpost[cal], n_post, dev, flagged=flagged_calib)  # list of (n_post, D) natural draws
     yc = {nm: truth[nm][cal] for nm in targets}
     qglobal = {}
     for idx, nm in enumerate(targets):
@@ -1072,7 +1232,7 @@ def fit_npe(
                   flow=flow, hidden=hidden, transforms=transforms,
                   z_score_theta=z_score_theta, z_score_x=z_score_x,
                   embedding=emb_kind, grid=grid, condition_on=cond_cols,
-                  conformal=conformal),
+                  conformal=conformal, sampling_flagged_calib=flagged_calib),
     )
     save_pickle(artifact, art)
     logger.info("artifact -> %s", artifact)
@@ -1083,7 +1243,9 @@ def fit_npe(
         if len(hi_idx) > max_holdout:
             hi_idx = np.random.default_rng(seed).choice(hi_idx, max_holdout, replace=False)
         logger.info("self-check: sampling %d holdout loci ...", len(hi_idx))
-        dh = _sample_batch(post, Xpost[hi_idx], n_post, dev)  # list of (n_post, D)
+        flagged_hold: list = []
+        dh = _sample_batch(post, Xpost[hi_idx], n_post, dev, flagged=flagged_hold)  # list of (n_post, D)
+        art["sampling_flagged_selfcheck"] = flagged_hold
         tidx = {nm: i for i, nm in enumerate(targets)}
         s_med_h = np.array([np.median(d[:, tidx["s"]]) for d in dh]) if "s" in tidx else None
         t_med_h = np.array([np.median(d[:, tidx["t"]]) for d in dh]) if "t" in tidx else None
@@ -1203,7 +1365,8 @@ def predict_npe(
 
     # sample posteriors (x_aug carries the conditioning channels when enabled)
     logger.info("sampling posteriors ...")
-    draws = _sample_batch(post, Xpost, n_post, dev)  # list of (n_post, D) natural draws
+    flagged: list = []
+    draws = _sample_batch(post, Xpost, n_post, dev, flagged=flagged)  # list of (n_post, D) natural draws
     tidx = {nm: i for i, nm in enumerate(targets)}
     comp = {nm: [d[:, i] for d in draws] for nm, i in tidx.items()}  # per-target draw lists
 
@@ -1232,6 +1395,7 @@ def predict_npe(
             cols[f"{nm}_hi{A}"] = hi
     cols["ood_flag"] = ood
     cols["ood_dist"] = d_e
+    cols["sampling_flagged"] = np.isin(np.arange(n), flagged)
     if cond_cols:
         cols["cond_oob"] = cond_oob
 
@@ -1352,6 +1516,16 @@ def analyze_npe(
 
     thetas = torch.from_numpy(theta).to(dev)
     xs = torch.from_numpy(X).to(dev)
+    # run_sbc and run_tarp have no time limit, so rows the sampler cannot finish are left out here.
+    acc = np.concatenate([_row_acceptance(post, xs[i:i + 400]) for i in range(0, len(xs), 400)])
+    excluded = np.where(acc < SAMPLE_MIN_ACCEPT)[0]
+    if excluded.size:
+        for j in excluded:
+            logger.warning("row %d: acceptance %.5f is under %g; left out of SBC and TARP",
+                           j, acc[j], SAMPLE_MIN_ACCEPT)
+        kept = acc >= SAMPLE_MIN_ACCEPT
+        theta = theta[kept]
+        thetas, xs = thetas[torch.as_tensor(kept, device=thetas.device)], xs[torch.as_tensor(kept, device=xs.device)]
     logger.info("sbi calibration: %d loci, %d post draws, targets=%s",
                 len(thetas), n_post, targets)
 
@@ -1363,7 +1537,7 @@ def analyze_npe(
     for k, v in sbc.items():
         logger.info("SBC %-14s %s", k, np.round(np.asarray(v, float), 4))
     out = dict(targets=list(targets), n_rows=int(len(thetas)),
-               n_post=int(n_post), sbc=sbc)
+               n_post=int(n_post), sbc=sbc, excluded_low_acceptance=excluded.tolist())
 
     # ---- TARP expected coverage (Lemos 2023), if the installed sbi has it ----
     ecp = alpha = None

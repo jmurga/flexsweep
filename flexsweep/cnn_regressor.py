@@ -66,11 +66,22 @@ import json
 import os
 import time
 
-import tensorflow as tf
 from sklearn.model_selection import train_test_split
 
 from . import np, pl
-from .cnn import CNN
+
+# TensorFlow is needed by CNNRegressor only. geometry_regressor runs on torch, in
+# environments that keep TensorFlow out (TF and torch collide on libnccl).
+try:
+    import tensorflow as tf
+
+    from .cnn import CNN
+
+    _TF_IMPORT_ERROR = None
+except ImportError as exc:
+    tf = None
+    CNN = object
+    _TF_IMPORT_ERROR = exc
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -116,6 +127,54 @@ TRUNK_LAYER: str = "dropconcat2"
 
 #: Loss names accepted by :meth:`CNNRegressor.train`.
 SUPPORTED_LOSSES: tuple[str, ...] = ("mse", "mae", "huber")
+
+
+# ---------------------------------------------------------------------------
+# Fixed-size regressor for comparing geometries
+# ---------------------------------------------------------------------------
+
+
+def geometry_regressor(S: int, W: int, C: int, *, n_targets: int = 3, dim: str = "2d"):
+    """
+    Build the torch CNN regressor used to compare feature-vector geometries.
+
+    It is the tower NPE conditions on (:class:`flexsweep.npe.FvGeometryEmbedding`)
+    plus a linear output, so with ``dim="2d"`` every geometry has the same parameters
+    and differs only in its input. The weights start identically under the same seed.
+
+    Parameters
+    ----------
+    S, W, C : int
+        Statistics, windows and centers of the grid.
+    n_targets : int, default=3
+        Number of regression outputs.
+    dim : {"2d", "1d"}, default="2d"
+        ``"2d"`` works for every grid. ``"1d"`` is a supplementary option for
+        single-axis grids.
+
+    Returns
+    -------
+    torch.nn.Module
+        Model taking ``(N, S, W*C, 1)`` tensors, already in stat-major order, and
+        returning ``(N, n_targets)`` standardized targets.
+    """
+    import torch.nn as nn
+
+    from .npe import _make_geometry_embedding
+
+    class GeometryRegressor(nn.Module):
+        def __init__(self):
+            super().__init__()
+            # The input is already in stat-major order, so the gather is the identity.
+            self.tower = _make_geometry_embedding(S, W, C, np.arange(S * W * C), dim=dim)
+            self.out = nn.Linear(128, n_targets)
+            nn.init.xavier_uniform_(self.out.weight)
+            nn.init.zeros_(self.out.bias)
+
+        def forward(self, x):
+            return self.out(self.tower(x.reshape(x.shape[0], -1)))
+
+    return GeometryRegressor()
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +245,8 @@ class CNNRegressor(CNN):
         stratify=True,
         **kwargs,
     ):
+        if _TF_IMPORT_ERROR is not None:
+            raise ImportError("CNNRegressor needs TensorFlow") from _TF_IMPORT_ERROR
         super().__init__(*args, **kwargs)
         self.targets = list(targets)
         self.s_natural = bool(s_natural)
