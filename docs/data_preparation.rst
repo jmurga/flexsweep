@@ -92,9 +92,9 @@ nucleotide diversity, the same direction as a sweep. Pass the same BED with
   window statistics in ``fvs-vcf``, left out of the window-statistic tables in
   ``scan``. Per-SNP statistics (iHS, nSL, iSAFE, ...) and whole-chromosome
   window statistics in ``scan`` (lassi, lassip, raisd, beta, ncd) are not filtered.
-* In ``fvs-vcf``, loci with many windows below ``--min_accessible`` can exceed the 10%
-  missing-feature filter and are dropped from the output (13% of loci on YRI chr20-22
-  at 0.6); lower the cutoff to keep more loci.
+* In ``fvs-vcf``, loci with many windows below ``--min_accessible`` can exceed the
+  missing-feature filter (``--max_missing``, default 0.1) and are dropped from the
+  output (13% of loci on YRI chr20-22 at 0.6); lower the cutoff to keep more loci.
 * Simulations are not masked, so their windows are fully accessible.
 
 Sites with missing genotype calls (``.``) are always dropped when the VCF is read,

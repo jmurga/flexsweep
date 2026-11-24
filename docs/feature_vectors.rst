@@ -187,6 +187,28 @@ Options
      - 0.6
      - VCF only, with ``--accessibility_mask``: windows with a smaller accessible
        fraction get missing window statistics (handled like any missing feature).
+   * - ``--max_missing``
+     - ``max_missing``
+     - ``0.1``
+     - Simulations and VCFs, independent of ``--accessibility_mask``: loci whose share
+       of missing features (null, NaN, inf) reaches this value are dropped; missing
+       values of kept loci are set to 0. Use the same value for the simulations and
+       the VCF features a model reads. Geometries with small windows (e.g. caldas)
+       can leave many cells without SNPs in loci a 100 kb geometry keeps, and may need
+       a larger value.
+   * - ``--geometry_from``
+     - ``centers`` and ``reference_columns``
+     - none
+     - VCF only: feature-vector parquet written by ``fvs-discoal``. The VCF features get
+       the same (window, center) pairs and the same column order, so they match the
+       input of a model trained on it. Overrides ``--windows`` and ``--step``. Windows
+       reaching past the region are clipped to it, as in the simulations. The run fails
+       if the columns differ (use the same ``--stats`` and ``--locus_length``).
+   * - ``--bins_from``
+     - CLI only
+     - none
+     - VCF only: ``neutral_bins*.pickle`` of the simulations. If they were normalized
+       with ``r_bins``, ``--r_bins`` must give the same bin edges or the run stops.
 
 .. _fv-statistics:
 

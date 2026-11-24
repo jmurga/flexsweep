@@ -52,6 +52,89 @@ def load_window_centers(path):
         )
 
 
+def geometry_from_parquet(path):
+    """(window, center) geometry and column order of a simulation feature-vector parquet.
+
+    Reads only the schema. Feature columns are ``{stat}_{window}_{center}``; every
+    statistic must carry the same (window, center) pairs in the same order.
+
+    Returns ``({window: [centers]}, columns)`` where ``columns`` is the full column list
+    (metadata and features) in parquet order.
+    """
+    import polars as pl
+
+    columns = list(pl.read_parquet_schema(path))
+    pairs = {}
+    for col in columns:
+        parts = col.rsplit("_", 2)
+        if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+            pairs.setdefault(parts[0], []).append((int(parts[1]), int(parts[2])))
+    if not pairs:
+        raise click.UsageError(f"{path}: no {{stat}}_{{window}}_{{center}} feature columns")
+    ref_stat, ref = next(iter(pairs.items()))
+    for stat, p in pairs.items():
+        if p != ref:
+            raise click.UsageError(
+                f"{path}: statistic {stat!r} has different (window, center) columns from "
+                f"{ref_stat!r} ({len(p)} vs {len(ref)}); cannot read one geometry"
+            )
+    mapping = {}
+    for w, c in ref:
+        mapping.setdefault(w, []).append(c)
+    return {w: sorted(cs) for w, cs in sorted(mapping.items())}, columns
+
+
+def check_geometry(mapping, locus_length):
+    """For each window size, centers must be symmetric on the locus middle (true for
+    every fvs-discoal geometry). Catches a --locus_length different from the
+    simulations'. Windows reaching past the locus (e.g. 500 kb at the 50 kb center) are
+    allowed: fvs-vcf clips them to the locus, as in the simulations."""
+    mid = locus_length / 2
+    for w, cs in mapping.items():
+        if (min(cs) + max(cs)) / 2 != mid:
+            raise click.UsageError(
+                f"window {w}: centers {min(cs)}..{max(cs)} are not symmetric on "
+                f"{mid:.0f} (--locus_length {int(locus_length)}); use the simulations' "
+                "locus length"
+            )
+
+
+def _rbins_edges(labels):
+    """Finite interval edges of r_bins labels such as '(1.0, 2.0]'."""
+    import re
+
+    edges = set()
+    for lab in labels:
+        for x in re.findall(r"-?\d+(?:\.\d+)?(?:e-?\d+)?", str(lab)):
+            edges.add(float(x))
+    return edges
+
+
+def check_rbins_against_bins(bins_path, r_bins):
+    """When the simulations were normalized with r_bins, --r_bins must give the same bin
+    edges. If their neutral bins carry no r_bins (normalized without them), there is
+    nothing to compare: VCF r_bins only stratify the empirical z-score."""
+    import pickle
+
+    import polars as pl
+
+    with open(bins_path, "rb") as fh:
+        bins = pickle.load(fh)
+    labels = set()
+    for df in list(bins.mean):
+        if isinstance(df, pl.DataFrame) and "r_bins" in df.columns:
+            labels |= {x for x in df["r_bins"].cast(pl.String).unique().to_list() if x is not None}
+    if not labels:
+        return
+    sims_edges = _rbins_edges(labels)
+    vcf_edges = {float(x) for x in r_bins} if r_bins else set()
+    if sims_edges != vcf_edges:
+        raise click.UsageError(
+            f"{bins_path}: simulations used r_bins edges {sorted(sims_edges)}, "
+            f"--r_bins gives {sorted(vcf_edges) or 'none'}"
+        )
+
+
 def _resolve_map_option(ctx, param, value):
     """Click callback: accept 'decode' for the bundled deCODE map, else a path."""
     if value is None:
@@ -77,6 +160,13 @@ def _resolve_demes_option(ctx, param, value):
 MAP_HELP = (
     "Recombination map TSV (chr, start, end, cm_mb, cm), or 'decode' for the bundled "
     "deCODE 2019 sex-averaged map. The bundled map is GRCh38: VCF coordinates must be GRCh38."
+)
+
+MAX_MISSING_HELP = (
+    "NaN filter, independent of --accessibility_mask: loci whose share of missing "
+    "features reaches this value are dropped; missing values of kept loci are set to 0. "
+    "Use the same value for the simulations and the VCF features a model reads. "
+    "Geometries with small windows (e.g. caldas) can need a larger value."
 )
 
 
@@ -427,6 +517,13 @@ def simulator(
               help="caldas: number of window sizes (and of centers per size).")
 @click.option("--caldas_lmin", type=int, default=10000, show_default=True,
               help="caldas: smallest window size in bp.")
+@click.option(
+    "--max_missing",
+    type=click.FloatRange(0, 1, min_open=True),
+    default=0.1,
+    show_default=True,
+    help=MAX_MISSING_HELP,
+)
 def fvs_discoal(
     simulations_path,
     stats,
@@ -442,6 +539,7 @@ def fvs_discoal(
     geometry,
     caldas_d,
     caldas_lmin,
+    max_missing,
 ):
     """
     Estimate summary statistics from discoal simulations and build feature vectors.
@@ -484,6 +582,7 @@ def fvs_discoal(
         suffix=suffix,
         func=None,
         save_stats=save_stats,
+        max_missing=max_missing,
     )
 
 
@@ -592,6 +691,28 @@ def fvs_discoal(
     show_default=True,
     help="With --accessibility_mask: windows whose accessible fraction is below this value get missing window statistics.",
 )
+@click.option(
+    "--geometry_from",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Simulation feature-vector parquet (fvs-discoal output) whose (window, center) "
+    "geometry and column order the VCF features must match, e.g. a --geometry caldas run. "
+    "Overrides --windows/--step; the run fails if the columns differ.",
+)
+@click.option(
+    "--bins_from",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Simulation neutral_bins pickle: if the simulations were normalized with "
+    "r_bins, --r_bins must give the same bin edges.",
+)
+@click.option(
+    "--max_missing",
+    type=click.FloatRange(0, 1, min_open=True),
+    default=0.1,
+    show_default=True,
+    help=MAX_MISSING_HELP,
+)
 def fvs_vcf(
     vcf_path,
     stats,
@@ -608,6 +729,9 @@ def fvs_vcf(
     tmp_dir,
     accessibility_mask,
     min_accessible,
+    geometry_from,
+    bins_from,
+    max_missing,
 ):
     """
     Estimate summary statistics from VCF files and build feature vectors.
@@ -632,6 +756,25 @@ def fvs_vcf(
 
     stats_list = stats.split(",") if stats is not None else None
 
+    if bins_from is not None:
+        check_rbins_against_bins(bins_from, r_bins_list)
+    if geometry_from is not None:
+        geometry, reference_columns = geometry_from_parquet(geometry_from)
+        check_geometry(geometry, locus_length)
+        n_pairs = sum(len(c) for c in geometry.values())
+        n_edge = sum(
+            1
+            for w, cs in geometry.items()
+            for c in cs
+            if c - w // 2 < 0 or c + w // 2 > locus_length
+        )
+        print(
+            f"Geometry from {geometry_from}: {len(geometry)} windows, {n_pairs} "
+            f"(window, center) pairs, {len(reference_columns)} columns"
+            + (f"; {n_edge} pairs reach past the locus and are clipped to it, as in "
+               "the simulations" if n_edge else "")
+        )
+
     vcf_files = sorted(
         glob.glob(os.path.join(vcf_path, "*vcf.gz"))
         + glob.glob(os.path.join(vcf_path, "*bcf.gz"))
@@ -639,6 +782,31 @@ def fvs_vcf(
     from flexsweep.data import check_genome_build
 
     check_genome_build(vcf_files, recombination_map)
+
+    if geometry_from is not None:
+        fs.summary_statistics(
+            vcf_path,
+            vcf=True,
+            stats=stats_list,
+            nthreads=nthreads,
+            windows=sorted(geometry),
+            step=step,
+            step_vcf=step_vcf,
+            locus_length=locus_length,
+            recombination_map=recombination_map,
+            r_bins=r_bins_list,
+            min_rate=min_rate,
+            suffix=suffix,
+            func=None,
+            save_stats=save_stats,
+            tmp_dir=tmp_dir,
+            accessibility_mask=accessibility_mask,
+            min_accessible=min_accessible,
+            centers=geometry,
+            reference_columns=reference_columns,
+            max_missing=max_missing,
+        )
+        return
 
     fs.summary_statistics(
         vcf_path,
@@ -658,6 +826,7 @@ def fvs_vcf(
         tmp_dir=tmp_dir,
         accessibility_mask=accessibility_mask,
         min_accessible=min_accessible,
+        max_missing=max_missing,
     )
 
 

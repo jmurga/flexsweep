@@ -1167,6 +1167,8 @@ def _process_vcf(
     tmp_dir=None,
     accessibility_mask=None,
     min_accessible=0.6,
+    reference_columns=None,
+    max_missing=0.1,
 ):
     from . import Parallel, delayed
     from .data import Data
@@ -1205,6 +1207,10 @@ def _process_vcf(
     :param float min_accessible:
         With ``accessibility_mask``: windows whose accessible fraction is below this
         value get missing window statistics. Default ``0.6``.
+    :param float max_missing:
+        NaN filter, independent of ``accessibility_mask``: loci whose share of missing
+        features reaches this value are dropped, the remaining missing values are set
+        to 0 (see :func:`filter_missing`). Default ``0.1``.
 
     :returns:
         A pair of Polars DataFrames:
@@ -1432,6 +1438,7 @@ def _process_vcf(
                 df_r_bins=df_r,
                 locus_length=locus_length,
                 centers=centers,
+                max_missing=max_missing,
             )
             df_fv_cnn[k] = df_w
             df_fv_cnn_raw[k] = df_w_raw
@@ -1442,6 +1449,10 @@ def _process_vcf(
     df_pred = _sort_by_region(df_pred)
     df_pred_raw = _sort_by_region(df_pred_raw)
 
+    if reference_columns is not None:
+        df_pred = _apply_reference_columns(df_pred, reference_columns)
+        df_pred_raw = _apply_reference_columns(df_pred_raw, reference_columns)
+
     with open(os.path.join(data_dir, f"empirical_bins{suffix_str}.pickle"), "wb") as f:
         pickle.dump(empirical_bins, f)
 
@@ -1449,6 +1460,29 @@ def _process_vcf(
     df_pred_raw.write_parquet(f"{data_dir}/fvs_raw{suffix_str}.parquet")
 
     return df_pred, df_pred_raw
+
+
+def _apply_reference_columns(df, reference_columns):
+    """Return ``df`` with exactly ``reference_columns``, in that order.
+
+    Raises ValueError naming the missing and extra columns when the sets differ: the
+    feature vectors would not match the simulations the model was trained on. Nothing
+    is dropped, filled or renamed to force a match. ``r_bins_{window}_{center}`` columns
+    (r_bins labels in the raw output of an r_bins run) are labels, not features: they
+    are kept, after the reference columns.
+    """
+    ref = list(reference_columns)
+    ref_set = set(ref)
+    labels = [c for c in df.columns if c.startswith("r_bins_") and c not in ref_set]
+    missing = [c for c in ref if c not in df.columns]
+    extra = [c for c in df.columns if c not in ref_set and c not in labels]
+    if missing or extra:
+        raise ValueError(
+            f"feature columns differ from the reference parquet: {len(missing)} missing "
+            f"{missing[:10]}, {len(extra)} extra {extra[:10]}. Use the same --stats, "
+            "geometry and locus length as the simulations."
+        )
+    return df.select(ref + labels)
 
 
 def _process_sims(
@@ -1463,6 +1497,7 @@ def _process_sims(
     locus_length=int(1.2e6),
     stats=None,
     centers=None,
+    max_missing=0.1,
 ):
     """
     Process ms files from simulation to compute, normalize, and estimate feature vectors.
@@ -1670,6 +1705,7 @@ def _process_sims(
                 df_r_bins=df_r[sim_type],
                 locus_length=locus_length,
                 centers=centers,
+                max_missing=max_missing,
             )
             df_fv_cnn[sim_type] = df_w
             df_fv_cnn_raw[sim_type] = df_w_raw
@@ -1707,6 +1743,8 @@ def summary_statistics(
     tmp_dir=None,
     accessibility_mask=None,
     min_accessible=0.6,
+    reference_columns=None,
+    max_missing=0.1,
 ):
     """
     Compute summary statistics to create needed feature vectors for CNN training/prediction
@@ -1746,11 +1784,18 @@ def summary_statistics(
         for both statistic computation and normalization, so the ``(center, window)``
         feature layout stays internally consistent. Applies to both the simulation
         and VCF paths; for VCF the list is the sim-relative grid, remapped per region.
-        Simulations only: a ``{window: [centers]}`` mapping gives each window size its
-        own centers (e.g. the Caldas et al. 2022 geometry, whose centers are spaced by
-        half the window), evaluated in ONE pass; ``windows`` is then set to the mapping's
-        keys. The default list behaviour crosses every center with every window.
+        A ``{window: [centers]}`` mapping gives each window size its own centers (e.g.
+        the Caldas et al. 2022 geometry, whose centers are spaced by half the window),
+        evaluated in ONE pass; ``windows`` is then set to the mapping's keys. On the VCF
+        path the centers are relative to each locus and cut around its middle
+        (``locus_length // 2``). The default list behaviour crosses every center with
+        every window.
         **Default:** ``None``.
+    :param list reference_columns:
+        VCF path only. Full column list of the simulation feature-vector parquet the
+        output must match (e.g. from ``flexsweep fvs-vcf --geometry_from``). The run
+        fails if the output columns differ as a set; otherwise they are written in this
+        order. **Default:** ``None`` (no check, current column order).
     :param int locus_length:
         Total locus length in base pairs.
         **Default:** ``1200000``.
@@ -1769,6 +1814,13 @@ def summary_statistics(
         VCF file. If ``None``, joblib's default is used (``JOBLIB_TEMP_FOLDER``,
         then ``/dev/shm``, then the system temp folder, typically ``/tmp``).
         **Default:** ``None``.
+    :param float max_missing:
+        NaN filter for simulations and VCF data alike, independent of
+        ``accessibility_mask``: loci whose share of missing features reaches this
+        value are dropped, the remaining missing values are set to 0 (see
+        :func:`filter_missing`). Use the same value for the simulations and the data
+        a model reads.
+        **Default:** ``0.1``.
 
     :returns:
         Feature-vector DataFrame combining all computed summary statistics.
@@ -1818,11 +1870,6 @@ def summary_statistics(
         )
     else:
         if isinstance(centers, dict):
-            if vcf:
-                raise ValueError(
-                    "per-window centers ({window: [centers]}) are only supported for "
-                    "simulations (vcf=False)"
-                )
             windows = sorted(int(w) for w in centers)
         if vcf:
             if func is not None and stats is None:
@@ -1848,6 +1895,8 @@ def summary_statistics(
                 tmp_dir=tmp_dir,
                 accessibility_mask=accessibility_mask,
                 min_accessible=min_accessible,
+                reference_columns=reference_columns,
+                max_missing=max_missing,
             )
         else:
             if func is not None:
@@ -1867,6 +1916,7 @@ def summary_statistics(
                 locus_length=locus_length,
                 stats=stats,
                 centers=centers,
+                max_missing=max_missing,
             )
 
 
@@ -2490,6 +2540,28 @@ def run_isafe_region(hap_int, position_masked, start, end):
     return df
 
 
+def _edge_window_pairs(per_window, locus_length):
+    """(center, window) pairs of a ``{window: [centers]}`` mapping whose window reaches
+    past the locus ``[0, locus_length]`` (e.g. 500 kb windows at the 50 kb center)."""
+    L = int(locus_length)
+    return {
+        (int(c), int(w))
+        for w, cs in per_window.items()
+        for c in cs
+        if int(c) - int(w) // 2 < 0 or int(c) + int(w) // 2 > L
+    }
+
+
+def _clip_to_locus(abs_c, w, locus_start, locus_length):
+    """Bounds of a window clipped to its locus, as in the simulations, where nothing
+    exists outside positions 0..L: ``[locus_start - 1, locus_start + L - 1]`` is their
+    image (absolute = locus_start + p - 1)."""
+    return (
+        max(int(abs_c) - int(w) // 2, int(locus_start) - 1),
+        min(int(abs_c) + int(w) // 2, int(locus_start) + int(locus_length) - 1),
+    )
+
+
 def batch_windowed_stats_flat(
     hap_f,
     ac,
@@ -2513,11 +2585,14 @@ def batch_windowed_stats_flat(
         Allele counts array.
     position_masked : (S,) int32 ndarray
         Absolute physical positions after biallelic filtering.
-    combos : list of (int, int, float)
+    combos : list of (int, int, float) or (int, int, float, int, int)
         (abs_center, window_size, denom) triples to compute in this batch.
         ``denom`` is the per-bp denominator passed to stat_func as
         ``window_size``: the window length, or its accessible bases when an
-        accessibility mask is used (<= 0 gives a NaN row).
+        accessibility mask is used (<= 0 gives a NaN row). A 5-tuple
+        (abs_center, window_size, denom, lo, hi) is a window clipped to its locus
+        (per-window centers path): SNPs in [lo, hi] only, result keyed by the
+        bounds too.
     stat_func : callable
         run_windows_stat or partial(compute_window_stats, ...).
     stat_cols : list of str
@@ -2525,22 +2600,33 @@ def batch_windowed_stats_flat(
 
     Returns
     -------
-    list of (abs_center, window_size, stats_tuple)
+    list of (abs_center, window_size, stats_tuple), or
+    (abs_center, window_size, lo, hi, stats_tuple) for a clipped window
     """
     iu, ju = np.triu_indices(hap_f.shape[1], k=1)
+    # int64 copy for the boundary search only, made once per batch: with int32 positions
+    # (genome_reader) and a Python-int query, numpy converted the whole array on every
+    # call. Same indices; the statistics below still receive position_masked.
+    pos_search = np.asarray(position_masked, dtype=np.int64)
     results = []
-    for abs_center, w, denom in combos:
-        left = np.searchsorted(position_masked, abs_center - w // 2, side="left")
-        right = np.searchsorted(position_masked, abs_center + w // 2, side="right")
+    for combo in combos:
+        abs_center, w, denom = combo[:3]
+        if len(combo) == 5:  # clipped to the locus: (..., lo, hi)
+            lo, hi = combo[3], combo[4]
+        else:
+            lo, hi = abs_center - w // 2, abs_center + w // 2
+        key = (abs_center, w) + tuple(combo[3:])
+        left = np.searchsorted(pos_search, lo, side="left")
+        right = np.searchsorted(pos_search, hi, side="right")
         _hap = hap_f[left:right]
         if _hap.size == 0 or denom <= 0:
-            results.append((abs_center, w, (np.nan,) * len(stat_cols)))
+            results.append(key + ((np.nan,) * len(stat_cols),))
             continue
         _ac = ac[left:right]
         _pos = position_masked[left:right]
         _f = _hap.mean(axis=1)
         sv = stat_func(_hap, _pos, _ac, _f, window_size=denom, iu=iu, ju=ju)
-        results.append((abs_center, w, sv))
+        results.append(key + (sv,))
     return results
 
 
@@ -2655,7 +2741,14 @@ def calculate_stats_vcf_flat(
     )
     nchr = parse_region(region[0])[0]
 
-    if centers is not None:
+    # per-window centers ({window: [centers]}, e.g. Caldas): each window size has its own
+    # centers; windows = the mapping's sizes (fs/beta neighbourhood = min(windows) // 2,
+    # as on the simulation path)
+    per_window = None
+    if isinstance(centers, dict):
+        per_window = _sort_centers(centers)
+        windows = sorted(per_window)
+    elif centers is not None:
         centers = np.asarray(sorted(int(c) for c in centers)).astype(int)
     elif len(center) == 1:
         centers = np.arange(center[0], center[0] + step, step).astype(int)
@@ -2719,39 +2812,114 @@ def calculate_stats_vcf_flat(
         for s, e in zip(isafe_starts, isafe_ends):
             tasks.append(delayed(run_isafe_region)(hap_int, position_masked, s, e))
 
-    # flat unique absolute (center, window_size) pairs
-    # For locus window starting at locus_start, relative center c maps to
-    # absolute position: locus_start + c - 1
-    unique_abs_centers = sorted(
-        {int(lw[0]) + int(c) - 1 for lw in genomic_windows for c in centers}
-    )
-    # Per-bp denominator of each window [c - w//2, c + w//2]: its length w, or w
-    # minus the bases excluded by the accessibility mask.
-    _abs = np.asarray(unique_abs_centers, dtype=np.int64)
-    denoms = {
-        w: (
-            np.full(_abs.size, float(w))
-            if mask is None
-            else (w - excluded_bp(mask, _abs - int(w) // 2, _abs + int(w) // 2)).astype(float)
-        )
-        for w in windows
-    }
-    if mask is not None:
-        # windows below the accessible-fraction cutoff get missing window stats
-        n_low = 0
+    if per_window is not None:
+        # Per-window centers: the unique absolute centers of each window size over all
+        # locus windows (locus_start + c - 1); each (absolute center, window) pair is
+        # computed once and shared by every locus containing it, as below. Per-bp
+        # denominators and the accessible-fraction cutoff use the same formulas.
+        # Pairs whose window reaches past the locus (e.g. 500 kb at the 50 kb center) are
+        # clipped to the locus, as in the simulations (nothing exists outside 0..L
+        # there), with the full window length as denominator: one combo per locus,
+        # keyed by its bounds. All other pairs are shared across loci as below.
+        edge = _edge_window_pairs(per_window, locus_length)
+        unique_combos = []
+        n_low, n_all = 0, 0
         for w in windows:
-            low = denoms[w] < min_accessible * w
-            n_low += int(low.sum())
-            denoms[w][low] = 0.0
-        print(
-            f"{nchr}: {n_low} of {_abs.size * len(windows)} windows below "
-            f"{min_accessible:.0%} accessible -> missing window statistics"
+            _abs_w = np.asarray(
+                sorted(
+                    {
+                        int(lw[0]) + int(c) - 1
+                        for lw in genomic_windows
+                        for c in per_window[w]
+                        if (int(c), int(w)) not in edge
+                    }
+                ),
+                dtype=np.int64,
+            )
+            if mask is None:
+                _den = np.full(_abs_w.size, float(w))
+            else:
+                _den = (
+                    w - excluded_bp(mask, _abs_w - int(w) // 2, _abs_w + int(w) // 2)
+                ).astype(float)
+                low = _den < min_accessible * w
+                n_low += int(low.sum())
+                _den[low] = 0.0
+            n_all += _abs_w.size
+            unique_combos.extend((int(a), w, _den[i]) for i, a in enumerate(_abs_w))
+        if edge:
+            _clip = sorted(
+                {
+                    (int(lw[0]) + c - 1, w)
+                    + _clip_to_locus(int(lw[0]) + c - 1, w, int(lw[0]), locus_length)
+                    for lw in genomic_windows
+                    for c, w in edge
+                }
+            )
+            _w = np.asarray([t[1] for t in _clip], dtype=np.int64)
+            if mask is None:
+                _den = _w.astype(float)
+            else:
+                # bases outside the locus count as present (they are in the sims'
+                # denominator); only masked bases inside the clipped window are removed
+                _den = (
+                    _w
+                    - excluded_bp(
+                        mask,
+                        np.asarray([t[2] for t in _clip], dtype=np.int64),
+                        np.asarray([t[3] for t in _clip], dtype=np.int64),
+                    )
+                ).astype(float)
+                low = _den < min_accessible * _w
+                n_low += int(low.sum())
+                _den[low] = 0.0
+            n_all += len(_clip)
+            unique_combos.extend(
+                (a, w, _den[i], lo, hi) for i, (a, w, lo, hi) in enumerate(_clip)
+            )
+        # center-major order, as on the list path: every batch below mixes window sizes,
+        # so the largest (slowest) windows are spread over all workers. Results do not
+        # depend on the order (stat_cache is keyed by (center, window)).
+        unique_combos.sort(key=lambda t: (t[0], t[1]))
+        if mask is not None:
+            print(
+                f"{nchr}: {n_low} of {n_all} windows below "
+                f"{min_accessible:.0%} accessible -> missing window statistics"
+            )
+    else:
+        # flat unique absolute (center, window_size) pairs
+        # For locus window starting at locus_start, relative center c maps to
+        # absolute position: locus_start + c - 1
+        unique_abs_centers = sorted(
+            {int(lw[0]) + int(c) - 1 for lw in genomic_windows for c in centers}
         )
-    unique_combos = [
-        (abs_c, w, denoms[w][i])
-        for i, abs_c in enumerate(unique_abs_centers)
-        for w in windows
-    ]
+        # Per-bp denominator of each window [c - w//2, c + w//2]: its length w, or w
+        # minus the bases excluded by the accessibility mask.
+        _abs = np.asarray(unique_abs_centers, dtype=np.int64)
+        denoms = {
+            w: (
+                np.full(_abs.size, float(w))
+                if mask is None
+                else (w - excluded_bp(mask, _abs - int(w) // 2, _abs + int(w) // 2)).astype(float)
+            )
+            for w in windows
+        }
+        if mask is not None:
+            # windows below the accessible-fraction cutoff get missing window stats
+            n_low = 0
+            for w in windows:
+                low = denoms[w] < min_accessible * w
+                n_low += int(low.sum())
+                denoms[w][low] = 0.0
+            print(
+                f"{nchr}: {n_low} of {_abs.size * len(windows)} windows below "
+                f"{min_accessible:.0%} accessible -> missing window statistics"
+            )
+        unique_combos = [
+            (abs_c, w, denoms[w][i])
+            for i, abs_c in enumerate(unique_abs_centers)
+            for w in windows
+        ]
 
     hap_f = np.ascontiguousarray(hap_int.astype(np.float64))
     chunk_size = max(1, ceil(len(unique_combos) / (nthreads * 2)))
@@ -2779,13 +2947,19 @@ def calculate_stats_vcf_flat(
     n_pre_window_tasks = n_snp_tasks + n_isafe_tasks
     stat_cache = {}
     for batch in results[n_pre_window_tasks:]:
-        for abs_c, w, sv in batch:
-            stat_cache[(abs_c, w)] = sv
+        # key: (abs_c, w), or (abs_c, w, lo, hi) for a window clipped to its locus
+        for *key, sv in batch:
+            stat_cache[tuple(key)] = sv
 
     # assemble output rows per locus window
     # Output layout: center (relative), window, stat_cols..., iter ("start-end")
     n_stat_cols = len(stat_cols_inner)
-    all_combos = list(product(centers, windows))
+    edge = set()  # pairs clipped to the locus (per-window centers only)
+    if per_window is not None:
+        all_combos = _window_center_pairs(per_window, windows)
+        edge = _edge_window_pairs(per_window, locus_length)
+    else:
+        all_combos = list(product(centers, windows))
     num_combos = len(all_combos)
     out_window = []
     for lw in genomic_windows:
@@ -2796,7 +2970,10 @@ def calculate_stats_vcf_flat(
             abs_c = locus_start + int(c) - 1
             arr[idx, 0] = c
             arr[idx, 1] = w
-            sv = stat_cache.get((abs_c, w))
+            key = (abs_c, w)
+            if (c, w) in edge:
+                key = (abs_c, w) + _clip_to_locus(abs_c, w, locus_start, locus_length)
+            sv = stat_cache.get(key)
             if sv is not None:
                 arr[idx, 2:] = sv
         df = (
@@ -2947,7 +3124,9 @@ def _window_center_pairs(centers, windows):
     return list(product(centers, windows))
 
 
-def cut_snps(df, centers, windows, stats_names, fixed_center=None, iter_value=1):
+def cut_snps(
+    df, centers, windows, stats_names, fixed_center=None, iter_value=1, sim_mid=None
+):
     """
     Processes data within windows across multiple centers and window sizes.
 
@@ -2970,6 +3149,11 @@ def cut_snps(df, centers, windows, stats_names, fixed_center=None, iter_value=1)
         Name of the column containing center values.
     fixed_center : int, optional
         If provided, use this fixed center value instead of the ones in centers list.
+    sim_mid : int, optional
+        With ``fixed_center`` (VCF path): the locus middle (``locus_length // 2``) the
+        relative centers are measured from; a relative center ``c`` is cut at
+        ``fixed_center + c - sim_mid`` and labelled ``c``. Required for per-window
+        centers; for a center list, ``None`` keeps the midpoint of the centers.
 
     Returns
     -------
@@ -2980,18 +3164,32 @@ def cut_snps(df, centers, windows, stats_names, fixed_center=None, iter_value=1)
 
     # reset centers
 
+    _sim_mid_arg = sim_mid
     if isinstance(centers, dict):
-        # per-window centers (simulations only): explicit (center, window) pairs
+        # per-window centers: explicit (center, window) pairs
         if fixed_center is not None:
-            raise ValueError("per-window centers ({window: [centers]}) are not supported "
-                             "with fixed_center (VCF path)")
-        pairs = _window_center_pairs(centers, windows)
+            # VCF path: relative centers measured from the locus middle
+            if sim_mid is None:
+                raise ValueError(
+                    "per-window centers ({window: [centers]}) with fixed_center (VCF "
+                    "path) need sim_mid = locus_length // 2"
+                )
+            pairs = [
+                (int(fixed_center + c - sim_mid), int(w))
+                for c, w in _window_center_pairs(centers, windows)
+            ]
+        else:
+            pairs = _window_center_pairs(centers, windows)
     else:
         if centers is None:
             centers = np.arange(5e5, 7e5 + 1e4, 1e4).astype(int)
             sim_mid = 6e5
         else:
             sim_mid = (centers[0] + centers[-1]) // 2
+        if _sim_mid_arg is not None:
+            # VCF path: measure from the locus middle, not the midpoint of the centers
+            # (they differ when the step does not divide the locus)
+            sim_mid = _sim_mid_arg
 
         centers = np.asarray(centers).astype(int)
 
@@ -3100,10 +3298,28 @@ def bin_values(values, freq=0.02):
         return values_copy.sort("chr", "positions")
 
 
+def _rbins_label_breaks(labels):
+    """Breaks from r_bins interval labels "(a, b]", in label order: the upper edge b of
+    each label; for the top bin "(a, inf]" the lower edge a (skipped when already
+    present). Labels without a top bin give the same list as before."""
+    breaks = []
+    for s in labels:
+        upper = re.search(r",\s*([0-9.]+)\]$", s)
+        if upper is not None:
+            b = float(upper.group(1))
+        else:
+            # top bin "(a, inf]": its lower edge is the last break
+            b = float(re.search(r"^\(\s*([0-9.]+)\s*,\s*inf\]$", s).group(1))
+            if b in breaks:
+                continue
+        breaks.append(b)
+    return breaks
+
+
 def _parse_breaks_from_rbins(df_r_bins):
     # expects categorical interval strings like "(a, b]"
     uniq = df_r_bins["r_bins"].unique().sort()
-    breaks = [float(re.search(r",\s*([0-9.]+)\]$", s).group(1)) for s in uniq]
+    breaks = _rbins_label_breaks(uniq)
     return breaks
 
 
@@ -3357,6 +3573,42 @@ def normalize_neutral(d_stats_neutral, vcf=False, df_r_bins=None):
     return ([expected, df_window_mean], [stdev, df_window_std])
 
 
+_FV_META_COLS = ["iter", "s", "t", "f_i", "f_t", "mu", "r", "model"]
+
+
+def filter_missing(df_fv_w: pl.DataFrame, max_missing: float = 0.1) -> pl.DataFrame:
+    """
+    Drop feature-vector rows with too many missing features; set the rest to 0.
+
+    A value is missing when it is null, NaN or +/-inf (z-scores divide by std without
+    a zero guard, so a group with std 0 gives +/-inf; it is treated like NaN). Missing
+    values are counted per row over every feature column (all columns except
+    ``iter``, ``s``, ``t``, ``f_i``, ``f_t``, ``mu``, ``r``, ``model``). A row is kept
+    when its count is below ``int(n_features * max_missing)``; the missing values of
+    kept rows are set to 0.
+
+    :param polars.DataFrame df_fv_w: Wide feature vectors (one row per locus).
+    :param float max_missing: Fraction of missing features at which a row is dropped,
+        in (0, 1]. Default ``0.1``. Multi-window geometries with small windows (e.g.
+        caldas) can leave many cells without SNPs in loci the single-window geometry
+        keeps, so they may need a larger value. Note the floor: with 5,850 features
+        and ``0.7`` the limit is ``int(4094.9999...) = 4094`` cells.
+    :returns: The kept rows, missing values set to 0.
+    :rtype: polars.DataFrame
+    """
+    if not 0 < max_missing <= 1:
+        raise ValueError(f"max_missing must be in (0, 1], got {max_missing}")
+    df_fv_w = df_fv_w.with_columns(
+        pl.when(pl.col(c).is_infinite()).then(None).otherwise(pl.col(c)).alias(c)
+        for c, dtype in df_fv_w.schema.items()
+        if dtype.is_float()
+    )
+    df_fv_w = df_fv_w.fill_nan(None)
+    feats = df_fv_w.select(pl.exclude(_FV_META_COLS))
+    num_nans = feats.transpose().null_count().to_numpy().flatten()
+    return df_fv_w.filter(num_nans < int(feats.shape[1] * max_missing)).fill_null(0)
+
+
 def normalize_stats(
     stats_values,
     bins,
@@ -3370,6 +3622,7 @@ def normalize_stats(
     df_r_bins=None,
     locus_length=int(1.2e6),
     centers=None,
+    max_missing=0.1,
 ):
     df_fv, df_fv_raw = normalization_raw(
         deepcopy(stats_values),
@@ -3389,31 +3642,7 @@ def normalize_stats(
     df_fv_w = pivot_feature_vectors(df_fv, vcf=vcf)
     df_fv_w_raw = pivot_feature_vectors(df_fv_raw, vcf=vcf)
 
-    # z-scores divide by std without a zero/null guard, so a group with std 0 yields
-    # +/-inf. Treat inf like NaN: it then follows the same rule below (windows with
-    # >= 10% missing features dropped, remaining missing values set to 0).
-    df_fv_w = df_fv_w.with_columns(
-        pl.when(pl.col(c).is_infinite()).then(None).otherwise(pl.col(c)).alias(c)
-        for c, dtype in df_fv_w.schema.items()
-        if dtype.is_float()
-    )
-    df_fv_w = df_fv_w.fill_nan(None)
-    num_nans = (
-        df_fv_w.select(pl.exclude(["iter", "s", "t", "f_i", "f_t", "mu", "r", "model"]))
-        .transpose()
-        .null_count()
-        .to_numpy()
-        .flatten()
-    )
-    df_fv_w = df_fv_w.filter(
-        num_nans
-        < int(
-            df_fv_w.select(
-                pl.exclude(["iter", "s", "t", "f_i", "f_t", "r", "mu", "model"])
-            ).shape[1]
-            * 0.1
-        )
-    ).fill_null(0)
+    df_fv_w = filter_missing(df_fv_w, max_missing=max_missing)
 
     if not vcf:
         df_fv_w.sort(["iter", "model"])
@@ -3444,7 +3673,7 @@ def batch_normalize_cut_raw(
     return results_norm, results_raw
 
 
-def batch_cut_snps(batch_data, centers, windows, stats_names):
+def batch_cut_snps(batch_data, centers, windows, stats_names, sim_mid=None):
     """
     CHANGE:
     - Preserve output length and ordering.
@@ -3461,6 +3690,7 @@ def batch_cut_snps(batch_data, centers, windows, stats_names):
                 stats_names,
                 fixed_center=coord,
                 iter_value=iter_val,
+                sim_mid=sim_mid,
             )
         )
     return results
@@ -3503,10 +3733,7 @@ def normalization_raw(
 
             try:
                 if df_r_bins is not None:
-                    breaks = [
-                        float(re.search(r",\s*([0-9.]+)\]$", s).group(1))
-                        for s in df_r_bins["r_bins"].unique().sort()
-                    ]
+                    breaks = _rbins_label_breaks(df_r_bins["r_bins"].unique().sort())
 
                     tmp_neutral_snps = snps_values.rename({"iter": "chr"}).with_columns(
                         pl.col("chr").cast(pl.Categorical)
@@ -3645,7 +3872,9 @@ def normalization_raw(
             ]
 
             _cut_tasks = (
-                delayed(batch_cut_snps)(batch, centers, windows, stats_names)
+                delayed(batch_cut_snps)(
+                    batch, centers, windows, stats_names, sim_mid=int(locus_length) // 2
+                )
                 for batch in batches
             )
             if parallel_manager is not None:

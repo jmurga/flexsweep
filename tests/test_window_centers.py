@@ -55,9 +55,8 @@ def test_cut_snps_dict_control_detects_shift():
     assert not a.select("a", "b").equals(b.select("a", "b"))
 
 
-def test_dict_centers_rejected_for_vcf(tmp_path):
-    with pytest.raises(ValueError, match="only supported for simulations"):
-        fv.summary_statistics(str(tmp_path), vcf=True, centers={10000: [600000]})
+# test_dict_centers_rejected_for_vcf removed: the VCF path now accepts a mapping
+# (tests/test_caldas_vcf.py::test_dict_centers_accepted_for_vcf).
 
 
 def test_caldas_window_centers_matches_test_code():
