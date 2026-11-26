@@ -86,8 +86,9 @@ Enrichment
 .. autofunction:: flexsweep.enrichment.run_enrichment
 .. autofunction:: flexsweep.enrichment.plot_enrichment
 .. autofunction:: flexsweep.enrichment.count_sweeps_fast
+.. autofunction:: flexsweep.enrichment.enrichment_curves
 .. autofunction:: flexsweep.enrichment.estimate_fdr_fast
-.. autofunction:: flexsweep.enrichment.run_bootstrap_nomatchomega
+.. autofunction:: flexsweep.enrichment.run_bootstrap
 
 
 Ancestral polarization

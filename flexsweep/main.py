@@ -1449,7 +1449,7 @@ def rank(prediction, prediction_dir, populations, pattern, feature_coordinates, 
     "--pop_interest",
     type=str,
     default="All",
-    help="Perl Pop_interest: scope (population, group or All) whose p-values set how many control sets are used (20/100/all).",
+    help="Scopes to run the FDR for: comma-separated populations, groups and/or All (e.g. All,YRI).",
 )
 @click.option(
     "--cluster_distance",
@@ -1467,12 +1467,12 @@ def rank(prediction, prediction_dir, populations, pattern, feature_coordinates, 
     "--tolerance",
     type=float,
     default=0.05,
-    help="Allowed ± fraction deviation in confounding factor averages.",
+    help="Allowed fraction deviation in confounding factor averages, on the side of the pool mean.",
 )
 @click.option(
     "--min_distance",
     type=int,
-    default=1_250_000,
+    default=200_000,
     help="Minimum bp distance from VIPs for control gene eligibility.",
 )
 @click.option(
@@ -1488,6 +1488,13 @@ def rank(prediction, prediction_dir, populations, pattern, feature_coordinates, 
     help="Max average resamples per control gene across all bootstrap sets.",
 )
 @click.option(
+    "--skip_factors",
+    type=str,
+    default=None,
+    help="Comma-separated factors left out of the matching, numbered from 1 in --factors "
+    "order (e.g. 9). Default: match every factor.",
+)
+@click.option(
     "--nthreads",
     type=int,
     default=1,
@@ -1496,8 +1503,8 @@ def rank(prediction, prediction_dir, populations, pattern, feature_coordinates, 
 @click.option(
     "--n_shuffles",
     type=int,
-    default=8,
-    help="FDR genome-shuffle replicates (multiple of 8; use >= 1000 for reported p-values).",
+    default=10_000,
+    help="FDR genome-shuffle replicates (multiple of 8; Perl FDR_number). Use few, e.g. 8, for a quick check.",
 )
 @click.option(
     "--shuffling_segs",
@@ -1569,6 +1576,7 @@ def enrichment(
     min_distance,
     flip,
     max_rep,
+    skip_factors,
     nthreads,
     n_shuffles,
     shuffling_segs,
@@ -1615,7 +1623,13 @@ def enrichment(
 
     Tables and SVGs go to the current directory when --output_folder is omitted.
     """
-    from flexsweep.enrichment import _curve_svg_path, np, plot_enrichment, run_enrichment
+    from flexsweep.enrichment import (
+        _curve_svg_path,
+        _fdr_scopes,
+        np,
+        plot_enrichment,
+        run_enrichment,
+    )
 
     if len(groups.split(",")) != len(populations.split(",")):
         raise click.BadParameter(
@@ -1623,6 +1637,23 @@ def enrichment(
             "populations; give one group per population, comma-separated",
             param_hint="--groups",
         )
+
+    try:
+        _fdr_scopes(pop_interest, populations.split(","), groups.split(","))
+    except ValueError as e:
+        raise click.BadParameter(str(e), param_hint="--pop_interest") from e
+
+    skip = None
+    if skip_factors is not None:
+        try:
+            skip = [int(x) for x in skip_factors.split(",")]
+        except ValueError:
+            skip = [0]
+        if min(skip) < 1:
+            raise click.BadParameter(
+                f"{skip_factors!r} is not a comma-separated list of factor numbers from 1",
+                param_hint="--skip_factors",
+            )
 
     df_case, df_control, df_curves, df_fdr = run_enrichment(
         sweep_files=sweep_files.split(","),
@@ -1647,6 +1678,7 @@ def enrichment(
         output_folder=output_folder,
         count_sweeps=count_sweeps,
         shuffle_blocks=shuffle_blocks,
+        skip_factors=skip,
     )
 
     figs = plot_enrichment(
