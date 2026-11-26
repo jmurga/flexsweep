@@ -1488,6 +1488,12 @@ def rank(prediction, prediction_dir, populations, pattern, feature_coordinates, 
     help="Max average resamples per control gene across all bootstrap sets.",
 )
 @click.option(
+    "--n_control_sets",
+    type=int,
+    default=100,
+    help="Number of matched control sets (a multiple of 10). Ignored with --reuse_bootstrap.",
+)
+@click.option(
     "--skip_factors",
     type=str,
     default=None,
@@ -1576,6 +1582,7 @@ def enrichment(
     min_distance,
     flip,
     max_rep,
+    n_control_sets,
     skip_factors,
     nthreads,
     n_shuffles,
@@ -1669,6 +1676,7 @@ def enrichment(
         min_distance=min_distance,
         flip=flip,
         max_rep=max_rep,
+        n_control_sets=n_control_sets,
         nthreads=nthreads,
         n_shuffles=n_shuffles,
         shuffling_segs=shuffling_segs,
