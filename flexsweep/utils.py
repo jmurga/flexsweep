@@ -20,7 +20,6 @@ from allel import (
 )
 from numba import int64, njit
 
-# from pybedtools import BedTool
 from polars_bio import merge, nearest, overlap
 
 from . import Parallel, delayed, np, pl
@@ -2030,8 +2029,9 @@ def _read_feature_bed(feature_coordinates: str) -> pl.DataFrame:
         .select("chr", "start", "end", "strand", "gene_id")
         .filter(pl.col("chr").is_in([str(i) for i in range(1, 23)]))
         .with_columns((pl.lit("chr") + pl.col("chr")).alias("chr"))
-        .sort(["chr", "start"])
-        # explicit deterministic order to break full ties exactly like bedtools A-stream
+        # stable sort: features with the same chromosome and start keep their BED order,
+        # which breaks full ties
+        .sort(["chr", "start"], maintain_order=True)
         .with_row_index("gene_order", offset=0)
     )
 
@@ -2137,18 +2137,24 @@ def rank_merge(
 
 def rank_probabilities(prediction, feature_coordinates, rank_distance=False, k=111):
     """
-    Goal: match the original pybedtools/bedtools output *exactly*, including tie order.
+    Rank genomic features (e.g. genes) by the sweep probability of nearby prediction windows.
 
-    Strategy for exact tie-order:
-      - Create an explicit, deterministic per-gene input order (`gene_order`) from the
-        sorted gene table (chr,start). This mirrors the order bedtools processes A.
-      - Carry `gene_order` through the pipeline and use it as the final tie-breaker
-        in the final sort (stable + deterministic).
+    Features and windows are reduced to their midpoints, ``(start + end) // 2 + 1``.
+    For each feature, ``d_min`` is the distance to the nearest window on the same
+    chromosome. The candidate windows are the ``k`` nearest windows (ties by window
+    position) among those at most ``d_min + 500 kb`` away (a window exactly at
+    ``d_min + 500 kb`` is a candidate).
 
-    Strategy for bedtools `closest -k` parity:
-      - We emulate `-k K` by sorting hits per gene by (d, chrom_pred, start_pred, end_pred)
-        and taking the first K.
-      - This gives deterministic selection when multiple windows share the same distance.
+    Default ranking: score = maximum ``prob_sweep`` of the windows at ``d_min``; ties are
+    broken by the larger sum of ``prob_sweep`` over the candidates, then the smaller sum
+    of their distances, then the feature order (BED sorted by chromosome and start).
+    With ``rank_distance=True``: score = sum of ``prob_sweep`` over the candidates, ties
+    by the smaller sum of distances, then feature order. The ``prob_sweep`` sums are
+    exactly rounded (``math.fsum``), so features with the same candidate windows tie
+    exactly.
+
+    Returns ``(ranked, n_rank_max)``: ``gene_id``, ``rank`` (1 = highest) and
+    ``prob_sweep``, and the number of features tied at the highest score.
     """
 
     def _to_point_1based_closed(df: pl.DataFrame, chr_col: str) -> pl.DataFrame:
@@ -2170,9 +2176,9 @@ def rank_probabilities(prediction, feature_coordinates, rank_distance=False, k=1
             df_genes = df_genes.rename({"feature_id": "gene_id"})
         if "gene_order" not in df_genes.columns:
             # ensure deterministic gene order if caller didn't provide it
-            df_genes = df_genes.sort(["chr", "start"]).with_row_index(
-                "gene_order", offset=0
-            )
+            df_genes = df_genes.sort(
+                ["chr", "start"], maintain_order=True
+            ).with_row_index("gene_order", offset=0)
     else:
         raise ValueError(
             "feature_coordinates must be a file path (str) or a Polars DataFrame"
@@ -2287,7 +2293,7 @@ def rank_probabilities(prediction, feature_coordinates, rank_distance=False, k=1
         }
     ).with_columns((pl.col("gene_pos") - pl.col("start_pred")).abs().alias("d"))
 
-    # k elements like in bedtools
+    # the k nearest candidate windows of each feature
     if k is not None:
         k = int(k)
         hits = (
@@ -2297,6 +2303,13 @@ def rank_probabilities(prediction, feature_coordinates, rank_distance=False, k=1
             .drop("_k")
         )
 
+    # Sum prob_sweep over the candidates with math.fsum (exactly rounded, so independent
+    # of summation order). A plain float sum depends on the order of the rows: two
+    # features with the same candidate windows could differ in the last bit, and
+    # rounding, not the distance sum and the feature order, would break their tie.
+    def fsum_list(name):
+        return pl.col(name).map_elements(math.fsum, return_dtype=pl.Float64)
+
     if rank_distance:
         # Distance-aware composite: sort by prob_sweep sum desc, d_sum asc,
         # and finally gene_order asc to match original tie order.
@@ -2304,10 +2317,11 @@ def rank_probabilities(prediction, feature_coordinates, rank_distance=False, k=1
             hits.filter((pl.col("d") - pl.col("d_min")).abs() <= 500_000)
             .group_by("gene_id")
             .agg(
-                pl.col("prob_sweep_pred").sum().alias("prob_sweep"),
+                pl.col("prob_sweep_pred").alias("prob_sweep"),
                 pl.col("d").sum().alias("d_sum"),
                 pl.col("gene_order").min().alias("gene_order"),
             )
+            .with_columns(fsum_list("prob_sweep"))
             .sort(
                 ["prob_sweep", "d_sum", "gene_order"], descending=[True, False, False]
             )
@@ -2336,9 +2350,10 @@ def rank_probabilities(prediction, feature_coordinates, rank_distance=False, k=1
         .filter(pl.col("_abs") <= 500_000)
         .group_by("gene_id")
         .agg(
-            pl.col("prob_sweep_pred").sum().alias("win_prob_sum"),
+            pl.col("prob_sweep_pred").alias("win_prob_sum"),
             pl.col("d").sum().alias("win_d_sum"),
         )
+        .with_columns(fsum_list("win_prob_sum"))
     )
 
     ranked = (

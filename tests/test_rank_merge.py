@@ -213,3 +213,70 @@ def test_ratio_ci_brackets_ratio():
     assert out["CI_up_ratio"].to_list() == pytest.approx([14.1 / 0.1, 0.1 / 0.1])
     assert (out["CI_low_ratio"] <= out["ratio"]).all()
     assert (out["ratio"] <= out["CI_up_ratio"]).all()
+
+
+
+def test_rank_window_at_dmin_plus_500kb_is_a_candidate(tmp_path):
+    """Both genes are nearest to the 0.75 window, so they tie on score and the sum of
+    prob_sweep over the candidates decides, then the sum of distances. Midpoints
+    (start + end) // 2 + 1: windows 600,000 (0.25), 1,000,000 (0.75), 1,500,000 (0.5);
+    gene A 1,000,000 (d_min 0), gene B 1,010,000 (d_min 10,000). The 1,500,000 window is
+    exactly d_min + 500 kb from A and counts: both sum 1.5 (exact in binary), and A's
+    distances (900 kb) are smaller than B's (910 kb) -> A first. Without the edge window A
+    would sum 1.0 -> B first."""
+    bed = tmp_path / "genes.bed"
+    bed.write_text("1\t999900\t1000099\tGENE_A\t+\n1\t1009900\t1010099\tGENE_B\t+\n")
+    pred = tmp_path / "x_predictions.txt"
+    rows = [(600_000, 0.25), (1_000_000, 0.75), (1_500_000, 0.5)]
+    pred.write_text(
+        "chr,start,end,prob_sweep\n"
+        + "".join(f"chr1,{c - 5000},{c + 4999},{p}\n" for c, p in rows)
+    )
+    ranked, n_top = rank_probabilities(str(pred), str(bed))
+    assert ranked["gene_id"].to_list() == ["GENE_A", "GENE_B"]
+    assert ranked["prob_sweep"].to_list() == [0.75, 0.75]
+    assert n_top == 2
+
+
+@pytest.mark.parametrize("rank_distance", [False, True])
+def test_rank_equal_candidate_sets_tie_exactly(tmp_path, rank_distance):
+    """Windows at 600,000 (0.3), 1,000,000 (0.2), 1,400,000 (0.1); gene A at 990,000 and
+    gene B at 1,010,000 share all three candidates, the same nearest window (d_min 10 kb)
+    and the same distance sum (810 kb), so the documented rule ends in the BED order:
+    A first. A plain float sum over the rows of each gene gave A 0.6 and B
+    0.6000000000000001 (polars 1.44), and that rounding put B first."""
+    bed = tmp_path / "genes.bed"
+    bed.write_text("1\t989900\t990099\tGENE_A\t+\n1\t1009900\t1010099\tGENE_B\t+\n")
+    pred = tmp_path / "x_predictions.txt"
+    rows = [(600_000, 0.3), (1_000_000, 0.2), (1_400_000, 0.1)]
+    pred.write_text(
+        "chr,start,end,prob_sweep\n"
+        + "".join(f"chr1,{c - 5000},{c + 4999},{p}\n" for c, p in rows)
+    )
+    ranked, n_top = rank_probabilities(str(pred), str(bed), rank_distance=rank_distance)
+    assert ranked["gene_id"].to_list() == ["GENE_A", "GENE_B"]
+    p = ranked["prob_sweep"].to_list()
+    assert p[0] == p[1]
+    assert n_top == 2
+
+
+def test_read_feature_bed_keeps_bed_order_for_coincident_features(tmp_path):
+    """gene_order is the last tie-break key of the ranking: features with the same
+    chromosome and start must keep their BED order (stable sort). 20,000 features on
+    2,000 possible starts per chromosome give many coincident groups."""
+    from flexsweep.utils import _read_feature_bed
+
+    rng = np.random.default_rng(1)
+    n = 20_000
+    chrs = rng.integers(1, 23, n)
+    starts = rng.integers(1, 2_000, n) * 1_000
+    bed = tmp_path / "genes.bed"
+    bed.write_text(
+        "".join(f"{c}\t{s}\t{s + 500}\tG{i:05d}\t+\n" for i, (c, s) in enumerate(zip(chrs, starts)))
+    )
+    g = _read_feature_bed(str(bed)).with_columns(
+        pl.col("gene_id").str.slice(1).cast(pl.Int64).alias("row")
+    )
+    assert g.select(pl.struct("chr", "start").is_duplicated().sum()).item() > 1_000
+    got = g.sort("gene_order")["gene_id"].to_list()
+    assert got == g.sort(["chr", "start", "row"])["gene_id"].to_list()

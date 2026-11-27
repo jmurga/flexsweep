@@ -332,11 +332,13 @@ output is one table (``gene_id`` plus one rank column per population, sorted by
         output="predictions/all_ranks_v3",
     )
 
-For each element, ``rank_probabilities`` finds the *k* nearest
-prediction windows on the same chromosome (using a ``bedtools closest -k``
-equivalent), then assigns the maximum ``prob_sweep`` among those windows.
-Elements are returned sorted by ``prob_sweep``, highest first: for a gene BED, the
-output is a ranked gene list.
+For each element, ``rank_probabilities`` takes the prediction window nearest to the
+element's midpoint on the same chromosome (distance ``d_min``) and assigns its
+``prob_sweep`` (the maximum if several windows are equally near). Ties are broken by
+the sum of ``prob_sweep`` over the *k* nearest windows at most ``d_min`` + 500 kb
+away, then by the sum of their distances, then by BED order. Elements
+are returned sorted by score, highest first: for a gene BED, the output is a ranked
+gene list.
 
 The ``feature_coordinates`` BED file must have columns ``chr``, ``start``,
 ``end``, ``gene_id``, ``strand`` (no header, 0-based). Chromosome labels
@@ -361,5 +363,5 @@ must be numeric (``1``–``22``); the function prepends ``chr`` automatically.
      - If ``True``, additionally rank by distance to the nearest window.
    * - ``k``
      - ``111``
-     - Number of nearest prediction windows to consider per gene. Equivalent
-       to ``bedtools closest -k k``.
+     - Number of nearest prediction windows (at most ``d_min`` + 500 kb away) used to
+       break ties.
