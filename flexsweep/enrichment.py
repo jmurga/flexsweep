@@ -1833,8 +1833,9 @@ def plot_enrichment(
 
     :param curves: ``enrichment_curves.txt`` written by ``flexsweep enrichment``, or the
         curves DataFrame returned by :func:`run_enrichment`.
-    :param scopes: Scopes to draw (population codes, group labels or ``All``).
-        Default: every scope in the table.
+    :param scopes: Scopes to draw (population codes, group labels or ``All``). Labels
+        match exactly, or ignoring case if no label matches exactly (as ``pop_interest``
+        in :func:`run_enrichment`). Default: every scope in the table.
     :param facet: One panel per scope instead of one panel with all lines.
     :param ci: Shade the 95% interval of the ratio across matched control sets
         (see :func:`_ratio_ci`).
@@ -1849,12 +1850,23 @@ def plot_enrichment(
 
     df_curves = curves if isinstance(curves, pl.DataFrame) else pl.read_csv(curves)
     if scopes is not None:
-        available = set(df_curves["scope"].cast(pl.Utf8).unique().to_list())
-        unknown = [sc for sc in scopes if sc not in available]
+        available = sorted(set(df_curves["scope"].cast(pl.Utf8).unique().to_list()))
+        resolved, unknown = [], []
+        for sc in scopes:
+            hits = [nm for nm in available if nm == sc]
+            if not hits:
+                hits = [nm for nm in available if nm.casefold() == sc.casefold()]
+            if not hits:
+                unknown.append(sc)
+            elif len(hits) > 1:
+                raise ValueError(f"scope {sc!r} fits {len(hits)} scopes ({', '.join(hits)})")
+            elif hits[0] not in resolved:
+                resolved.append(hits[0])
         if unknown:
             raise ValueError(
-                f"scopes {unknown} not in the curves table; available: {sorted(available)}"
+                f"scopes {unknown} not in the curves table; available: {available}"
             )
+        scopes = resolved
 
     figs = {}
     for dataset in sorted(df_curves["dataset"].unique().to_list()):
