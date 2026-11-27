@@ -48,8 +48,9 @@ def test_scan_rejects_removed_n_daf_bins(tmp_path):
         cli, ["scan", "--vcf_path", str(tmp_path), "--out_prefix", str(tmp_path / "x"),
               "--stats", "ihs", "--n_daf_bins", "50"],
     )
+    # Usage error naming the option; click's wording differs between versions.
     assert result.exit_code == 2
-    assert "No such option '--n_daf_bins'" in result.output
+    assert "No such option" in result.output and "--n_daf_bins" in result.output
     with pytest.raises(TypeError, match="n_daf_bins was removed"):
         scan(str(tmp_path), str(tmp_path / "x"), ["ihs"], n_daf_bins=50)
 
