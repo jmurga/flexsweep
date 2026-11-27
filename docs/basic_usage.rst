@@ -91,7 +91,7 @@ Python interface
     fs_cnn = fs.CNN(
         train_data="yri_test/fvs.parquet",
         predict_data="yri_vcfs/fvs_yri.parquet",
-        output_folder="yri_vcfs",
+        output_folder="yri_test",
         seed=1,
     )
     fs_cnn.train()
@@ -105,13 +105,7 @@ single-population :math:`N_e(t)` trajectories estimated with
 `Relate <https://doi.org/10.1038/s41588-019-0484-x>`_ (``--demes yri``, ``ceu``,
 ``chb``, ... or ``constant``; see :ref:`shipped-models`), and the
 sex-averaged `deCODE recombination map <https://doi.org/10.1126/science.aau1043>`_ on
-GRCh38 (``--recombination_map decode``).
-
-``--seed`` makes runs reproducible: the simulator stores per-replicate discoal seeds
-in ``params.txt.gz``, and seeded CPU training gives identical predictions. GPU
-training may still differ slightly between runs because some GPU kernels are
-non-deterministic.
-You can inspect them directly:
+GRCh38 (``--recombination_map decode``). You can inspect them directly:
 
 .. code-block:: python
 
@@ -133,3 +127,8 @@ You can inspect them directly:
             ("cm", fs.pl.Float64),
         ])
     ))
+
+``--seed`` makes runs reproducible: the simulator stores per-replicate discoal seeds
+in ``params.txt.gz``, and seeded CPU training gives identical predictions. GPU
+training may still differ slightly between runs because some GPU kernels are
+non-deterministic.

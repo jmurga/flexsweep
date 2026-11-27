@@ -251,6 +251,10 @@ Parameters
    * - ``--seed``
      - random
      - Seed of the bootstrap and of the shuffles; printed when not given.
+   * - ``--n_control_sets``
+     - ``100``
+     - Number of matched control sets, a multiple of 10. Ignored with
+       ``--reuse_bootstrap``.
    * - ``--reuse_bootstrap``
      - none
      - Output folder of a previous run whose control sets are reused, e.g. to rerun with
@@ -264,9 +268,6 @@ Parameters
    * - ``--facet``, ``--plot_groups``, ``--ci``
      - off
      - How the curve plot is drawn (see `Plotting`_).
-
-The number of control sets is set from Python, ``n_control_sets`` (default 100), in
-``run_enrichment`` and ``run_bootstrap``.
 
 **Notes**
 

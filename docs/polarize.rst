@@ -231,6 +231,7 @@ Examples:
         --method kimura
 
     # A whole-genome MAF must first be split by contig and sorted
+    # (writes genome_chr22.maf.gz; pass it to polarize --maf)
     flexsweep split-maf --maf genome.maf.gz --contig chr22 --sort
 
     # Use parsimony with a pre-sorted MAF

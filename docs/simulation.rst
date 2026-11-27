@@ -146,6 +146,7 @@ mutation and recombination rate along the genome. Both rates accept four forms:
 
     # Same mutation rate in every replicate, recombination rate uniform
     flexsweep simulator --sample_size 216 --demes yri --output_folder yri_sims_fixed_mu \
+        --num_simulations 22000 --nthreads 24 \
         --mutation_rate 1.25e-8 --recombination_rate 1e-9,4e-8
 
 .. code-block:: python
@@ -224,6 +225,7 @@ uniformly from that range.
 
     # Sweep anywhere between about 400 and 800 kb of the 1.2 Mb locus
     flexsweep simulator --sample_size 216 --demes yri --output_folder yri_sims_offcenter \
+        --num_simulations 22000 --nthreads 24 \
         --x 0.333,0.667
 
 .. code-block:: python
