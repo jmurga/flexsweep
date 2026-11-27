@@ -32,9 +32,7 @@ implementation.
 
 The DANN does not replace realistic simulations. Simulate under the best demographic
 model available (:ref:`shipped-models`), and use the DANN to absorb the remaining
-mismatch. When the training demography is far from the truth, domain-adaptive training
-can still perform worse than the plain CNN, so test it on simulations first
-(:ref:`demography-misspecification`).
+mismatch.
 
 Command line and Python interface
 ---------------------------------
@@ -132,9 +130,8 @@ predictions join on chromosome and start:
                       (pl.col("prob_sweep_dann") >= 0.5).sum().alias("dann")))
 
 The VCF has no labels, so this comparison shows how much the two models agree, not which
-is right. To measure whether the DANN helps under a given misspecification, test it on
-simulations (:ref:`demography-misspecification`). Here source and target share the YRI
-demographic model, so little difference is expected.
+is right. Here source and target share the YRI demographic model, so little difference
+is expected.
 
 Options
 -------
@@ -238,9 +235,7 @@ Testing a misspecified model on simulations
 Real data have no labels, so the effect of a wrong demographic model is measured on
 simulations. Simulate labelled data under a **training** model and under a different
 **test** model that plays the role of the real population. Then compare a CNN trained
-on the training model, a DANN trained on the training model with the test-model feature
-vectors as unlabelled target, and, as an upper bound, a CNN trained on the test model
-itself.
+on the training model with, as an upper bound, a CNN trained on the test model itself.
 
 .. code-block:: bash
 
@@ -256,19 +251,12 @@ itself.
     flexsweep cnn --train_data src/fvs.parquet --predict_data tgt/fvs.parquet \
         --output_folder cnn_src --seed 1
 
-    # DANN: labelled source + unlabelled target
-    flexsweep dann --source_data src/fvs.parquet --target_data tgt/fvs.parquet \
-        --output_folder dann_src --seed 1
-
     # Upper bound: CNN trained on the "true" model
     flexsweep cnn --train_data tgt/fvs.parquet --output_folder cnn_tgt --seed 1
 
-In the predictions on ``tgt``, neutral replicates have ``s = 0`` and sweep replicates
-carry their ``s``, ``t``, ``f_i`` and ``f_t``. Compare the false positive rate on
-neutral replicates and the recall on sweep replicates between the three models. In a
-real analysis the DANN target would be the empirical feature vectors from ``fvs-vcf``,
-not simulated ones. Use separate replicates (seeds) for the target pool and for the
-evaluation set when you report results.
+The ``dann`` command does not take simulations as target: its ``--target_data`` must be
+empirical feature vectors from ``fvs-vcf`` (genomic windows), and it stops with an error
+otherwise.
 
 Admixture and population structure
 ----------------------------------
@@ -281,13 +269,3 @@ with discoal. To train under admixture, simulate with a forward simulator (e.g. 
 with tree-sequence recording), write the replicates as ms-format files in the folder
 layout of ``flexsweep simulator`` (``neutral/``, ``sweep/`` and ``params.txt.gz``), and
 compute feature vectors with ``flexsweep fvs-discoal``.
-
-The Flex-sweep 2.0 paper runs this comparison with a constant-size population as the
-labelled source and, as the target standing in for empirical data, either the YRI size
-history or the West Eurasian admixture history of Souilmi et al. (2022), simulated with SLiM
-so that demography is the only difference. On held-out target simulations the ROC-AUC was
-0.947 (YRI) and 0.949 (admixture) for the CNN without adaptation, 0.947 and 0.950 for the
-DANN, and 0.977 and 0.974 for a CNN trained on the true demography. Each model was trained
-once, on one demography and one simulator. The DANN therefore preserved the accuracy of the
-CNN, whose robustness here comes mostly from standardizing each statistic within its own
-dataset, but did not recover the accuracy lost to the misspecification.

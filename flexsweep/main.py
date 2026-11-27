@@ -1216,6 +1216,21 @@ def dann(
     """
     import flexsweep as fs
 
+    # The target is predicted per genomic window: fvs-vcf output stores the window as
+    # "<contig>:start-end" in `iter`; fvs-discoal output stores a replicate number.
+    from flexsweep import pl
+
+    if target_data.endswith(".parquet"):
+        iter_dtype = pl.read_parquet_schema(target_data).get("iter")
+    else:
+        iter_dtype = pl.read_csv(target_data, n_rows=100).schema.get("iter")
+    if iter_dtype != pl.String:
+        raise click.UsageError(
+            f"{target_data} is not fvs-vcf output: its 'iter' column is {iter_dtype}, not "
+            "'<contig>:start-end' windows. The DANN target must be empirical feature "
+            "vectors from 'flexsweep fvs-vcf'."
+        )
+
     os.makedirs(output_folder, exist_ok=True)
 
     center_list = [int(x) for x in parse_float_list(center)]
