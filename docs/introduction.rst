@@ -96,7 +96,7 @@ these statistics on allele frequency:
 .. math::
    z_i^{(f)} = \frac{x_i^{(f)} - \mu^{(f)}}{\sigma^{(f)}}
 
-where :math:`f` is the DAF bin of SNP :math:`i`. The standardized SNP values
+where :math:`f` is the DAF bin of SNP :math:`i` (50 bins of width 0.02). The standardized SNP values
 are then summarized in each window of the feature vector.
 
 **Window statistics** (:math:`\pi`, Tajima's D, H12, HAF, ...) are

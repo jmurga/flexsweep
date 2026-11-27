@@ -14,8 +14,8 @@ VCFs, which the trained model classifies.
 Before training, every statistic is standardized (z-scored), so that statistics on
 different scales are comparable:
 
-* per-SNP statistics (iHS, nSL, DIND, ...) within derived allele frequency bins
-  (`Voight et al. 2006 <https://doi.org/10.1371/journal.pbio.0040072>`_), and
+* per-SNP statistics (iHS, nSL, DIND, ...) within derived allele frequency bins (50
+  bins of width 0.02; `Voight et al. 2006 <https://doi.org/10.1371/journal.pbio.0040072>`_), and
 * window statistics within each (window size, center) combination:
 
 .. math::

@@ -778,64 +778,6 @@ def normalize_stat_scan(df, df_r_bins=None):
     return normalized_df
 
 
-def _normalize_daf_bins(
-    values: np.ndarray,
-    daf: np.ndarray,
-    recomb: np.ndarray | None = None,
-    freq_step: float = 0.02,  # Matches your Polars default
-    n_r_bins: int | None = None,
-) -> np.ndarray:
-    """Fixed-width Z-score normalization matching Polars/Pandas cut logic."""
-
-    # 1. Generate Fixed-Width Edges for DAF (0.0 to 1.0)
-    # This matches: np.arange(0, 1 + freq, freq)
-    daf_edges = np.arange(0, 1 + freq_step, freq_step)
-
-    # 2. Binning logic (np.digitize)
-    # Polars cut(include_lowest=True) behavior:
-    # We use np.digitize. To match (0, 0.02], (0.02, 0.04]...
-    # we use 'right=True'.
-    daf_bin = np.digitize(daf, daf_edges, right=True)
-
-    # Adjust for include_lowest=True (values exactly 0 go into bin 1)
-    daf_bin[daf == daf_edges[0]] = 1
-    # Clip to ensure indices stay within 1-indexed range of bins
-    n_daf_bins = len(daf_edges) - 1
-    daf_bin = np.clip(daf_bin, 1, n_daf_bins)
-
-    if recomb is not None and n_r_bins is not None:
-        # If recomb is still using quantiles, keep this,
-        # but usually you'd want consistency.
-        r_edges = np.nanpercentile(recomb, np.linspace(0, 100, n_r_bins + 1))
-        r_edges[0] -= 1e-10
-        r_bin = np.clip(np.digitize(recomb, r_edges) - 1, 0, n_r_bins - 1)
-        # Create unique key for the joint grid
-        bin_key = (daf_bin - 1) * n_r_bins + r_bin
-    else:
-        bin_key = daf_bin
-
-    normalized = np.full_like(values, np.nan, dtype=np.float64)
-
-    for b in np.unique(bin_key):
-        mask = bin_key == b
-        # Polars .std() returns null if count < 2.
-        # mask.sum() < 2 ensures we don't divide by zero or get 0 std
-        if mask.sum() < 2:
-            continue
-
-        v = values[mask].astype(np.float64)
-
-        # 3. Match Polars Math
-        mu = np.nanmean(v)
-        # ddof=1 is CRITICAL. Polars uses N-1, NumPy defaults to N.
-        std = np.nanstd(v, ddof=1)
-
-        if std > 0 and not np.isnan(std):
-            normalized[mask] = (v - mu) / std
-
-    return normalized
-
-
 def empirical_pvalues(
     df: pl.DataFrame, stat_col: str, abs_rank: bool = False
 ) -> pl.DataFrame:
@@ -1665,7 +1607,6 @@ def scan(
     step_bp=10_000,
     min_maf=0.05,
     recombination_map=None,
-    n_daf_bins=50,
     r_bins=None,
     min_rate=0.0,
     nthreads=1,
@@ -1717,8 +1658,6 @@ def scan(
         If provided: genetic distances used for T3 stat windows, and
         frequency-sensitive stats (iHS, nSL, dind, …) are normalized
         by joint (DAF × recomb_rate) bins (Johnson et al. approach).
-    n_daf_bins:
-        Number of equal-frequency DAF bins for normalization (default 50).
     r_bins:
         Recombination-rate bin edges (cM/Mb) for joint (DAF x recombination)
         normalization of per-SNP stats; requires ``recombination_map``.
@@ -1765,6 +1704,11 @@ def scan(
         raise TypeError(
             "n_r_bins was replaced by r_bins: pass the recombination-rate bin edges "
             "(cM/Mb), e.g. from 'flexsweep recombination-bins'."
+        )
+    if "n_daf_bins" in kwargs:
+        raise TypeError(
+            "n_daf_bins was removed: per-SNP statistics are always normalized within "
+            "50 DAF bins of width 0.02."
         )
     if os.path.dirname(out_prefix):
         os.makedirs(os.path.dirname(out_prefix), exist_ok=True)

@@ -413,10 +413,9 @@ that would otherwise cause high-frequency SNPs to dominate outlier lists.
 
 **DAF-only normalization** (default):
 
-1. Compute 50 equal-frequency DAF bin edges over the genome-wide DAF
-   distribution.
-2. Assign each SNP to a bin.
-3. Within each bin: z-score = (value − mean) / std. Bins with fewer than 2
+1. Assign each SNP to one of 50 DAF bins of width 0.02: (0, 0.02], (0.02, 0.04],
+   ..., (0.98, 1].
+2. Within each bin: z-score = (value − mean) / std. Bins with fewer than 2
    SNPs are left as NaN.
 
 **Joint DAF × recombination rate normalization** (when ``recombination_map``
@@ -466,7 +465,6 @@ data:
         "results/YRI",
         stats=["ihs", "nsl"],
         recombination_map="decode",
-        n_daf_bins=50,
         r_bins=[0.37, 0.55, 0.71, 0.87, 1.05, 1.26, 1.53, 1.88, 2.46, 6.10],
     )
 
@@ -552,9 +550,6 @@ CLI reference
      - None
      - TSV recombination map (chr, start, end, cm_mb, cm). Enables
        genetic-distance windows for T3 stats.
-   * - ``--n_daf_bins INT``
-     - 50
-     - Number of equal-frequency DAF bins for normalization.
    * - ``--r_bins LIST``
      - None
      - Comma-separated recombination-rate bin edges (cM/Mb) for joint
@@ -680,7 +675,6 @@ Python API
         "results/YRI",
         stats=["ihs", "nsl"],
         recombination_map="decode",
-        n_daf_bins=50,
         r_bins=[0.37, 0.55, 0.71, 0.87, 1.05, 1.26, 1.53, 1.88, 2.46, 6.10],
         nthreads=4,
     )

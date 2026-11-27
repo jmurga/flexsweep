@@ -1995,13 +1995,6 @@ def split_maf(maf, contig, outdir, sort, tmp_dir, chunk_bytes):
     help=MAP_HELP,
 )
 @click.option(
-    "--n_daf_bins",
-    type=int,
-    default=100,
-    show_default=True,
-    help="Number of DAF bins for iHS/nSL normalization.",
-)
-@click.option(
     "--max_extend",
     type=float,
     default=1e5,
@@ -2109,7 +2102,6 @@ def scan(
     step,
     min_maf,
     recombination_map,
-    n_daf_bins,
     max_extend,
     K_truncation,
     sweep_mode,
@@ -2166,7 +2158,6 @@ def scan(
         step_bp=step_bp,
         min_maf=min_maf,
         recombination_map=recombination_map,
-        n_daf_bins=n_daf_bins,
         r_bins=parse_float_list(r_bins),
         min_rate=min_rate,
         nthreads=nthreads,
