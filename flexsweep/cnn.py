@@ -738,6 +738,7 @@ class CNN:
         X_test_params = X_test.select(X_test.columns[:6])
 
         X_train = self._feature_tensor(X_train, stats, one_dim)
+        self._set_layout(stats, self.feature_keys)
         X_test = self._feature_tensor(X_test, stats, one_dim)
         X_valid = self._feature_tensor(X_valid, stats, one_dim)
 
@@ -1006,6 +1007,7 @@ class CNN:
 
         if self.output_folder is not None:
             model.save(model_path)
+            self._save_layout(model_path)
 
         # ROC curves and confusion matrix
         if self.output_folder is None:
@@ -1265,6 +1267,7 @@ class CNN:
         if one_dim is None:
             one_dim = len(model.inputs[0].shape) == 3
         test_X = self._feature_tensor(X_test, stats, one_dim)
+        self._check_layout(stats, self.feature_keys, self._data_label(self.predict_data))
 
         if preprocess:
             self.mean = test_X.mean(axis=(0, 1, 2), keepdims=False)
@@ -1588,19 +1591,8 @@ class CNN:
             If a statistic has no columns or its window/center columns differ from
             those of the first statistic.
         """
-        ref, blocks = None, []
-        for stat in stats:
-            blk = df.select(pl.col(f"^{stat}_[0-9]+_[0-9]+$"))
-            keys = [tuple(int(v) for v in c.rsplit("_", 2)[1:]) for c in blk.columns]
-            if ref is None:
-                ref = keys
-            if not keys or keys != ref:
-                raise ValueError(
-                    f"statistic {stat!r}: window/center columns are missing or differ "
-                    f"from those of {stats[0]!r}; every statistic needs the same "
-                    "{stat}_{window}_{center} columns in the same order"
-                )
-            blocks.append(blk)
+        blocks, ref = self._stat_blocks(df, stats)
+        self.feature_keys = ref
         self.windows = np.unique([w for w, _ in ref])
         self.center = np.unique([c for _, c in ref])
         self.n_pos = len(ref)
@@ -1614,6 +1606,90 @@ class CNN:
             return np.ascontiguousarray(X.transpose(0, 2, 1))
         return X[..., None]
 
+    @staticmethod
+    def _stat_blocks(df: pl.DataFrame, stats: list[str]) -> tuple[list, list]:
+        """
+        Columns ``{stat}_{window}_{center}`` of each statistic, in file order.
+
+        Every CNN and DANN path (training and prediction) reads its features through
+        this helper, so the positions inside a statistic keep the order in which the
+        geometry was written (window-major or center-major). Every statistic must have
+        the same (window, center) columns in the same order as the first one.
+
+        Returns
+        -------
+        tuple
+            ``(blocks, keys)``: one DataFrame per statistic and the ``(window, center)``
+            keys of the positions.
+
+        Raises
+        ------
+        ValueError
+            If a statistic has no columns or its window/center columns differ from
+            those of the first statistic (names or order).
+        """
+        ref, blocks = None, []
+        for stat in stats:
+            blk = df.select(pl.col(f"^{stat}_[0-9]+_[0-9]+$"))
+            keys = [tuple(int(v) for v in c.rsplit("_", 2)[1:]) for c in blk.columns]
+            if ref is None:
+                ref = keys
+            if not keys or keys != ref:
+                raise ValueError(
+                    f"statistic {stat!r}: window/center columns are missing or differ "
+                    f"from those of {stats[0]!r}; every statistic needs the same "
+                    "{stat}_{window}_{center} columns in the same order"
+                )
+            blocks.append(blk)
+        return blocks, ref
+
+    @staticmethod
+    def _data_label(data) -> str:
+        """File name for messages; a DataFrame input is named generically."""
+        return data if isinstance(data, str) else "predict_data (DataFrame)"
+
+    def _set_layout(self, stats: list[str], keys: list) -> None:
+        """Record the statistic order and (window, center) positions used in training."""
+        self._layout = {"stats": list(stats), "keys": [list(k) for k in keys]}
+
+    def _save_layout(self, model_path: str) -> None:
+        """Write the training layout as ``features.json`` next to the saved model."""
+        if getattr(self, "_layout", None) is not None:
+            folder = os.path.dirname(model_path) or "."
+            with open(os.path.join(folder, "features.json"), "w") as f:
+                json.dump(self._layout, f)
+
+    def _check_layout(self, stats: list[str], keys: list, data: str) -> None:
+        """
+        Require ``data`` to have the statistic order and (window, center) positions the
+        model was trained on. The reference is ``features.json`` next to a model given
+        as a path, otherwise the layout of the training run in this session. Models
+        saved without ``features.json`` are not checked.
+
+        Raises
+        ------
+        ValueError
+            If the statistics or their positions differ (names or order).
+        """
+        if isinstance(self.model, str):
+            path = os.path.join(os.path.dirname(self.model) or ".", "features.json")
+            if not os.path.isfile(path):
+                return
+            with open(path) as f:
+                ref, source = json.load(f), path
+        else:
+            ref, source = getattr(self, "_layout", None), "the training data"
+            if ref is None:
+                return
+        got = {"stats": list(stats), "keys": [list(k) for k in keys]}
+        if got != ref:
+            what = "statistics" if got["stats"] != ref["stats"] else "window/center columns"
+            raise ValueError(
+                f"{data}: its {what} differ from those of {source} (names or order). "
+                "Compute the feature vectors with the training geometry "
+                "(e.g. fvs-vcf --geometry_from) and the same statistics."
+            )
+
     def _select_stats_matrix(self, df: pl.DataFrame, stats: list[str]):
         # Standardize model: anything not 'neutral' -> 'sweep'
         df = df.with_columns(
@@ -1623,26 +1699,7 @@ class CNN:
             .alias("model")
         )
 
-        blocks = []
-        windows_set = set(self.windows.tolist())
-        centers_set = set(self.center.tolist())
-
-        for stat in stats:
-            blk = df.select(pl.col(f"^{stat}_[0-9]+_[0-9]+$"))
-            cols = blk.columns
-            keys = []
-            for col in cols:
-                _, a, b = col.rsplit("_", 2)
-                a, b = int(a), int(b)
-                if a in windows_set and b in centers_set:
-                    wv, cv = a, b
-                elif a in centers_set and b in windows_set:
-                    wv, cv = b, a
-                else:
-                    cv, wv = a, b
-                keys.append((wv, cv, col))
-            sorted_cols = [col for _, _, col in sorted(keys)]
-            blocks.append(blk.select(sorted_cols))
+        blocks, self.feature_keys = self._stat_blocks(df, stats)
 
         X = pl.concat(blocks, how="horizontal")
         y = (df["model"] != "neutral").cast(pl.Int8).to_numpy().astype(np.float32)
@@ -1688,6 +1745,7 @@ class CNN:
 
         # ---------- Source matrices ----------
         X_src, y_src, _src_params = self._select_stats_matrix(src_df, stats)
+        self._set_layout(stats, self.feature_keys)
         X_test, y_test, X_test_params = self._select_stats_matrix(df_test, stats)
 
         # Map labels to binary {0,1} if needed (accepts strings or ints)
@@ -1716,6 +1774,12 @@ class CNN:
 
         # ---------- Target matrix (unlabeled for discriminator) ----------
         X_tgt, _yt_placeholder, tgt_params = self._select_stats_matrix(tgt_df, stats)
+        if [list(k) for k in self.feature_keys] != self._layout["keys"]:
+            raise ValueError(
+                f"{self.target_data}: its window/center columns differ from those of "
+                f"{self.source_data} (names or order). Compute the target feature vectors "
+                "with the source geometry (e.g. fvs-vcf --geometry_from)."
+            )
 
         # ---------- Validation set ----------
         # source validation
@@ -2328,6 +2392,7 @@ class CNN:
         self.model = model
         if self.output_folder:
             model.save(f"{self.output_folder}/model_da.keras")
+            self._save_layout(f"{self.output_folder}/model_da.keras")
 
         # quick eval on held-out source test for the plots you already have wired
         X_test, Y_test, X_test_params = dd["test_data"]
@@ -2571,6 +2636,7 @@ class CNN:
         self.model = model
         if self.output_folder:
             model.save(f"{self.output_folder}/model_da.keras")
+            self._save_layout(f"{self.output_folder}/model_da.keras")
             self.history.write_csv(f"{self.output_folder}/history_da.txt")
 
         # quick eval on held-out source test for the plots you already have wired
@@ -2771,6 +2837,7 @@ class CNN:
         self.model = model
         if self.output_folder:
             model.save(f"{self.output_folder}/model_da.keras")
+            self._save_layout(f"{self.output_folder}/model_da.keras")
 
         X_test, Y_test, X_test_params = dd["test_data"]
         out = model.predict(X_test, verbose=0, batch_size=32)
@@ -2899,12 +2966,11 @@ class CNN:
         stats = []
         if _stats is not None:
             stats = stats + _stats
-        test_stats = []
 
         self.num_stats = len(stats)
 
-        for i in stats:
-            test_stats.append(df_test.select(pl.col(f"^{i}_[0-9]+_[0-9]+$")))
+        test_stats, keys = self._stat_blocks(df_test, stats)
+        self._check_layout(stats, keys, self._data_label(self.predict_data))
 
         X_test = pl.concat(test_stats, how="horizontal")
 
@@ -3083,10 +3149,9 @@ class CNN:
         stats = []
         if _stats is not None:
             stats = stats + _stats
-        test_stats = []
 
-        for i in stats:
-            test_stats.append(df_test.select(pl.col(f"^{i}_[0-9]+_[0-9]+$")))
+        test_stats, keys = self._stat_blocks(df_test, stats)
+        self._check_layout(stats, keys, self._data_label(self.predict_data))
 
         X_test = pl.concat(test_stats, how="horizontal")
 

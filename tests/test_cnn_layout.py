@@ -79,3 +79,47 @@ def test_mismatched_columns_across_stats_raise(tmp_path):
     m = CNN(train_data=path, seed=1)
     with pytest.raises(ValueError, match="window/center"):
         m.load_training_data(_stats=STATS)
+
+
+CENTER_MAJOR = sorted(UNEVEN, key=lambda k: (k[1], k[0]))  # same columns, other order
+
+
+def test_predict_rejects_a_layout_other_than_training(tmp_path):
+    """Same column names in another order would reshape into the wrong cells silently."""
+    m = CNN(train_data=toy(tmp_path / "train.parquet", UNEVEN), seed=1)
+    m.num_stats = len(STATS)
+    m.load_training_data(_stats=STATS)
+    m.model = picker((len(STATS), len(UNEVEN), 1), (0, 0, 0))
+    m.output_folder = str(tmp_path)
+
+    m.predict_data = toy(tmp_path / "same.parquet", UNEVEN)
+    assert m.predict(_stats=STATS).height == 40
+    m.predict_data = toy(tmp_path / "center_major.parquet", CENTER_MAJOR)
+    with pytest.raises(ValueError, match="window/center columns differ"):
+        m.predict(_stats=STATS)
+    m.predict_data = toy(tmp_path / "same2.parquet", UNEVEN)
+    with pytest.raises(ValueError, match="statistics differ"):
+        m.predict(_stats=STATS[::-1])
+
+
+def test_layout_saved_next_to_the_model(tmp_path):
+    m = CNN(train_data=toy(tmp_path / "train.parquet", UNEVEN), seed=1)
+    m.num_stats = len(STATS)
+    m.load_training_data(_stats=STATS)
+    m._save_layout(str(tmp_path / "model.keras"))
+
+    p = CNN(model=str(tmp_path / "model.keras"))
+    p._check_layout(STATS, UNEVEN, "same.parquet")
+    with pytest.raises(ValueError, match="features.json"):
+        p._check_layout(STATS, CENTER_MAJOR, "center_major.parquet")
+    # a model saved without features.json is not checked
+    CNN(model=str(tmp_path / "old" / "model.keras"))._check_layout(STATS, CENTER_MAJOR, "x")
+
+
+def test_dann_target_layout_must_match_source(tmp_path):
+    src = toy(tmp_path / "src.parquet", BASE)
+    ok = CNN(source_data=src, target_data=toy(tmp_path / "tgt.parquet", BASE), seed=1)
+    ok.load_da_data(_stats=STATS)
+    bad = CNN(source_data=src, target_data=toy(tmp_path / "tgt_rev.parquet", BASE[::-1]), seed=1)
+    with pytest.raises(ValueError, match="tgt_rev.parquet: its window/center columns differ"):
+        bad.load_da_data(_stats=STATS)
