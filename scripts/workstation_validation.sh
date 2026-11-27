@@ -43,13 +43,23 @@ run 01_build  uv build --wheel
 WHEEL="$(ls dist/flexsweep-*.whl | head -n 1)"
 run 02_install uv pip install --python "${PY}" "${WHEEL}" pytest
 
-# 1. Static check and tests (tests import the repo source; the CLI uses the wheel)
+# 1. Static check and tests
 # --isolated: ignore ruff configs above the repo (pyproject.toml has no [tool.ruff]);
 # test_code/ holds local scratch scripts that are never packaged or uploaded
 run 10_lint_undefined_names uvx ruff check --isolated --select F821,F822,F823 \
     --output-format concise --extend-exclude test_code flexsweep/
-run 11_pytest_fast env CUDA_VISIBLE_DEVICES=-1 "${PY}" -m pytest tests -m "not slow" -q -p no:warnings
-run 12_pytest_slow env CUDA_VISIBLE_DEVICES=-1 "${PY}" -m pytest tests -m slow -q -p no:warnings
+# Run the tests against the installed wheel, from a copy outside the source tree:
+# `python -m pytest` from the repo root would import ./flexsweep, which has no compiled
+# Rust extension (flexsweep.polarize) in a fresh clone. docs/ and pyproject.toml are
+# copied too (docs-vs-CLI test, pytest markers).
+TESTS="${OUT}/wheeltests"
+rm -rf "${TESTS}"; mkdir -p "${TESTS}"
+cp -r tests docs pyproject.toml "${TESTS}/"
+cd "${TESTS}"
+run 11_pytest_fast env PATH="${OUT}/venv/bin:${PATH}" CUDA_VISIBLE_DEVICES=-1 \
+    "${PY}" -m pytest tests -m "not slow" -q -p no:warnings -p no:cacheprovider
+run 12_pytest_slow env PATH="${OUT}/venv/bin:${PATH}" CUDA_VISIBLE_DEVICES=-1 \
+    "${PY}" -m pytest tests -m slow -q -p no:warnings -p no:cacheprovider
 
 # 2. Quickstart, exactly as in docs/quickstart.rst (one command, six steps)
 cd "${OUT}"
